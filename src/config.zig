@@ -720,6 +720,7 @@ pub const Config = struct {
             .compaction_keep_recent = self.agent.compaction_keep_recent,
             .compaction_max_summary_chars = self.agent.compaction_max_summary_chars,
             .compaction_max_source_chars = self.agent.compaction_max_source_chars,
+            .status_show_emojis = self.agent.status_show_emojis,
             .message_timeout_secs = self.agent.message_timeout_secs,
         }, .{})});
 
@@ -1517,6 +1518,7 @@ test "save roundtrip preserves extended config sections" {
     cfg.agent.compaction_keep_recent = 12;
     cfg.agent.compaction_max_summary_chars = 3000;
     cfg.agent.compaction_max_source_chars = 9000;
+    cfg.agent.status_show_emojis = false;
     cfg.agent.message_timeout_secs = 60;
 
     cfg.memory.search.provider = "openai";
@@ -1632,6 +1634,7 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expectEqual(@as(u32, 32), loaded.scheduler.max_tasks);
     try std.testing.expectEqual(@as(u64, 123), loaded.scheduler.agent_timeout_secs);
     try std.testing.expect(loaded.agent.parallel_tools);
+    try std.testing.expect(!loaded.agent.status_show_emojis);
 
     try std.testing.expectEqualStrings("openai", loaded.memory.search.provider);
     try std.testing.expect(loaded.memory.response_cache.enabled);
@@ -2231,7 +2234,7 @@ test "json parse scheduler section" {
 test "json parse agent section" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"agent": {"compact_context": true, "max_tool_iterations": 20, "max_history_messages": 80, "parallel_tools": true, "tool_dispatcher": "xml", "token_limit": 64000}}
+        \\{"agent": {"compact_context": true, "max_tool_iterations": 20, "max_history_messages": 80, "parallel_tools": true, "tool_dispatcher": "xml", "token_limit": 64000, "status_show_emojis": false}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
@@ -2242,6 +2245,7 @@ test "json parse agent section" {
     try std.testing.expectEqualStrings("xml", cfg.agent.tool_dispatcher);
     try std.testing.expectEqual(@as(u64, 64_000), cfg.agent.token_limit);
     try std.testing.expect(cfg.agent.token_limit_explicit);
+    try std.testing.expect(!cfg.agent.status_show_emojis);
     allocator.free(cfg.agent.tool_dispatcher);
 }
 
@@ -2254,6 +2258,7 @@ test "json parse agent token_limit explicit remains false when omitted" {
     try cfg.parseJson(json);
     try std.testing.expectEqual(config_types.DEFAULT_AGENT_TOKEN_LIMIT, cfg.agent.token_limit);
     try std.testing.expect(!cfg.agent.token_limit_explicit);
+    try std.testing.expect(cfg.agent.status_show_emojis);
 }
 
 test "json parse composio section" {

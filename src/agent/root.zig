@@ -270,6 +270,7 @@ pub const Agent = struct {
     activation_mode: ActivationMode = .mention,
     send_mode: SendMode = .inherit,
     last_turn_usage: providers.TokenUsage = .{},
+    status_show_emojis: bool = true,
     message_timeout_secs: u64 = 0,
     log_tool_calls: bool = false,
     log_llm_io: bool = false,
@@ -370,6 +371,7 @@ pub const Agent = struct {
             .max_tokens = resolved_max_tokens,
             .max_tokens_override = cfg.max_tokens,
             .reasoning_effort = cfg.reasoning_effort,
+            .status_show_emojis = cfg.agent.status_show_emojis,
             .message_timeout_secs = cfg.agent.message_timeout_secs,
             .log_tool_calls = cfg.diagnostics.log_tool_calls,
             .log_llm_io = cfg.diagnostics.log_llm_io,
@@ -2486,6 +2488,23 @@ test "Agent.fromConfig clamps max_tokens to token_limit" {
     try std.testing.expectEqual(@as(u32, 4096), agent.max_tokens);
 }
 
+test "Agent.fromConfig applies status_show_emojis flag" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.agent.status_show_emojis = false;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expect(!agent.status_show_emojis);
+}
+
 test "slash /new clears history" {
     const allocator = std.testing.allocator;
     var agent = try makeTestAgent(allocator);
@@ -2716,8 +2735,24 @@ test "slash /status returns agent info" {
     const response = (try agent.handleSlashCommand("/status")).?;
     defer allocator.free(response);
 
+    try std.testing.expect(std.mem.indexOf(u8, response, "🌊 NullClaw ") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "test-model") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "42") != null);
+}
+
+test "slash /status can render without emojis" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.status_show_emojis = false;
+
+    const response = (try agent.handleSlashCommand("/status")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "🌊") == null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "NullClaw") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Model:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "🧠") == null);
 }
 
 test "slash /whoami returns current session id" {

@@ -141,6 +141,8 @@ pub const AgentConfig = struct {
     compaction_keep_recent: u32 = 20,
     compaction_max_summary_chars: u32 = 2_000,
     compaction_max_source_chars: u32 = 12_000,
+    /// Include emoji prefixes in `/status` output.
+    status_show_emojis: bool = true,
     /// Max seconds to wait for an LLM HTTP response (curl --max-time). 0 = no limit.
     message_timeout_secs: u64 = 600,
 };

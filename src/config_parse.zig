@@ -736,6 +736,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     self.agent.token_limit_explicit = true;
                 }
             }
+            if (ag.object.get("status_show_emojis")) |v| {
+                if (v == .bool) self.agent.status_show_emojis = v.bool;
+            }
             if (ag.object.get("message_timeout_secs")) |v| {
                 if (v == .integer) self.agent.message_timeout_secs = @intCast(v.integer);
             }
