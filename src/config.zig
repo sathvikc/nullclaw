@@ -224,7 +224,11 @@ pub const Config = struct {
 
         const home = platform.getHomeDir(allocator) catch return error.NoHomeDir;
 
-        const config_dir = try std.fs.path.join(allocator, &.{ home, ".nullclaw" });
+        // NULLCLAW_HOME overrides the default config directory (~/.nullclaw/).
+        const config_dir = if (std.posix.getenv("NULLCLAW_HOME")) |env_home|
+            try allocator.dupe(u8, env_home)
+        else
+            try std.fs.path.join(allocator, &.{ home, ".nullclaw" });
         const config_path = try std.fs.path.join(allocator, &.{ config_dir, "config.json" });
         const default_workspace_dir = try std.fs.path.join(allocator, &.{ config_dir, "workspace" });
 
