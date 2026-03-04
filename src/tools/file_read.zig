@@ -71,17 +71,19 @@ pub const FileReadTool = struct {
         defer file.close();
 
         const stat = try file.stat();
-        if (stat.size > self.max_file_size) {
+        const max_usize_u64: u64 = @intCast(std.math.maxInt(usize));
+        const effective_max_file_size = @min(self.max_file_size, max_usize_u64);
+        if (stat.size > effective_max_file_size) {
             const msg = try std.fmt.allocPrint(
                 allocator,
                 "File too large: {} bytes (limit: {} bytes)",
-                .{ stat.size, self.max_file_size },
+                .{ stat.size, effective_max_file_size },
             );
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         }
 
         // Read contents
-        const contents = file.readToEndAlloc(allocator, @intCast(self.max_file_size)) catch |err| {
+        const contents = file.readToEndAlloc(allocator, @intCast(effective_max_file_size)) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Failed to read file: {}", .{err});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
