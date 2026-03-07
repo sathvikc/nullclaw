@@ -290,7 +290,7 @@ pub fn buildSystemPrompt(
 
     // Runtime section
     try std.fmt.format(w, "## Runtime\n\nOS: {s} | Model: {s}\n\n", .{
-        @tagName(comptime std.Target.Os.Tag.macos),
+        @tagName(builtin.os.tag),
         ctx.model_name,
     });
 
