@@ -3733,6 +3733,11 @@ test "slash /think updates reasoning effort" {
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
 
+    const alias_resp = (try agent.handleSlashCommand("/think on")).?;
+    defer allocator.free(alias_resp);
+    try std.testing.expect(std.mem.indexOf(u8, alias_resp, "medium") != null);
+    try std.testing.expectEqualStrings("medium", agent.reasoning_effort.?);
+
     const set_resp = (try agent.handleSlashCommand("/think high")).?;
     defer allocator.free(set_resp);
     try std.testing.expect(std.mem.indexOf(u8, set_resp, "high") != null);
