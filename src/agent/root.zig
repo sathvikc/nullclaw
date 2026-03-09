@@ -26,6 +26,7 @@ const observability = @import("../observability.zig");
 const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
 const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
+const verbose_mod = @import("../verbose.zig");
 
 const cache = memory_mod.cache;
 pub const dispatcher = @import("dispatcher.zig");
@@ -47,6 +48,10 @@ const DEFAULT_MAX_TOOL_ITERATIONS: u32 = 25;
 
 /// Maximum non-system messages before trimming.
 const DEFAULT_MAX_HISTORY: u32 = 50;
+
+fn estimate_text_tokens(text: []const u8) u32 {
+    return @intCast((text.len + 3) / 4);
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Agent
@@ -246,6 +251,15 @@ pub const Agent = struct {
     workspace_dir: []const u8,
     allowed_paths: []const []const u8 = &.{},
     multimodal_unrestricted: bool = false,
+    /// List of models that do not support image/vision input.
+    /// When image markers are detected and the model is in this list,
+    /// the agent will skip processing images instead of returning an error.
+    vision_disabled_models: []const []const u8 = &.{},
+    /// When true, automatically adds the current model to vision_disabled_models
+    /// upon receiving a "model does not support vision" error.
+    auto_disable_vision_on_error: bool = true,
+    /// Models auto-detected as not supporting vision (built at runtime).
+    detected_vision_disabled: std.ArrayListUnmanaged([]const u8) = .empty,
     max_tool_iterations: u32,
     max_history_messages: u32,
     auto_save: bool,
@@ -399,6 +413,8 @@ pub const Agent = struct {
             .workspace_dir = cfg.workspace_dir,
             .allowed_paths = cfg.autonomy.allowed_paths,
             .multimodal_unrestricted = cfg.autonomy.level == .yolo,
+            .vision_disabled_models = cfg.agent.vision_disabled_models,
+            .auto_disable_vision_on_error = cfg.agent.auto_disable_vision_on_error,
             .max_tool_iterations = cfg.agent.max_tool_iterations,
             .max_history_messages = cfg.agent.max_history_messages,
             .auto_save = cfg.memory.auto_save,
@@ -450,6 +466,10 @@ pub const Agent = struct {
             msg.deinit(self.allocator);
         }
         self.history.deinit(self.allocator);
+        for (self.detected_vision_disabled.items) |model| {
+            self.allocator.free(model);
+        }
+        self.detected_vision_disabled.deinit(self.allocator);
         self.allocator.free(self.tool_specs);
     }
 
@@ -1136,7 +1156,7 @@ pub const Agent = struct {
                     self.temperature,
                     self.stream_callback.?,
                     self.stream_ctx.?,
-                ) catch |err| {
+                ) catch |err| retry_stream: {
                     const fail_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - timer_start)));
                     const fail_event = ObserverEvent{ .llm_response = .{
                         .provider = self.provider.getName(),
@@ -1146,6 +1166,41 @@ pub const Agent = struct {
                         .error_message = @errorName(err),
                     } };
                     self.observer.recordEvent(&fail_event);
+
+                    // Auto-disable vision on first "model does not support vision" error
+                    if (self.auto_disable_vision_on_error and err == error.ProviderDoesNotSupportVision) {
+                        if (self.verbose_level == .on or self.verbose_level == .full) {
+                            log.info("Auto-disabling vision for model {s}", .{self.model_name});
+                        }
+                        try self.markVisionDisabled();
+                        const retry_msgs = try self.buildProviderMessages(arena);
+                        const retry_max_tokens = self.effectiveMaxTokensForMessagesWithToolSpecs(
+                            retry_msgs,
+                            if (native_tools_enabled) turn_tool_specs else null,
+                        );
+                        response_attempt = 2;
+                        self.logLlmRequest(iteration + 1, 2, retry_msgs, native_tools_enabled, true);
+                        break :retry_stream self.provider.streamChat(
+                            self.allocator,
+                            .{
+                                .messages = retry_msgs,
+                                .model = self.model_name,
+                                .temperature = self.temperature,
+                                .max_tokens = retry_max_tokens,
+                                .tools = null,
+                                .timeout_secs = self.message_timeout_secs,
+                                .reasoning_effort = self.reasoning_effort,
+                            },
+                            self.model_name,
+                            self.temperature,
+                            self.stream_callback.?,
+                            self.stream_ctx.?,
+                        ) catch |retry_err| {
+                            self.emitUsageFailure();
+                            return retry_err;
+                        };
+                    }
+
                     self.emitUsageFailure();
                     return err;
                 };
@@ -1181,6 +1236,37 @@ pub const Agent = struct {
                         .error_message = @errorName(err),
                     } };
                     self.observer.recordEvent(&fail_event);
+
+                    // Auto-disable vision on first "model does not support vision" error
+                    if (self.auto_disable_vision_on_error and err == error.ProviderDoesNotSupportVision) {
+                        if (self.verbose_level == .on or self.verbose_level == .full) {
+                            log.info("Auto-disabling vision for model {s}", .{self.model_name});
+                        }
+                        try self.markVisionDisabled();
+                        const retry_msgs = try self.buildProviderMessages(arena);
+                        const retry_max_tokens = self.effectiveMaxTokensForMessagesWithToolSpecs(
+                            retry_msgs,
+                            if (native_tools_enabled) turn_tool_specs else null,
+                        );
+                        self.logLlmRequest(iteration + 1, 2, retry_msgs, native_tools_enabled, false);
+                        break :retry_blk self.provider.chat(
+                            self.allocator,
+                            .{
+                                .messages = retry_msgs,
+                                .model = self.model_name,
+                                .temperature = self.temperature,
+                                .max_tokens = retry_max_tokens,
+                                .tools = if (native_tools_enabled) turn_tool_specs else null,
+                                .timeout_secs = self.message_timeout_secs,
+                                .reasoning_effort = self.reasoning_effort,
+                            },
+                            self.model_name,
+                            self.temperature,
+                        ) catch |retry_err| {
+                            self.emitUsageFailure();
+                            return retry_err;
+                        };
+                    }
 
                     // Context exhaustion: compact immediately before first retry
                     const err_name = @errorName(err);
@@ -1279,6 +1365,8 @@ pub const Agent = struct {
             } };
             self.observer.recordEvent(&resp_event);
 
+            const response_text = response.contentOrEmpty();
+
             // Track tokens with provider-agnostic fallback when total is omitted.
             var normalized_usage = response.usage;
             if (normalized_usage.total_tokens == 0 and
@@ -1286,13 +1374,16 @@ pub const Agent = struct {
             {
                 normalized_usage.total_tokens = normalized_usage.prompt_tokens +| normalized_usage.completion_tokens;
             }
+            // Some providers/channels omit usage entirely; keep status counters useful.
+            if (normalized_usage.total_tokens == 0 and normalized_usage.prompt_tokens == 0 and normalized_usage.completion_tokens == 0 and response_text.len > 0) {
+                normalized_usage.completion_tokens = estimate_text_tokens(response_text);
+                normalized_usage.total_tokens = normalized_usage.completion_tokens;
+            }
             response.usage = normalized_usage;
 
             self.total_tokens += normalized_usage.total_tokens;
             self.last_turn_usage = normalized_usage;
             self.emitUsageRecord(&response, true);
-
-            const response_text = response.contentOrEmpty();
             const use_native = response.hasToolCalls();
 
             // Determine tool calls: structured (native) first, then XML fallback.
@@ -1792,6 +1883,9 @@ pub const Agent = struct {
                 @import("../http_util.zig").setThreadInterruptFlag(&self.interrupt_requested);
                 defer @import("../http_util.zig").setThreadInterruptFlag(null);
                 const result = t.execute(tool_allocator, args) catch |err| {
+                    if (verbose_mod.isVerbose()) {
+                        log.info("tool result: name={s} error={s}", .{ call.name, @errorName(err) });
+                    }
                     return .{
                         .name = call.name,
                         .output = @errorName(err),
@@ -1804,6 +1898,10 @@ pub const Agent = struct {
                         std.mem.indexOf(u8, result.output, "Interrupted by /stop") != null);
                 if (was_interrupted) {
                     self.noteInterruptedTool(trimmed_call_name) catch {};
+                }
+                if (verbose_mod.isVerbose()) {
+                    const output_preview = if (result.output.len > 256) result.output[0..256] else result.output;
+                    log.info("tool result: name={s} success={} output_len={d} output={s}...", .{ call.name, result.success, result.output.len, output_preview });
                 }
                 return .{
                     .name = call.name,
@@ -1951,6 +2049,27 @@ pub const Agent = struct {
         self.emitUsageRecord(&failed, false);
     }
 
+    /// Check if vision is disabled for current model (either configured or auto-detected).
+    fn isVisionDisabled(self: *const Agent) bool {
+        for (self.vision_disabled_models) |model| {
+            if (std.mem.eql(u8, model, self.model_name)) return true;
+        }
+        for (self.detected_vision_disabled.items) |model| {
+            if (std.mem.eql(u8, model, self.model_name)) return true;
+        }
+        return false;
+    }
+
+    /// Add model to detected vision disabled list if not already present.
+    fn markVisionDisabled(self: *Agent) !void {
+        const already_disabled = for (self.detected_vision_disabled.items) |model| {
+            if (std.mem.eql(u8, model, self.model_name)) break true;
+        } else false;
+        if (!already_disabled) {
+            try self.detected_vision_disabled.append(self.allocator, try self.allocator.dupe(u8, self.model_name));
+        }
+    }
+
     /// Build provider-ready ChatMessage slice from owned history.
     /// Applies multimodal preprocessing and vision capability checks.
     fn buildProviderMessages(self: *Agent, arena: std.mem.Allocator) ![]ChatMessage {
@@ -1960,8 +2079,28 @@ pub const Agent = struct {
         }
 
         const image_marker_count = multimodal.countImageMarkersInLastUser(m);
-        if (image_marker_count > 0 and !self.provider.supportsVisionForModel(self.model_name)) {
-            return error.ProviderDoesNotSupportVision;
+        if (image_marker_count == 0) {
+            return m;
+        }
+
+        // Check if vision is disabled (configured or auto-detected)
+        if (self.isVisionDisabled()) {
+            if (self.verbose_level == .on or self.verbose_level == .full) {
+                log.info("Vision disabled for model {s}, stripping image markers", .{self.model_name});
+            }
+            return multimodal.stripImageMarkers(arena, m);
+        }
+
+        // Check if provider supports vision for this model
+        if (!self.provider.supportsVisionForModel(self.model_name)) {
+            if (self.verbose_level == .on or self.verbose_level == .full) {
+                log.info("Model {s} does not support vision, stripping image markers", .{self.model_name});
+            }
+            // Auto-disable vision if configured
+            if (self.auto_disable_vision_on_error) {
+                try self.markVisionDisabled();
+            }
+            return multimodal.stripImageMarkers(arena, m);
         }
 
         // Allow local multimodal reads from:
@@ -2576,7 +2715,11 @@ test "Agent buildProviderMessages uses model-aware vision capability" {
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    try std.testing.expectError(error.ProviderDoesNotSupportVision, agent.buildProviderMessages(arena));
+    const text_model_messages = try agent.buildProviderMessages(arena);
+    try std.testing.expectEqual(@as(usize, 1), text_model_messages.len);
+    try std.testing.expect(text_model_messages[0].content_parts == null);
+    try std.testing.expect(std.mem.indexOf(u8, text_model_messages[0].content, "[IMAGE:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text_model_messages[0].content, "omitted because the current model does not support vision") != null);
 
     agent.model_name = "vision-model";
     const messages = try agent.buildProviderMessages(arena);
@@ -4149,6 +4292,74 @@ test "turn includes reasoning and usage footer when enabled" {
     try std.testing.expect(std.mem.indexOf(u8, response, "Reasoning:\nthinking trace") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "[usage] total_tokens=10") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "final answer") != null);
+}
+
+test "turn estimates token usage when provider omits usage" {
+    const ProviderState = struct {
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{
+                .content = try allocator.dupe(u8, "final answer"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "test";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    var state: u8 = 0;
+    const vtable = Provider.VTable{
+        .chatWithSystem = ProviderState.chatWithSystem,
+        .chat = ProviderState.chat,
+        .supportsNativeTools = ProviderState.supportsNativeTools,
+        .getName = ProviderState.getName,
+        .deinit = ProviderState.deinitFn,
+    };
+    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &vtable };
+
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+
+    const expected_tokens = estimate_text_tokens("final answer");
+    try std.testing.expectEqual(@as(u64, expected_tokens), agent.tokensUsed());
+
+    const status = (try agent.handleSlashCommand("/status")).?;
+    defer allocator.free(status);
+    var expected_line_buf: [64]u8 = undefined;
+    const expected_line = try std.fmt.bufPrint(&expected_line_buf, "Tokens used: {d}", .{expected_tokens});
+    try std.testing.expect(std.mem.indexOf(u8, status, expected_line) != null);
 }
 
 test "turn refreshes system prompt after workspace markdown change" {

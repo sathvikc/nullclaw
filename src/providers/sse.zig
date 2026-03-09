@@ -1,6 +1,106 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const root = @import("root.zig");
 const http_util = @import("../http_util.zig");
+const platform = @import("../platform.zig");
+const error_classify = @import("error_classify.zig");
+const verbose = @import("../verbose.zig");
+const log = std.log.scoped(.provider_sse);
+
+fn finalizeStreamResult(
+    allocator: std.mem.Allocator,
+    accumulated: []const u8,
+    output_tokens: ?u32,
+) !root.StreamChatResult {
+    const content = if (accumulated.len > 0)
+        try allocator.dupe(u8, accumulated)
+    else
+        null;
+
+    const completion_tokens = if (output_tokens) |ot|
+        (if (ot > 0) ot else @as(u32, @intCast((accumulated.len + 3) / 4)))
+    else
+        @as(u32, @intCast((accumulated.len + 3) / 4));
+
+    return .{
+        .content = content,
+        .usage = .{ .completion_tokens = completion_tokens },
+        .model = "",
+    };
+}
+
+const CurlBodyArg = struct {
+    arg: []const u8,
+    temp_path_buf: [std.fs.max_path_bytes]u8 = undefined,
+    temp_path_len: usize = 0,
+    uses_temp_file: bool = false,
+
+    fn deinit(self: *const CurlBodyArg, allocator: std.mem.Allocator) void {
+        if (!self.uses_temp_file) return;
+        std.fs.deleteFileAbsolute(self.temp_path_buf[0..self.temp_path_len]) catch {};
+        allocator.free(self.arg);
+    }
+};
+
+fn prepareCurlBodyArg(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    log_enabled: bool,
+) !CurlBodyArg {
+    if (builtin.os.tag != .windows) {
+        return .{ .arg = body };
+    }
+
+    const debug_log = std.log.scoped(.sse);
+    var prepared: CurlBodyArg = .{ .arg = body };
+
+    const tmp_dir_path = platform.getTempDir(allocator) catch
+        return error.TempDirNotFound;
+    defer allocator.free(tmp_dir_path);
+
+    var tmp_dir = std.fs.openDirAbsolute(tmp_dir_path, .{}) catch
+        return error.TempDirNotFound;
+    defer tmp_dir.close();
+
+    const body_path = std.fmt.bufPrint(
+        &prepared.temp_path_buf,
+        "{s}{s}sse_body_{d}.tmp",
+        .{ tmp_dir_path, std.fs.path.sep_str, std.time.timestamp() },
+    ) catch return error.PathTooLong;
+    prepared.temp_path_len = body_path.len;
+    errdefer std.fs.deleteFileAbsolute(prepared.temp_path_buf[0..prepared.temp_path_len]) catch {};
+
+    var tmp_file = tmp_dir.createFile(
+        body_path[tmp_dir_path.len + 1 ..],
+        .{ .truncate = true, .exclusive = false },
+    ) catch return error.TempFileCreateFailed;
+
+    tmp_file.writeAll(body) catch {
+        tmp_file.close();
+        return error.TempFileWriteFailed;
+    };
+    tmp_file.close();
+
+    if (log_enabled) {
+        debug_log.info("Using temp file for curl body: {s}, body_len={d}", .{ body_path, body.len });
+    }
+
+    const verify_file = std.fs.openFileAbsolute(body_path, .{}) catch return error.TempFileCreateFailed;
+    defer verify_file.close();
+    const verify_stat = verify_file.stat() catch return error.TempFileCreateFailed;
+    if (log_enabled) {
+        debug_log.info("Temp body file size: {d} bytes", .{verify_stat.size});
+    }
+
+    for (prepared.temp_path_buf[0..prepared.temp_path_len]) |*c| {
+        if (c.* == '\\') c.* = '/';
+    }
+
+    prepared.arg = try std.fmt.allocPrint(allocator, "@{s}", .{prepared.temp_path_buf[0..prepared.temp_path_len]});
+    errdefer allocator.free(prepared.arg);
+    prepared.uses_temp_file = true;
+    return prepared;
+}
 
 /// Result of parsing a single SSE line.
 pub const SseLineResult = union(enum) {
@@ -74,6 +174,10 @@ pub fn curlStream(
     callback: root.StreamCallback,
     ctx: *anyopaque,
 ) !root.StreamChatResult {
+    // Check verbose mode once at function start
+    const log_enabled = verbose.isVerbose();
+    const debug_log = std.log.scoped(.sse);
+
     // Build argv on stack (max 32 args)
     var argv_buf: [32][]const u8 = undefined;
     var argc: usize = 0;
@@ -130,18 +234,57 @@ pub fn curlStream(
         argc += 1;
     }
 
-    argv_buf[argc] = "-d";
-    argc += 1;
-    argv_buf[argc] = body;
+    // On Windows, command line length is limited to ~32767 chars.
+    // Use a temp file there to avoid NameTooLong; keep other platforms in-memory.
+    var prepared_body = try prepareCurlBodyArg(allocator, body, log_enabled);
+    defer prepared_body.deinit(allocator);
+
+    if (prepared_body.uses_temp_file) {
+        argv_buf[argc] = "--data-binary";
+        argc += 1;
+    } else {
+        argv_buf[argc] = "-d";
+        argc += 1;
+    }
+    argv_buf[argc] = prepared_body.arg;
     argc += 1;
     argv_buf[argc] = url;
     argc += 1;
+
+    // Debug: log the curl command
+    if (log_enabled) {
+        debug_log.info("curl argc={d}, body_len={d}, used_temp_file={}, body_arg={s}", .{ argc, body.len, prepared_body.uses_temp_file, prepared_body.arg });
+    }
+
+    var cmd_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer cmd_buf.deinit(allocator);
+    for (argv_buf[0..argc], 0..) |arg, i| {
+        if (i > 0) cmd_buf.append(allocator, ' ') catch {};
+        // Quote arguments that contain spaces or special chars for easy copy-paste
+        if (std.mem.indexOfAny(u8, arg, " \t\"'") != null or std.mem.startsWith(u8, arg, "@")) {
+            cmd_buf.append(allocator, '"') catch {};
+            cmd_buf.appendSlice(allocator, arg) catch {};
+            cmd_buf.append(allocator, '"') catch {};
+        } else {
+            cmd_buf.appendSlice(allocator, arg) catch {};
+        }
+    }
+    if (log_enabled) {
+        debug_log.info("curl command: {s}", .{cmd_buf.items});
+    }
 
     var child = std.process.Child.init(argv_buf[0..argc], allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
 
+    if (log_enabled) {
+        debug_log.info("spawning curl process...", .{});
+    }
     try child.spawn();
+    if (log_enabled) {
+        const pid: i64 = if (@import("builtin").os.tag == .windows) @intCast(@intFromPtr(child.id)) else child.id;
+        debug_log.info("curl process spawned, pid={d}", .{pid});
+    }
 
     // Read stdout line by line, parse SSE events
     var accumulated: std.ArrayListUnmanaged(u8) = .empty;
@@ -150,16 +293,60 @@ pub fn curlStream(
     var line_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer line_buf.deinit(allocator);
 
-    const file = child.stdout.?;
+    const stdout_file = child.stdout.?;
     var read_buf: [4096]u8 = undefined;
     var saw_done = false;
+    var total_stdout: usize = 0;
 
     outer: while (true) {
-        const n = file.read(&read_buf) catch break;
-        if (n == 0) break;
+        const n = stdout_file.read(&read_buf) catch |err| {
+            if (log_enabled) {
+                debug_log.info("stdout read error: {}", .{err});
+            }
+            break;
+        };
+        if (n == 0) {
+            if (log_enabled) {
+                debug_log.info("stdout read returned 0 bytes (EOF)", .{});
+            }
+            break;
+        }
+        total_stdout += n;
+
+        if (log_enabled) {
+            debug_log.info("stdout read {d} bytes: {s}", .{ n, read_buf[0..n] });
+        }
+
+        // Check if this is JSON (starts with '{')
+        if (total_stdout == n and read_buf[0] == '{') {
+            if (log_enabled) {
+                debug_log.info("Detected JSON response, not SSE", .{});
+            }
+            // This is a JSON error, not SSE
+            const json_response = try allocator.dupe(u8, read_buf[0..n]);
+            defer allocator.free(json_response);
+
+            // Try to classify the error
+            const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_response, .{}) catch null;
+            if (parsed) |p| {
+                defer p.deinit();
+                if (error_classify.classifyKnownApiError(p.value.object)) |kind| {
+                    _ = child.wait() catch {};
+                    return error_classify.kindToError(kind);
+                }
+            }
+
+            // Return a meaningful error
+            _ = child.wait() catch {};
+            debug_log.err("Server returned JSON error: {s}", .{json_response});
+            return error.ServerError;
+        }
 
         for (read_buf[0..n]) |byte| {
             if (byte == '\n') {
+                if (log_enabled) {
+                    debug_log.info("parsing SSE line: {s}", .{line_buf.items});
+                }
                 const result = parseSseLine(allocator, line_buf.items) catch {
                     line_buf.clearRetainingCapacity();
                     continue;
@@ -172,6 +359,9 @@ pub fn curlStream(
                         callback(ctx, root.StreamChunk.textDelta(text));
                     },
                     .done => {
+                        if (log_enabled) {
+                            debug_log.info("SSE stream done", .{});
+                        }
                         saw_done = true;
                         break :outer;
                     },
@@ -181,6 +371,10 @@ pub fn curlStream(
                 try line_buf.append(allocator, byte);
             }
         }
+    }
+
+    if (log_enabled) {
+        debug_log.info("stdout stream ended, saw_done={}, accumulated_len={d}, total_stdout={d}", .{ saw_done, accumulated.items.len, total_stdout });
     }
 
     // Parse a trailing line when the stream ends without a final '\n'.
@@ -202,29 +396,50 @@ pub fn curlStream(
 
     // Drain remaining stdout to prevent deadlock on wait()
     while (true) {
-        const n = file.read(&read_buf) catch break;
+        const n = stdout_file.read(&read_buf) catch break;
         if (n == 0) break;
+        if (log_enabled) {
+            debug_log.info("drained {d} more stdout bytes", .{n});
+        }
     }
 
-    const term = child.wait() catch return error.CurlWaitError;
+    if (log_enabled) {
+        debug_log.info("waiting for curl process to exit...", .{});
+    }
+    const term = child.wait() catch |err| {
+        log.err("curlStream child.wait failed: {}", .{err});
+        if (saw_done) {
+            log.warn("curlStream proceeding despite wait failure after receiving stream data", .{});
+            callback(ctx, root.StreamChunk.finalChunk());
+            return finalizeStreamResult(allocator, accumulated.items, null);
+        }
+        return error.CurlWaitError;
+    };
+    if (log_enabled) {
+        debug_log.info("curl process terminated: {}", .{term});
+    }
     switch (term) {
-        .Exited => |code| if (code != 0) return error.CurlFailed,
-        else => return error.CurlFailed,
+        .Exited => |code| if (code != 0) {
+            if (saw_done) {
+                log.warn("curlStream exit code {d} after stream data; returning accumulated output", .{code});
+                callback(ctx, root.StreamChunk.finalChunk());
+                return finalizeStreamResult(allocator, accumulated.items, null);
+            }
+            return error.CurlFailed;
+        },
+        else => {
+            if (saw_done) {
+                log.warn("curlStream abnormal termination after stream data; returning accumulated output", .{});
+                callback(ctx, root.StreamChunk.finalChunk());
+                return finalizeStreamResult(allocator, accumulated.items, null);
+            }
+            return error.CurlFailed;
+        },
     }
 
     // Signal stream completion only after curl exits successfully.
     callback(ctx, root.StreamChunk.finalChunk());
-
-    const content = if (accumulated.items.len > 0)
-        try allocator.dupe(u8, accumulated.items)
-    else
-        null;
-
-    return .{
-        .content = content,
-        .usage = .{ .completion_tokens = @intCast((accumulated.items.len + 3) / 4) },
-        .model = "",
-    };
+    return finalizeStreamResult(allocator, accumulated.items, null);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -380,9 +595,17 @@ pub fn curlStreamAnthropic(
         argc += 1;
     }
 
-    argv_buf[argc] = "-d";
+    const log_enabled = verbose.isVerbose();
+    var prepared_body = try prepareCurlBodyArg(allocator, body, log_enabled);
+    defer prepared_body.deinit(allocator);
+
+    if (prepared_body.uses_temp_file) {
+        argv_buf[argc] = "--data-binary";
+    } else {
+        argv_buf[argc] = "-d";
+    }
     argc += 1;
-    argv_buf[argc] = body;
+    argv_buf[argc] = prepared_body.arg;
     argc += 1;
     argv_buf[argc] = url;
     argc += 1;
@@ -402,6 +625,7 @@ pub fn curlStreamAnthropic(
 
     var current_event: []const u8 = "";
     var output_tokens: u32 = 0;
+    var saw_done = false;
 
     const file = child.stdout.?;
     var read_buf: [4096]u8 = undefined;
@@ -429,6 +653,7 @@ pub fn curlStreamAnthropic(
                     },
                     .usage => |tokens| output_tokens = tokens,
                     .done => {
+                        saw_done = true;
                         line_buf.clearRetainingCapacity();
                         break :outer;
                     },
@@ -444,37 +669,42 @@ pub fn curlStreamAnthropic(
     // Free owned event string
     if (current_event.len > 0) allocator.free(@constCast(current_event));
 
-    // Send final chunk
-    callback(ctx, root.StreamChunk.finalChunk());
-
     // Drain remaining stdout to prevent deadlock on wait()
     while (true) {
         const n = file.read(&read_buf) catch break;
         if (n == 0) break;
     }
 
-    const term = child.wait() catch return error.CurlWaitError;
+    const term = child.wait() catch |err| {
+        log.err("curlStreamAnthropic child.wait failed: {}", .{err});
+        if (saw_done) {
+            log.warn("curlStreamAnthropic proceeding despite wait failure after receiving stream data", .{});
+            callback(ctx, root.StreamChunk.finalChunk());
+            return finalizeStreamResult(allocator, accumulated.items, output_tokens);
+        }
+        return error.CurlWaitError;
+    };
     switch (term) {
-        .Exited => |code| if (code != 0) return error.CurlFailed,
-        else => return error.CurlFailed,
+        .Exited => |code| if (code != 0) {
+            if (saw_done) {
+                log.warn("curlStreamAnthropic exit code {d} after stream data; returning accumulated output", .{code});
+                callback(ctx, root.StreamChunk.finalChunk());
+                return finalizeStreamResult(allocator, accumulated.items, output_tokens);
+            }
+            return error.CurlFailed;
+        },
+        else => {
+            if (saw_done) {
+                log.warn("curlStreamAnthropic abnormal termination after stream data; returning accumulated output", .{});
+                callback(ctx, root.StreamChunk.finalChunk());
+                return finalizeStreamResult(allocator, accumulated.items, output_tokens);
+            }
+            return error.CurlFailed;
+        },
     }
 
-    const content = if (accumulated.items.len > 0)
-        try allocator.dupe(u8, accumulated.items)
-    else
-        null;
-
-    // Use actual output_tokens if reported, otherwise estimate
-    const completion_tokens = if (output_tokens > 0)
-        output_tokens
-    else
-        @as(u32, @intCast((accumulated.items.len + 3) / 4));
-
-    return .{
-        .content = content,
-        .usage = .{ .completion_tokens = completion_tokens },
-        .model = "",
-    };
+    callback(ctx, root.StreamChunk.finalChunk());
+    return finalizeStreamResult(allocator, accumulated.items, output_tokens);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -490,6 +720,21 @@ test "parseSseLine valid delta" {
             try std.testing.expectEqualStrings("Hello", text);
         },
         else => return error.TestUnexpectedResult,
+    }
+}
+
+test "prepareCurlBodyArg uses temp file only on Windows" {
+    const allocator = std.testing.allocator;
+    const body = [_]u8{'x'} ** 4096;
+    var prepared = try prepareCurlBodyArg(allocator, body[0..], false);
+    defer prepared.deinit(allocator);
+
+    if (builtin.os.tag == .windows) {
+        try std.testing.expect(prepared.uses_temp_file);
+        try std.testing.expect(std.mem.startsWith(u8, prepared.arg, "@"));
+    } else {
+        try std.testing.expect(!prepared.uses_temp_file);
+        try std.testing.expectEqualStrings(body[0..], prepared.arg);
     }
 }
 

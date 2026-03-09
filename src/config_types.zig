@@ -193,6 +193,13 @@ pub const AgentConfig = struct {
     /// Per-turn MCP tool filtering. Empty slice = no filtering (all tools included).
     /// See ToolFilterGroup for semantics.
     tool_filter_groups: []const ToolFilterGroup = &.{},
+    /// List of models that do not support image/vision input.
+    /// When image markers are detected and the model is in this list,
+    /// the agent will skip processing images instead of returning an error.
+    vision_disabled_models: []const []const u8 = &.{},
+    /// When true, automatically adds the current model to vision_disabled_models
+    /// upon receiving a "model does not support vision" error.
+    auto_disable_vision_on_error: bool = true,
 };
 
 pub const ToolsConfig = struct {
@@ -261,6 +268,14 @@ pub const SlackReceiveMode = enum {
     http,
 };
 
+pub const SlackReplyToMode = enum {
+    /// Only thread when the triggering message is already a thread reply
+    /// (thread_ts present and differs from ts). Default.
+    off,
+    /// Always reply in a thread, using thread_ts if present or message ts otherwise.
+    all,
+};
+
 pub const SlackConfig = struct {
     account_id: []const u8 = "default",
     mode: SlackReceiveMode = .socket,
@@ -272,6 +287,7 @@ pub const SlackConfig = struct {
     allow_from: []const []const u8 = &.{},
     dm_policy: []const u8 = "pairing",
     group_policy: []const u8 = "mention_only",
+    reply_to_mode: SlackReplyToMode = .off,
 };
 
 pub const WebhookConfig = struct {

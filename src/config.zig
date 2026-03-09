@@ -736,6 +736,8 @@ pub const Config = struct {
             .compaction_max_source_chars = self.agent.compaction_max_source_chars,
             .status_show_emojis = self.agent.status_show_emojis,
             .message_timeout_secs = self.agent.message_timeout_secs,
+            .vision_disabled_models = self.agent.vision_disabled_models,
+            .auto_disable_vision_on_error = self.agent.auto_disable_vision_on_error,
         }, .{})});
 
         // Channels
@@ -2335,9 +2337,11 @@ test "json parse scheduler section" {
 }
 
 test "json parse agent section" {
-    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     const json =
-        \\{"agent": {"compact_context": true, "max_tool_iterations": 20, "max_history_messages": 80, "parallel_tools": true, "tool_dispatcher": "xml", "token_limit": 64000, "status_show_emojis": false}}
+        \\{"agent": {"compact_context": true, "max_tool_iterations": 20, "max_history_messages": 80, "parallel_tools": true, "tool_dispatcher": "xml", "token_limit": 64000, "status_show_emojis": false, "vision_disabled_models": ["router/text-only"], "auto_disable_vision_on_error": false}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
@@ -2349,7 +2353,9 @@ test "json parse agent section" {
     try std.testing.expectEqual(@as(u64, 64_000), cfg.agent.token_limit);
     try std.testing.expect(cfg.agent.token_limit_explicit);
     try std.testing.expect(!cfg.agent.status_show_emojis);
-    allocator.free(cfg.agent.tool_dispatcher);
+    try std.testing.expectEqual(@as(usize, 1), cfg.agent.vision_disabled_models.len);
+    try std.testing.expectEqualStrings("router/text-only", cfg.agent.vision_disabled_models[0]);
+    try std.testing.expect(!cfg.agent.auto_disable_vision_on_error);
 }
 
 test "json parse agent token_limit explicit remains false when omitted" {
@@ -2794,6 +2800,8 @@ test "save and load roundtrip" {
     cfg.default_provider = try allocator.dupe(u8, "glm");
     cfg.default_model = try allocator.dupe(u8, "glm-4.7");
     cfg.workspace_dir_override = try allocator.dupe(u8, "C:\\Users\\menger\\Desktop\\myspace");
+    cfg.agent.vision_disabled_models = &.{ "router/text-only", "router/backup-text" };
+    cfg.agent.auto_disable_vision_on_error = false;
 
     try cfg.save();
 
@@ -2812,6 +2820,9 @@ test "save and load roundtrip" {
     try std.testing.expectEqualStrings("glm", cfg2.default_provider);
     try std.testing.expectEqualStrings("glm-4.7", cfg2.default_model.?);
     try std.testing.expect(cfg2.workspace_dir_override != null);
+    try std.testing.expectEqual(@as(usize, 2), cfg2.agent.vision_disabled_models.len);
+    try std.testing.expectEqualStrings("router/text-only", cfg2.agent.vision_disabled_models[0]);
+    try std.testing.expect(!cfg2.agent.auto_disable_vision_on_error);
 }
 
 test "parse agents.list with model object" {

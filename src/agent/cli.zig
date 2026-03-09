@@ -24,6 +24,7 @@ const security = @import("../security/policy.zig");
 const auth_mod = @import("../auth.zig");
 const onboard = @import("../onboard.zig");
 const streaming = @import("../streaming.zig");
+const verbose = @import("../verbose.zig");
 
 const Agent = @import("root.zig").Agent;
 
@@ -90,6 +91,7 @@ const ParsedAgentArgs = struct {
     provider_override: ?[]const u8 = null,
     model_override: ?[]const u8 = null,
     temperature_override: ?f64 = null,
+    verbose: bool = false,
 };
 
 const AgentArgParseResult = union(enum) {
@@ -124,6 +126,8 @@ fn parseAgentArgs(args: []const []const u8) AgentArgParseResult {
             i += 1;
             const temp = std.fmt.parseFloat(f64, args[i]) catch return .{ .invalid_temperature = args[i] };
             parsed.temperature_override = temp;
+        } else if (std.mem.eql(u8, arg, "--verbose") or std.mem.eql(u8, arg, "-v")) {
+            parsed.verbose = true;
         }
     }
     return .{ .ok = parsed };
@@ -158,6 +162,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (parsed_args.temperature_override) |temp| {
         cfg.default_temperature = temp;
         cfg.temperature = temp;
+    }
+    if (parsed_args.verbose) {
+        log.warn("Verbose flag detected, enabling verbose logging", .{});
+        verbose.setVerbose(true);
     }
 
     cfg.validate() catch |err| {
@@ -255,6 +263,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .web_search_provider = cfg.http_request.search_provider,
         .web_search_fallback_providers = cfg.http_request.search_fallback_providers,
         .browser_enabled = cfg.browser.enabled,
+        .screenshot_enabled = true,
         .mcp_tools = mcp_tools,
         .agents = cfg.agents,
         .fallback_api_key = resolved_api_key,
