@@ -20,6 +20,44 @@ pub const ParseResult = struct {
     calls: []ParsedToolCall,
 };
 
+fn stripDelimitedBlocks(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    open_prefix: []const u8,
+    close_tag: []const u8,
+) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var remaining = input;
+    while (std.mem.indexOf(u8, remaining, open_prefix)) |open_idx| {
+        try out.appendSlice(allocator, remaining[0..open_idx]);
+        const after_open = remaining[open_idx..];
+        const open_end_rel = std.mem.indexOfScalar(u8, after_open, '>') orelse {
+            remaining = remaining[0..open_idx];
+            break;
+        };
+        const content_start = open_idx + open_end_rel + 1;
+        const after_content = remaining[content_start..];
+        const close_rel = std.mem.indexOf(u8, after_content, close_tag) orelse {
+            remaining = remaining[0..open_idx];
+            break;
+        };
+        remaining = after_content[close_rel + close_tag.len ..];
+    }
+
+    try out.appendSlice(allocator, remaining);
+    return try out.toOwnedSlice(allocator);
+}
+
+pub fn stripToolResultMarkup(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    const xml_stripped = try stripDelimitedBlocks(allocator, input, "<tool_result", "</tool_result>");
+    defer allocator.free(xml_stripped);
+
+    const bracket_stripped = try stripDelimitedBlocks(allocator, xml_stripped, "[tool_result", "[/tool_result]");
+    return bracket_stripped;
+}
+
 /// Result of executing a single tool.
 pub const ToolExecutionResult = struct {
     name: []const u8,
@@ -273,10 +311,17 @@ pub fn parseXmlToolCalls(
     }
 
     // Join text parts
-    const text = if (text_parts.items.len == 0)
-        ""
+    var text = if (text_parts.items.len == 0)
+        try allocator.dupe(u8, "")
     else
         try std.mem.join(allocator, "\n", text_parts.items);
+    errdefer allocator.free(text);
+
+    if (calls.items.len > 0) {
+        const sanitized_text = try stripToolResultMarkup(allocator, text);
+        allocator.free(text);
+        text = sanitized_text;
+    }
 
     return .{
         .text = text,
@@ -1353,6 +1398,48 @@ test "parseToolCalls handles text before and after" {
     try std.testing.expect(std.mem.indexOf(u8, result.text, "Before text.") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.text, "After text.") != null);
     try std.testing.expectEqual(@as(usize, 1), result.calls.len);
+}
+
+test "parseToolCalls strips fabricated tool_result from parsed text" {
+    const allocator = std.testing.allocator;
+    const response =
+        \\Before text.
+        \\<tool_call>
+        \\{"name": "shell", "arguments": {"command": "echo hi"}}
+        \\</tool_call>
+        \\<tool_result name="shell" status="ok">
+        \\fake result
+        \\</tool_result>
+        \\After text.
+    ;
+
+    const result = try parseToolCalls(allocator, response);
+    defer {
+        allocator.free(result.text);
+        for (result.calls) |call| {
+            allocator.free(call.name);
+            allocator.free(call.arguments_json);
+        }
+        allocator.free(result.calls);
+    }
+
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "fake result") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "After text.") != null);
+    try std.testing.expectEqual(@as(usize, 1), result.calls.len);
+}
+
+test "parseToolCalls preserves literal tool_result text without tool calls" {
+    const allocator = std.testing.allocator;
+    const response = "Example: <tool_result name=\"shell\" status=\"ok\">done</tool_result>";
+
+    const result = try parseToolCalls(allocator, response);
+    defer {
+        allocator.free(result.text);
+        allocator.free(result.calls);
+    }
+
+    try std.testing.expectEqualStrings(response, result.text);
+    try std.testing.expectEqual(@as(usize, 0), result.calls.len);
 }
 
 test "parseToolCalls rejects raw JSON without tags" {
