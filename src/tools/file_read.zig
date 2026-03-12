@@ -62,7 +62,7 @@ fn hasIsoBmffHeader(data: []const u8) bool {
     return data.len >= 8 and std.mem.eql(u8, data[4..8], "ftyp");
 }
 
-fn isBinaryContent(data: []const u8) bool {
+pub fn isBinaryContent(data: []const u8) bool {
     if (data.len == 0) return false;
 
     for (BINARY_SIGNATURES) |sig| {
@@ -80,7 +80,7 @@ fn isBinaryContent(data: []const u8) bool {
     return false;
 }
 
-fn getBinaryFileType(data: []const u8, path: []const u8) []const u8 {
+pub fn getBinaryFileType(data: []const u8, path: []const u8) []const u8 {
     for (BINARY_SIGNATURES) |sig| {
         if (std.mem.startsWith(u8, data, sig.magic)) return sig.type_name;
     }

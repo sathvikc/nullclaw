@@ -2269,7 +2269,9 @@ pub const Agent = struct {
     }
 
     fn tool_call_updates_tools_md(allocator: std.mem.Allocator, call: ParsedToolCall) bool {
-        if (!std.mem.eql(u8, call.name, "file_write") and !std.mem.eql(u8, call.name, "file_edit")) return false;
+        if (!std.mem.eql(u8, call.name, "file_write") and
+            !std.mem.eql(u8, call.name, "file_edit") and
+            !std.mem.eql(u8, call.name, "file_edit_hashed")) return false;
 
         const parsed = std.json.parseFromSlice(std.json.Value, allocator, call.arguments_json, .{}) catch return false;
         defer parsed.deinit();
@@ -6048,7 +6050,7 @@ test "tool_call_batch_updates_tools_md detects writes to TOOLS.md" {
 
     const calls_match = [_]ParsedToolCall{
         .{ .name = "file_write", .arguments_json = "{\"path\":\"TOOLS.md\",\"content\":\"x\"}" },
-        .{ .name = "file_edit", .arguments_json = "{\"path\":\"notes/TOOLS.md\",\"old_text\":\"a\",\"new_text\":\"b\"}" },
+        .{ .name = "file_edit_hashed", .arguments_json = "{\"path\":\"notes/TOOLS.md\",\"target\":\"L1:abc\",\"new_text\":\"b\"}" },
     };
     try std.testing.expect(Agent.tool_call_batch_updates_tools_md(allocator, &calls_match));
 
@@ -6063,7 +6065,7 @@ test "should_skip_tools_memory_store_duplicate skips only tools-related memory_s
     const allocator = std.testing.allocator;
 
     const calls = [_]ParsedToolCall{
-        .{ .name = "file_edit", .arguments_json = "{\"path\":\"./config/TOOLS.md\",\"old_text\":\"old\",\"new_text\":\"new\"}" },
+        .{ .name = "file_edit_hashed", .arguments_json = "{\"path\":\"./config/TOOLS.md\",\"target\":\"L4:def\",\"new_text\":\"new\"}" },
         .{ .name = "memory_store", .arguments_json = "{\"key\":\"pref.tools.file_read_over_cat\",\"content\":\"Always use file_read\"}" },
         .{ .name = "memory_store", .arguments_json = "{\"key\":\"user.nickname\",\"content\":\"DonPrus\"}" },
         .{ .name = "memory_store", .arguments_json = "{\"key\":\"session.note\",\"content\":\"Rule is documented in TOOLS.md\"}" },
