@@ -193,35 +193,35 @@ const PostgresMemoryImpl = struct {
         self_.q_count = try buildQuery(allocator, "SELECT COUNT(*) FROM {schema}.{table} WHERE instance_id = $1", schema_q, table_q);
         errdefer allocator.free(self_.q_count);
 
-        self_.q_save_msg = try buildQuery(allocator, "INSERT INTO {schema}.messages (session_id, role, content) VALUES ($1, $2, $3)", schema_q, table_q);
+        self_.q_save_msg = try buildQuery(allocator, "INSERT INTO {schema}.messages (session_id, instance_id, role, content) VALUES ($1, $2, $3, $4)", schema_q, table_q);
         errdefer allocator.free(self_.q_save_msg);
 
-        self_.q_load_msgs = try buildQuery(allocator, "SELECT role, content FROM {schema}.messages WHERE session_id = $1 ORDER BY id ASC", schema_q, table_q);
+        self_.q_load_msgs = try buildQuery(allocator, "SELECT role, content FROM {schema}.messages WHERE session_id = $1 AND instance_id = $2 ORDER BY id ASC", schema_q, table_q);
         errdefer allocator.free(self_.q_load_msgs);
 
-        self_.q_clear_msgs = try buildQuery(allocator, "DELETE FROM {schema}.messages WHERE session_id = $1", schema_q, table_q);
+        self_.q_clear_msgs = try buildQuery(allocator, "DELETE FROM {schema}.messages WHERE session_id = $1 AND instance_id = $2", schema_q, table_q);
         errdefer allocator.free(self_.q_clear_msgs);
 
-        self_.q_save_usage = try buildQuery(allocator, "INSERT INTO {schema}.session_usage (session_id, total_tokens, updated_at) VALUES ($1, $2, NOW()) " ++
-            "ON CONFLICT (session_id) DO UPDATE SET total_tokens = EXCLUDED.total_tokens, updated_at = NOW()", schema_q, table_q);
+        self_.q_save_usage = try buildQuery(allocator, "INSERT INTO {schema}.session_usage (session_id, instance_id, total_tokens, updated_at) VALUES ($1, $2, $3, NOW()) " ++
+            "ON CONFLICT (session_id, instance_id) DO UPDATE SET total_tokens = EXCLUDED.total_tokens, updated_at = NOW()", schema_q, table_q);
         errdefer allocator.free(self_.q_save_usage);
 
-        self_.q_load_usage = try buildQuery(allocator, "SELECT total_tokens FROM {schema}.session_usage WHERE session_id = $1", schema_q, table_q);
+        self_.q_load_usage = try buildQuery(allocator, "SELECT total_tokens FROM {schema}.session_usage WHERE session_id = $1 AND instance_id = $2", schema_q, table_q);
         errdefer allocator.free(self_.q_load_usage);
 
-        self_.q_clear_usage = try buildQuery(allocator, "DELETE FROM {schema}.session_usage WHERE session_id = $1", schema_q, table_q);
+        self_.q_clear_usage = try buildQuery(allocator, "DELETE FROM {schema}.session_usage WHERE session_id = $1 AND instance_id = $2", schema_q, table_q);
         errdefer allocator.free(self_.q_clear_usage);
 
-        self_.q_count_sessions = try buildQuery(allocator, "SELECT COUNT(*) FROM (SELECT 1 FROM {schema}.messages GROUP BY session_id) AS sessions", schema_q, table_q);
+        self_.q_count_sessions = try buildQuery(allocator, "SELECT COUNT(*) FROM (SELECT 1 FROM {schema}.messages WHERE instance_id = $1 GROUP BY session_id) AS sessions", schema_q, table_q);
         errdefer allocator.free(self_.q_count_sessions);
 
-        self_.q_list_sessions = try buildQuery(allocator, "SELECT session_id, COUNT(*), MIN(created_at)::text, MAX(created_at)::text FROM {schema}.messages GROUP BY session_id ORDER BY MAX(created_at) DESC LIMIT $1 OFFSET $2", schema_q, table_q);
+        self_.q_list_sessions = try buildQuery(allocator, "SELECT session_id, COUNT(*), MIN(created_at)::text, MAX(created_at)::text FROM {schema}.messages WHERE instance_id = $1 GROUP BY session_id ORDER BY MAX(created_at) DESC LIMIT $2 OFFSET $3", schema_q, table_q);
         errdefer allocator.free(self_.q_list_sessions);
 
-        self_.q_count_detailed_msgs = try buildQuery(allocator, "SELECT COUNT(*) FROM {schema}.messages WHERE session_id = $1", schema_q, table_q);
+        self_.q_count_detailed_msgs = try buildQuery(allocator, "SELECT COUNT(*) FROM {schema}.messages WHERE session_id = $1 AND instance_id = $2", schema_q, table_q);
         errdefer allocator.free(self_.q_count_detailed_msgs);
 
-        self_.q_load_msgs_detailed = try buildQuery(allocator, "SELECT role, content, created_at::text FROM {schema}.messages WHERE session_id = $1 ORDER BY id ASC LIMIT $2 OFFSET $3", schema_q, table_q);
+        self_.q_load_msgs_detailed = try buildQuery(allocator, "SELECT role, content, created_at::text FROM {schema}.messages WHERE session_id = $1 AND instance_id = $2 ORDER BY id ASC LIMIT $3 OFFSET $4", schema_q, table_q);
         errdefer allocator.free(self_.q_load_msgs_detailed);
 
         self_.q_clear_auto = try buildQuery(allocator, "DELETE FROM {schema}.{table} WHERE key LIKE 'autosave_%' AND instance_id = $1", schema_q, table_q);
@@ -244,7 +244,7 @@ const PostgresMemoryImpl = struct {
         errdefer allocator.free(self_.q_list_sid);
 
         // Run migrations
-        try self_.migrate(table);
+        try self_.migrate(schema, table);
 
         return self_;
     }
@@ -280,8 +280,8 @@ const PostgresMemoryImpl = struct {
         }
     }
 
-    fn migrate(self: *Self, raw_table: []const u8) !void {
-        // raw_table is pre-validated (alphanumeric + underscore only) so safe for index names.
+    fn migrate(self: *Self, raw_schema: []const u8, raw_table: []const u8) !void {
+        // raw_schema/raw_table are pre-validated (alphanumeric + underscore only) so safe where used below.
         // Index names must NOT use quoted identifiers, so we use raw_table directly.
         const ddl = try std.fmt.allocPrintZ(self.allocator,
             \\CREATE TABLE IF NOT EXISTS {s}.{s} (
@@ -303,26 +303,64 @@ const PostgresMemoryImpl = struct {
             \\CREATE TABLE IF NOT EXISTS {s}.messages (
             \\    id SERIAL PRIMARY KEY,
             \\    session_id TEXT NOT NULL,
+            \\    instance_id TEXT NOT NULL DEFAULT '',
             \\    role TEXT NOT NULL,
             \\    content TEXT NOT NULL,
             \\    created_at TIMESTAMP DEFAULT NOW()
             \\);
+            \\ALTER TABLE {s}.messages ADD COLUMN IF NOT EXISTS instance_id TEXT NOT NULL DEFAULT '';
+            \\CREATE INDEX IF NOT EXISTS idx_messages_instance_session ON {s}.messages(instance_id, session_id);
             \\CREATE TABLE IF NOT EXISTS {s}.session_usage (
-            \\    session_id TEXT PRIMARY KEY,
+            \\    session_id TEXT NOT NULL,
+            \\    instance_id TEXT NOT NULL DEFAULT '',
             \\    total_tokens BIGINT NOT NULL DEFAULT 0,
             \\    updated_at TIMESTAMP DEFAULT NOW()
             \\);
+            \\ALTER TABLE {s}.session_usage ADD COLUMN IF NOT EXISTS instance_id TEXT NOT NULL DEFAULT '';
+            \\DO $$
+            \\DECLARE
+            \\    old_pk_name text;
+            \\BEGIN
+            \\    SELECT conname INTO old_pk_name
+            \\    FROM pg_constraint
+            \\    WHERE conrelid = '{s}.session_usage'::regclass
+            \\      AND contype = 'p'
+            \\      AND array_length(conkey, 1) = 1
+            \\    LIMIT 1;
+            \\    IF old_pk_name IS NOT NULL THEN
+            \\        EXECUTE format('ALTER TABLE %I.session_usage DROP CONSTRAINT %I', '{s}', old_pk_name);
+            \\    END IF;
+            \\END $$;
+            \\CREATE UNIQUE INDEX IF NOT EXISTS idx_session_usage_session_instance ON {s}.session_usage(session_id, instance_id);
+            \\CREATE INDEX IF NOT EXISTS idx_session_usage_instance ON {s}.session_usage(instance_id);
         , .{
-            self.schema_q, self.table_q,
-            self.schema_q, self.table_q,
-            self.schema_q, raw_table,
-            raw_table,     self.schema_q,
-            self.table_q,  raw_table,
-            self.schema_q, self.table_q,
-            raw_table,     self.schema_q,
-            self.table_q,  raw_table,
-            self.schema_q, self.table_q,
-            self.schema_q, self.schema_q,
+            self.schema_q,
+            self.table_q,
+            self.schema_q,
+            self.table_q,
+            self.schema_q,
+            raw_table,
+            raw_table,
+            self.schema_q,
+            self.table_q,
+            raw_table,
+            self.schema_q,
+            self.table_q,
+            raw_table,
+            self.schema_q,
+            self.table_q,
+            raw_table,
+            self.schema_q,
+            self.table_q,
+            self.schema_q,
+            self.schema_q,
+            self.schema_q,
+            self.schema_q,
+            self.schema_q,
+            self.schema_q,
+            raw_schema,
+            self.schema_q,
+            self.schema_q,
         });
         defer self.allocator.free(ddl);
 
@@ -662,14 +700,17 @@ const PostgresMemoryImpl = struct {
 
         const sid_z = try self_.allocator.dupeZ(u8, session_id);
         defer self_.allocator.free(sid_z);
+        const iid_z = try self_.allocator.dupeZ(u8, self_.instance_id);
+        defer self_.allocator.free(iid_z);
         const role_z = try self_.allocator.dupeZ(u8, role);
         defer self_.allocator.free(role_z);
         const content_z = try self_.allocator.dupeZ(u8, content);
         defer self_.allocator.free(content_z);
 
-        const params = [_]?[*:0]const u8{ sid_z, role_z, content_z };
+        const params = [_]?[*:0]const u8{ sid_z, iid_z, role_z, content_z };
         const lengths = [_]c_int{
             @intCast(session_id.len),
+            @intCast(self_.instance_id.len),
             @intCast(role.len),
             @intCast(content.len),
         };
@@ -683,9 +724,11 @@ const PostgresMemoryImpl = struct {
 
         const sid_z = try allocator.dupeZ(u8, session_id);
         defer allocator.free(sid_z);
+        const iid_z = try allocator.dupeZ(u8, self_.instance_id);
+        defer allocator.free(iid_z);
 
-        const params = [_]?[*:0]const u8{sid_z};
-        const lengths = [_]c_int{@intCast(session_id.len)};
+        const params = [_]?[*:0]const u8{ sid_z, iid_z };
+        const lengths = [_]c_int{ @intCast(session_id.len), @intCast(self_.instance_id.len) };
 
         const result = try self_.execParams(self_.q_load_msgs, &params, &lengths);
         defer c.PQclear(result);
@@ -719,9 +762,11 @@ const PostgresMemoryImpl = struct {
 
         const sid_z = try self_.allocator.dupeZ(u8, session_id);
         defer self_.allocator.free(sid_z);
+        const iid_z = try self_.allocator.dupeZ(u8, self_.instance_id);
+        defer self_.allocator.free(iid_z);
 
-        const params = [_]?[*:0]const u8{sid_z};
-        const lengths = [_]c_int{@intCast(session_id.len)};
+        const params = [_]?[*:0]const u8{ sid_z, iid_z };
+        const lengths = [_]c_int{ @intCast(session_id.len), @intCast(self_.instance_id.len) };
 
         const result = try self_.execParams(self_.q_clear_msgs, &params, &lengths);
         c.PQclear(result);
@@ -756,11 +801,13 @@ const PostgresMemoryImpl = struct {
 
         const sid_z = try self_.allocator.dupeZ(u8, session_id);
         defer self_.allocator.free(sid_z);
+        const iid_z = try self_.allocator.dupeZ(u8, self_.instance_id);
+        defer self_.allocator.free(iid_z);
 
         const total_z = try std.fmt.allocPrintZ(self_.allocator, "{d}", .{total_tokens});
         defer self_.allocator.free(total_z);
-        const params = [_]?[*:0]const u8{ sid_z, total_z };
-        const lengths = [_]c_int{ @intCast(session_id.len), @intCast(total_z.len) };
+        const params = [_]?[*:0]const u8{ sid_z, iid_z, total_z };
+        const lengths = [_]c_int{ @intCast(session_id.len), @intCast(self_.instance_id.len), @intCast(total_z.len) };
 
         const result = try self_.execParams(self_.q_save_usage, &params, &lengths);
         c.PQclear(result);
@@ -771,9 +818,11 @@ const PostgresMemoryImpl = struct {
 
         const sid_z = try self_.allocator.dupeZ(u8, session_id);
         defer self_.allocator.free(sid_z);
+        const iid_z = try self_.allocator.dupeZ(u8, self_.instance_id);
+        defer self_.allocator.free(iid_z);
 
-        const params = [_]?[*:0]const u8{sid_z};
-        const lengths = [_]c_int{@intCast(session_id.len)};
+        const params = [_]?[*:0]const u8{ sid_z, iid_z };
+        const lengths = [_]c_int{ @intCast(session_id.len), @intCast(self_.instance_id.len) };
 
         const result = try self_.execParams(self_.q_load_usage, &params, &lengths);
         defer c.PQclear(result);
@@ -787,7 +836,12 @@ const PostgresMemoryImpl = struct {
     fn implSessionCountSessions(ptr: *anyopaque) anyerror!u64 {
         const self_: *Self = @ptrCast(@alignCast(ptr));
 
-        const result = try self_.execParams(self_.q_count_sessions, &.{}, &.{});
+        const iid_z = try self_.allocator.dupeZ(u8, self_.instance_id);
+        defer self_.allocator.free(iid_z);
+        const params = [_]?[*:0]const u8{iid_z};
+        const lengths = [_]c_int{@intCast(self_.instance_id.len)};
+
+        const result = try self_.execParams(self_.q_count_sessions, &params, &lengths);
         defer c.PQclear(result);
 
         if (c.PQntuples(result) == 0) return 0;
@@ -799,13 +853,15 @@ const PostgresMemoryImpl = struct {
     fn implSessionListSessions(ptr: *anyopaque, allocator: std.mem.Allocator, limit: usize, offset: usize) anyerror![]root.SessionInfo {
         const self_: *Self = @ptrCast(@alignCast(ptr));
 
+        const iid_z = try allocator.dupeZ(u8, self_.instance_id);
+        defer allocator.free(iid_z);
         var limit_buf: [20]u8 = undefined;
         const limit_str = try std.fmt.bufPrintZ(&limit_buf, "{d}", .{limit});
         var offset_buf: [20]u8 = undefined;
         const offset_str = try std.fmt.bufPrintZ(&offset_buf, "{d}", .{offset});
 
-        const params = [_]?[*:0]const u8{ limit_str.ptr, offset_str.ptr };
-        const lengths = [_]c_int{ @intCast(std.mem.len(limit_str)), @intCast(std.mem.len(offset_str)) };
+        const params = [_]?[*:0]const u8{ iid_z, limit_str.ptr, offset_str.ptr };
+        const lengths = [_]c_int{ @intCast(self_.instance_id.len), @intCast(std.mem.len(limit_str)), @intCast(std.mem.len(offset_str)) };
 
         const result = try self_.execParams(self_.q_list_sessions, &params, &lengths);
         defer c.PQclear(result);
@@ -845,9 +901,11 @@ const PostgresMemoryImpl = struct {
 
         const sid_z = try self_.allocator.dupeZ(u8, session_id);
         defer self_.allocator.free(sid_z);
+        const iid_z = try self_.allocator.dupeZ(u8, self_.instance_id);
+        defer self_.allocator.free(iid_z);
 
-        const params = [_]?[*:0]const u8{sid_z};
-        const lengths = [_]c_int{@intCast(session_id.len)};
+        const params = [_]?[*:0]const u8{ sid_z, iid_z };
+        const lengths = [_]c_int{ @intCast(session_id.len), @intCast(self_.instance_id.len) };
 
         const result = try self_.execParams(self_.q_count_detailed_msgs, &params, &lengths);
         defer c.PQclear(result);
@@ -863,14 +921,17 @@ const PostgresMemoryImpl = struct {
 
         const sid_z = try allocator.dupeZ(u8, session_id);
         defer allocator.free(sid_z);
+        const iid_z = try allocator.dupeZ(u8, self_.instance_id);
+        defer allocator.free(iid_z);
         var limit_buf: [20]u8 = undefined;
         const limit_str = try std.fmt.bufPrintZ(&limit_buf, "{d}", .{limit});
         var offset_buf: [20]u8 = undefined;
         const offset_str = try std.fmt.bufPrintZ(&offset_buf, "{d}", .{offset});
 
-        const params = [_]?[*:0]const u8{ sid_z, limit_str.ptr, offset_str.ptr };
+        const params = [_]?[*:0]const u8{ sid_z, iid_z, limit_str.ptr, offset_str.ptr };
         const lengths = [_]c_int{
             @intCast(session_id.len),
+            @intCast(self_.instance_id.len),
             @intCast(std.mem.len(limit_str)),
             @intCast(std.mem.len(offset_str)),
         };
