@@ -40,13 +40,19 @@ fn hashWithCanonicalLineEndings(bytes: []const u8) [std.crypto.hash.sha2.Sha256.
     return digest;
 }
 
+fn readFileAllocCompat(dir: std.fs.Dir, allocator: std.mem.Allocator, sub_path: []const u8, max_bytes: usize) ![]u8 {
+    const file = try dir.openFile(sub_path, .{});
+    defer file.close();
+    return try file.readToEndAlloc(allocator, max_bytes);
+}
+
 fn verifyVendoredSqliteHashes(b: *std.Build) !void {
     const max_vendor_file_size = 16 * 1024 * 1024;
     for (VENDORED_SQLITE_HASHES) |entry| {
         const file_path = b.pathFromRoot(entry.path);
         defer b.allocator.free(file_path);
 
-        const bytes = std.fs.cwd().readFileAlloc(b.allocator, file_path, max_vendor_file_size) catch |err| {
+        const bytes = readFileAllocCompat(std.fs.cwd(), b.allocator, file_path, max_vendor_file_size) catch |err| {
             std.log.err("failed to read {s}: {s}", .{ file_path, @errorName(err) });
             return err;
         };

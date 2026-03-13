@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const root = @import("root.zig");
+const fs_compat = @import("../fs_compat.zig");
 const http_util = @import("../http_util.zig");
 const platform = @import("../platform.zig");
 const error_classify = @import("error_classify.zig");
@@ -151,7 +152,7 @@ fn prepareCurlBodyArg(
 
     const verify_file = std.fs.openFileAbsolute(body_path, .{}) catch return error.TempFileCreateFailed;
     defer verify_file.close();
-    const verify_stat = verify_file.stat() catch return error.TempFileCreateFailed;
+    const verify_stat = fs_compat.stat(verify_file) catch return error.TempFileCreateFailed;
     if (log_enabled) {
         debug_log.info("Temp body file size: {d} bytes", .{verify_stat.size});
     }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const fs_compat = @import("../fs_compat.zig");
 const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
@@ -157,7 +158,7 @@ pub const FileReadTool = struct {
         };
         defer file.close();
 
-        const stat = try file.stat();
+        const stat = try fs_compat.stat(file);
         const max_usize_u64: u64 = @intCast(std.math.maxInt(usize));
         const effective_max_file_size = @min(self.max_file_size, max_usize_u64);
         if (stat.size > effective_max_file_size) {
