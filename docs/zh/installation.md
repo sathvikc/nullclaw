@@ -200,13 +200,20 @@ nullclaw status
 
 ## 升级与卸载
 
-### Homebrew
+### 使用二进制文件
+
+#### Homebrew（macOS/Linux推荐）
 
 ```bash
 brew update
 brew upgrade nullclaw
 brew uninstall nullclaw
 ```
+#### 命令行（CMD)（Windows）
+
+- 升级： `nullclaw update`
+- 卸载：直接删除nullclaw二进制文件。
+检查系统变量PATH，若存在就将nullclaw二进制文件的所在目录从中删除。
 
 ### 源码安装
 
