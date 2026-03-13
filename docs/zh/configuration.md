@@ -187,19 +187,19 @@ Telegram 示例：
 
 ### `tunnel`
 
-隧道提供者，用于将网关暴露到公网。在没有公网 IP 的情况下运行基于 webhook 的频道时需要。
+隧道服务，用于将本地网关暴露到公网。当没有公网 IP 但需要接收 webhook 回调时使用。
 
-**提供者：**
+**支持的隧道：**
 
-| 提供者 | 描述 |
+| 隧道 | 说明 |
 |--------|------|
-| `none` | 无隧道（默认） |
+| `none` | 不使用隧道（默认） |
 | `cloudflare` | Cloudflare Tunnel |
 | `ngrok` | ngrok 隧道 |
 | `tailscale` | Tailscale Funnel |
-| `custom` | 自定义隧道命令 |
+| `custom` | 自定义命令启动隧道 |
 
-**示例：ngrok**
+**ngrok 示例：**
 
 ```json
 {
@@ -213,7 +213,7 @@ Telegram 示例：
 }
 ```
 
-**示例：Cloudflare**
+**Cloudflare 示例：**
 
 ```json
 {
@@ -226,10 +226,10 @@ Telegram 示例：
 }
 ```
 
-**注意事项：**
+**注意：**
 
-- 隧道在网关之前启动。
-- 公网 URL 会在启动时打印，并写入 `daemon_state.json`。
+- 隧道会在网关启动前自动启动。
+- 启动后公网 URL 会打印到控制台，同时写入 `daemon_state.json`。
 
 ### `autonomy`
 
