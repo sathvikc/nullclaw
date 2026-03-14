@@ -191,10 +191,16 @@ pub fn parseSseLine(allocator: std.mem.Allocator, line: []const u8) !SseLineResu
     if (trimmed.len == 0) return .skip;
     if (trimmed[0] == ':') return .skip;
 
-    const prefix = "data: ";
+    // SSE uses "data:" with an optional single leading space before the value.
+    const prefix = "data:";
     if (!std.mem.startsWith(u8, trimmed, prefix)) return .skip;
 
-    const data = trimmed[prefix.len..];
+    const data = if (trimmed.len > prefix.len and trimmed[prefix.len] == ' ')
+        trimmed[prefix.len + 1 ..]
+    else
+        trimmed[prefix.len..];
+
+    if (data.len == 0) return .skip;
 
     if (std.mem.eql(u8, data, "[DONE]")) return .done;
 
@@ -826,6 +832,18 @@ test "parseSseLine valid delta" {
     }
 }
 
+test "parseSseLine valid delta without optional space" {
+    const allocator = std.testing.allocator;
+    const result = try parseSseLine(allocator, "data:{\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}");
+    switch (result) {
+        .delta => |text| {
+            defer allocator.free(text);
+            try std.testing.expectEqualStrings("Hello", text);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "prepareCurlBodyArg uses temp file only on Windows" {
     const allocator = std.testing.allocator;
     const body = [_]u8{'x'} ** 4096;
@@ -843,6 +861,11 @@ test "prepareCurlBodyArg uses temp file only on Windows" {
 
 test "parseSseLine DONE sentinel" {
     const result = try parseSseLine(std.testing.allocator, "data: [DONE]");
+    try std.testing.expect(result == .done);
+}
+
+test "parseSseLine DONE sentinel without optional space" {
+    const result = try parseSseLine(std.testing.allocator, "data:[DONE]");
     try std.testing.expect(result == .done);
 }
 
@@ -866,6 +889,11 @@ test "parseSseLine empty line" {
 
 test "parseSseLine comment" {
     const result = try parseSseLine(std.testing.allocator, ":keep-alive");
+    try std.testing.expect(result == .skip);
+}
+
+test "parseSseLine empty data field" {
+    const result = try parseSseLine(std.testing.allocator, "data:");
     try std.testing.expect(result == .skip);
 }
 
