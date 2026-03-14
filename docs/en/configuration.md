@@ -417,6 +417,7 @@ Use only in controlled environments:
 {
   "http_request": {
     "enabled": true,
+    "allowed_domains": ["192.168.1.10", "*.internal.example.com"],
     "search_base_url": "https://searx.example.com",
     "search_provider": "auto",
     "search_fallback_providers": ["jina", "duckduckgo"]
@@ -433,8 +434,18 @@ Use only in controlled environments:
 
 Notes:
 
-- `search_base_url` must be `https://host[/search]` or a local/private `http://host[:port][/search]` URL, otherwise startup validation fails.
+- `search_base_url` (for web_search tool): Must be `https://host[/search]` or a local/private `http://host[:port][/search]` URL. HTTP is allowed only for localhost/private hosts (e.g., `http://localhost:8888`, `http://192.168.1.10:8888`). This URL is used by the `web_search` tool to query SearXNG instances.
 - `allowed_commands: ["*"]` and `allowed_paths: ["*"]` significantly widen execution scope.
+- `http_request.allowed_domains`: Domains that bypass SSRF protection for the `http_request` and `web_fetch` tools.
+  - `[]` (empty): All domains go through SSRF check (default, safest).
+  - `["example.com"]`: Only specified domains skip SSRF protection.
+  - `["*.example.com"]`: Matches all subdomains (e.g., `api.example.com`, `www.example.com`).
+  - `["192.168.1.10"]`: IP addresses can also be allowlisted (exact match only, CIDR ranges not supported).
+  - `["*"]`: **DANGEROUS** - All domains skip SSRF protection and DNS pinning. Use only in trusted network environments where you control DNS and need to allow access to any IP address. This effectively disables SSRF protection.
+  - **Example**: If your SearXNG runs on `192.168.1.10`, add `"192.168.1.10"` to access it via `http_request` tool.
+  - **Security trade-off**: Allowlisted domains skip DNS pinning, allowing access to private IPs. This trades DNS rebinding protection for operational flexibility.
+  - **HTTPS-only policy**: The `http_request` and `web_fetch` tools require `https://` URLs. Plain HTTP is rejected for security. Note: This does not affect `web_search` tool's `search_base_url` which allows HTTP for local hosts.
+  - **Check order**: Allowlist is checked BEFORE DNS resolution to prevent DNS exfiltration attacks.
 
 ## Validate After Config Changes
 

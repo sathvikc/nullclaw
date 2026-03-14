@@ -250,6 +250,7 @@ Telegram 示例：
 {
   "http_request": {
     "enabled": true,
+    "allowed_domains": ["192.168.1.10", "*.internal.example.com"],
     "search_base_url": "https://searx.example.com",
     "search_provider": "auto",
     "search_fallback_providers": ["jina", "duckduckgo"]
@@ -266,8 +267,18 @@ Telegram 示例：
 
 注意：
 
-- `search_base_url` 必须是 `https://host[/search]`，或者本地/内网可达的 `http://host[:port][/search]`，否则启动校验会失败。
+- `search_base_url`（用于 web_search 工具）：必须是 `https://host[/search]` 或本地/内网的 `http://host[:port][/search]` URL。HTTP 仅允许用于 localhost/私有主机（如 `http://localhost:8888`、`http://192.168.1.10:8888`）。此 URL 供 `web_search` 工具查询 SearXNG 实例使用。
 - `allowed_commands: ["*"]` 与 `allowed_paths: ["*"]` 会显著扩大执行范围。
+- `http_request.allowed_domains`：绕过 SSRF 保护的域名列表，用于 `http_request` 和 `web_fetch` 工具。
+  - `[]` (空数组)：所有域名经过 SSRF 检查（默认，最安全）。
+  - `["example.com"]`：只有指定域名跳过 SSRF 保护。
+  - `["*.example.com"]`：匹配所有子域名（如 `api.example.com`、`www.example.com`）。
+  - `["192.168.1.10"]`：IP 地址也可以加入白名单（仅支持精确匹配，不支持 CIDR 范围）。
+  - `["*"]`：**危险** - 所有域名跳过 SSRF 保护和 DNS 钉扎。仅用于可信网络环境，当你控制 DNS 且需要访问任意 IP 地址时使用。这实际上禁用了 SSRF 保护。
+  - **示例**：如果你的 SearXNG 运行在 `192.168.1.10`，添加 `"192.168.1.10"` 即可通过 `http_request` 工具访问它。
+  - **安全权衡**：白名单域名跳过 DNS 钉扎，允许访问私有 IP。这是用 DNS 重绑定防护换取操作灵活性。
+  - **HTTPS-only 策略**：`http_request` 和 `web_fetch` 工具要求使用 `https://` URL。明文 HTTP 因安全原因被拒绝。注意：这不影响 `web_search` 工具的 `search_base_url`，后者允许本地主机使用 HTTP。
+  - **检查顺序**：白名单在 DNS 解析之前检查，防止 DNS 渗漏攻击。
 
 ## 配置变更后的验证
 
