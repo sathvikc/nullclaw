@@ -131,8 +131,8 @@ pub const HttpRequestTool = struct {
         const success = status_code >= 200 and status_code < 300;
 
         // Build redacted headers display for custom request headers
-        const redacted = redactHeadersForDisplay(allocator, custom_headers) catch "";
-        defer if (redacted.len > 0) allocator.free(redacted);
+        const redacted = redactHeadersForDisplay(allocator, custom_headers) catch try allocator.dupe(u8, "");
+        defer allocator.free(redacted);
 
         const output = if (redacted.len > 0)
             try std.fmt.allocPrint(
@@ -455,7 +455,7 @@ fn parseHeaders(allocator: std.mem.Allocator, headers_json: ?[]const u8) ![]cons
 /// Headers with names containing authorization, api-key, apikey, token, secret,
 /// or password (case-insensitive) get their values replaced with "***REDACTED***".
 fn redactHeadersForDisplay(allocator: std.mem.Allocator, headers: []const [2][]const u8) ![]const u8 {
-    if (headers.len == 0) return "";
+    if (headers.len == 0) return allocator.dupe(u8, "");
 
     var buf: std.ArrayList(u8) = .{};
     errdefer buf.deinit(allocator);
@@ -570,6 +570,7 @@ test "redactHeadersForDisplay redacts api-key and token" {
 
 test "redactHeadersForDisplay empty returns empty" {
     const result = try redactHeadersForDisplay(std.testing.allocator, &.{});
+    defer std.testing.allocator.free(result);
     try std.testing.expectEqualStrings("", result);
 }
 
