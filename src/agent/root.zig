@@ -6062,7 +6062,9 @@ test "slash additional commands are handled" {
         "/approve",
         "/poll",
         "/subagents",
+        "/config reload",
         "/config get model",
+        "/skill reload",
         "/skill list",
     };
 
@@ -6340,6 +6342,37 @@ test "direct slash skill command reports ambiguity between exact and composite m
     defer allocator.free(response);
 
     try std.testing.expect(std.mem.indexOf(u8, response, "Ambiguous skill name") != null);
+}
+
+test "slash /skill reload invalidates prompt caches" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    agent.has_system_prompt = true;
+    agent.system_prompt_has_conversation_context = true;
+    agent.workspace_prompt_fingerprint = 1234;
+    agent.system_prompt_model_name = try allocator.dupe(u8, "openrouter/gpt-4o");
+
+    const response = (try agent.handleSlashCommand("/skill reload")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "Skills reloaded") != null);
+    try std.testing.expect(!agent.has_system_prompt);
+    try std.testing.expect(!agent.system_prompt_has_conversation_context);
+    try std.testing.expect(agent.workspace_prompt_fingerprint == null);
+    try std.testing.expect(agent.system_prompt_model_name == null);
+}
+
+test "slash /config reload returns summary" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    const response = (try agent.handleSlashCommand("/config reload")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "Config hot reload complete") != null);
 }
 
 test "Agent streaming fields default to null" {

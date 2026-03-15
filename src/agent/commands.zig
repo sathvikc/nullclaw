@@ -275,6 +275,9 @@ fn invalidateSystemPromptCache(self: anytype) void {
     if (@hasField(@TypeOf(self.*), "system_prompt_has_conversation_context")) {
         self.system_prompt_has_conversation_context = false;
     }
+    if (@hasField(@TypeOf(self.*), "workspace_prompt_fingerprint")) {
+        self.workspace_prompt_fingerprint = null;
+    }
     if (@hasField(@TypeOf(self.*), "system_prompt_conversation_context_fingerprint")) {
         self.system_prompt_conversation_context_fingerprint = null;
     }
@@ -2461,6 +2464,46 @@ fn handleConfigCommand(self: anytype, arg: []const u8) ![]const u8 {
         return try self.allocator.dupe(u8, "Config validation: OK");
     }
 
+    if (std.ascii.eqlIgnoreCase(action, "reload") or std.ascii.eqlIgnoreCase(action, "refresh")) {
+        const hot_reload_paths = [_][]const u8{
+            "agents.defaults.model.primary",
+            "default_temperature",
+            "agent.max_tool_iterations",
+            "agent.max_history_messages",
+            "agent.message_timeout_secs",
+            "agent.status_show_emojis",
+        };
+
+        var attempted: usize = 0;
+        var applied: usize = 0;
+        var failed: usize = 0;
+
+        for (hot_reload_paths) |path| {
+            const value_json = config_mutator.getPathValueJson(self.allocator, path) catch {
+                failed += 1;
+                continue;
+            };
+            defer self.allocator.free(value_json);
+
+            attempted += 1;
+            const hot_applied = hotApplyConfigChange(self, .set, path, value_json) catch {
+                failed += 1;
+                continue;
+            };
+            if (hot_applied) applied += 1;
+        }
+
+        if (applied > 0) {
+            invalidateSystemPromptCache(self);
+        }
+
+        return try std.fmt.allocPrint(
+            self.allocator,
+            "Config hot reload complete: attempted={d} applied={d} failed={d}",
+            .{ attempted, applied, failed },
+        );
+    }
+
     if (std.ascii.eqlIgnoreCase(action, "set")) {
         const path_and_value = splitFirstToken(parsed.tail);
         const path = path_and_value.head;
@@ -2546,6 +2589,7 @@ fn handleConfigCommand(self: anytype, arg: []const u8) ![]const u8 {
             "  /config unset <path>                  (dry-run preview)\n" ++
             "  /config apply set <path> <value>\n" ++
             "  /config apply unset <path>\n" ++
+            "  /config reload                        (hot reload supported keys)\n" ++
             "  /config validate",
     );
 }
@@ -2558,6 +2602,11 @@ fn handleSkillCommand(self: anytype, arg: []const u8) ![]const u8 {
 
     const parsed = splitFirstToken(arg);
     const action_or_name = parsed.head;
+
+    if (std.ascii.eqlIgnoreCase(action_or_name, "reload") or std.ascii.eqlIgnoreCase(action_or_name, "refresh")) {
+        invalidateSystemPromptCache(self);
+        return try self.allocator.dupe(u8, "Skills reloaded for this session. Updated skill instructions will apply on the next turn.");
+    }
 
     if (action_or_name.len == 0 or std.ascii.eqlIgnoreCase(action_or_name, "list")) {
         if (skills.len == 0) {
