@@ -523,6 +523,17 @@ WhatsApp 登录的职责边界、QR/pairing 归属以及首次联调步骤，请
 
 - [`examples/external-channel-template/README.md`](../../examples/external-channel-template/README.md)
 
+配套的仓库还包括：
+
+- `nullclaw-channel-whatsmeow-bridge`
+  面向生产环境的 Go/whatsmeow bridge，包含 QR、pairing-code 和部署资产。
+- `nullclaw-channel-baileys`
+  直接基于 Node/Baileys 的 external channel 插件，包含 QR 和 pairing-code
+  流程。
+- `nullclaw-channel-imap-connector`
+  基于 Python 的 IMAP/SMTP external channel 插件，用于双向邮件和配套的
+  邮箱 CLI 工作流。
+
 ## 插件作者检查单
 
 - 实现 `get_manifest`

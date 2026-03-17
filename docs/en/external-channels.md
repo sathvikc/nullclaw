@@ -534,6 +534,17 @@ bridge, use:
 
 - [`examples/external-channel-template/README.md`](../../examples/external-channel-template/README.md)
 
+Companion out-of-tree repositories:
+
+- `nullclaw-channel-whatsmeow-bridge`
+  Production-oriented Go/whatsmeow bridge with QR, pairing-code, and
+  deployment assets.
+- `nullclaw-channel-baileys`
+  Direct Node/Baileys external channel plugin with QR and pairing-code flows.
+- `nullclaw-channel-imap-connector`
+  Python IMAP/SMTP external channel plugin for bidirectional email plus
+  companion mailbox CLI workflows.
+
 ## Plugin Author Checklist
 
 - Implement `get_manifest`
