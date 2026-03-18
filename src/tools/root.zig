@@ -445,6 +445,7 @@ pub fn allTools(
         ht.* = .{
             .allowed_domains = opts.http_allowed_domains,
             .max_response_size = opts.http_max_response_size,
+            .timeout_secs = opts.http_timeout_secs,
         };
         try list.append(allocator, ht.tool());
 
@@ -576,6 +577,7 @@ pub fn subagentTools(
         http_enabled: bool = false,
         http_allowed_domains: []const []const u8 = &.{},
         http_max_response_size: u32 = 1_000_000,
+        http_timeout_secs: u64 = 30,
         allowed_paths: []const []const u8 = &.{},
         policy: ?*const @import("../security/policy.zig").SecurityPolicy = null,
         tools_config: @import("../config.zig").ToolsConfig = .{},
@@ -667,6 +669,7 @@ pub fn subagentTools(
         ht.* = .{
             .allowed_domains = opts.http_allowed_domains,
             .max_response_size = opts.http_max_response_size,
+            .timeout_secs = opts.http_timeout_secs,
         };
         try list.append(allocator, ht.tool());
     }
@@ -863,6 +866,7 @@ test "all tools wires http and web_search config into tool instances" {
             try std.testing.expectEqual(@as(usize, 2), ht.allowed_domains.len);
             try std.testing.expectEqualStrings("example.com", ht.allowed_domains[0]);
             try std.testing.expectEqual(@as(u32, 321_000), ht.max_response_size);
+            try std.testing.expectEqual(@as(u64, 12), ht.timeout_secs);
             saw_http = true;
             continue;
         }
@@ -1047,12 +1051,13 @@ test "subagent tools wire bootstrap provider into file_read for sqlite backends"
     try std.testing.expect(checked);
 }
 
-test "subagent tools wire http allowlist and response limit" {
+test "subagent tools wire http allowlist, response limit, and timeout" {
     const domains = [_][]const u8{"example.com"};
     const tools = try subagentTools(std.testing.allocator, "/tmp/yc_test", .{
         .http_enabled = true,
         .http_allowed_domains = &domains,
         .http_max_response_size = 2222,
+        .http_timeout_secs = 17,
     });
     defer deinitTools(std.testing.allocator, tools);
 
@@ -1063,6 +1068,7 @@ test "subagent tools wire http allowlist and response limit" {
         try std.testing.expectEqual(@as(usize, 1), ht.allowed_domains.len);
         try std.testing.expectEqualStrings("example.com", ht.allowed_domains[0]);
         try std.testing.expectEqual(@as(u32, 2222), ht.max_response_size);
+        try std.testing.expectEqual(@as(u64, 17), ht.timeout_secs);
         saw_http = true;
         break;
     }

@@ -51,6 +51,7 @@ pub const TaskRunRequest = struct {
     http_enabled: bool,
     http_allowed_domains: []const []const u8,
     http_max_response_size: u32,
+    http_timeout_secs: u64,
     tools_config: config_types.ToolsConfig,
     memory_config: config_types.MemoryConfig,
     max_tool_iterations: u32,
@@ -108,6 +109,7 @@ pub const SubagentManager = struct {
     http_enabled: bool,
     http_allowed_domains: []const []const u8,
     http_max_response_size: u32,
+    http_timeout_secs: u64,
     tools_config: config_types.ToolsConfig,
     memory_config: config_types.MemoryConfig,
     observer: ?observability.Observer = null,
@@ -144,6 +146,7 @@ pub const SubagentManager = struct {
             .http_enabled = cfg.http_request.enabled,
             .http_allowed_domains = cfg.http_request.allowed_domains,
             .http_max_response_size = cfg.http_request.max_response_size,
+            .http_timeout_secs = cfg.http_request.timeout_secs,
             .tools_config = cfg.tools,
             .memory_config = cfg.memory,
         };
@@ -414,6 +417,7 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
             .http_enabled = ctx.manager.http_enabled,
             .http_allowed_domains = ctx.manager.http_allowed_domains,
             .http_max_response_size = ctx.manager.http_max_response_size,
+            .http_timeout_secs = ctx.manager.http_timeout_secs,
             .tools_config = ctx.manager.tools_config,
             .memory_config = ctx.manager.memory_config,
             .max_tool_iterations = ctx.manager.config.max_iterations,
@@ -481,6 +485,10 @@ fn testTaskRunnerOk(allocator: Allocator, request: TaskRunRequest) ![]const u8 {
 
 fn testTaskRunnerWorkspace(allocator: Allocator, request: TaskRunRequest) ![]const u8 {
     return allocator.dupe(u8, request.workspace_dir);
+}
+
+fn testTaskRunnerHttpTimeout(allocator: Allocator, request: TaskRunRequest) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "{d}", .{request.http_timeout_secs});
 }
 
 fn testTaskRunnerFail(_: Allocator, _: TaskRunRequest) ![]const u8 {
@@ -732,6 +740,25 @@ test "SubagentManager uses task runner callback result" {
     const status = try waitTaskTerminalStatus(&mgr, task_id);
     try std.testing.expectEqual(TaskStatus.completed, status);
     try std.testing.expectEqualStrings("runner-ok", mgr.getTaskResult(task_id).?);
+}
+
+test "SubagentManager propagates http timeout to task runner" {
+    const cfg = config_mod.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+        .http_request = .{
+            .timeout_secs = 17,
+        },
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    mgr.task_runner = testTaskRunnerHttpTimeout;
+    defer mgr.deinit();
+
+    const task_id = try mgr.spawn("quick task", "runner-timeout", "agent", "session:42");
+    const status = try waitTaskTerminalStatus(&mgr, task_id);
+    try std.testing.expectEqual(TaskStatus.completed, status);
+    try std.testing.expectEqualStrings("17", mgr.getTaskResult(task_id).?);
 }
 
 test "SubagentManager stores runner callback error" {

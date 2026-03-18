@@ -72,6 +72,7 @@ pub fn runTaskWithTools(
         .http_enabled = request.http_enabled,
         .http_allowed_domains = request.http_allowed_domains,
         .http_max_response_size = request.http_max_response_size,
+        .http_timeout_secs = request.http_timeout_secs,
         .allowed_paths = request.allowed_paths,
         .policy = &policy,
         .tools_config = request.tools_config,
@@ -108,6 +109,7 @@ pub fn runTaskWithTools(
             .enabled = request.http_enabled,
             .allowed_domains = request.http_allowed_domains,
             .max_response_size = request.http_max_response_size,
+            .timeout_secs = request.http_timeout_secs,
         },
         .tools = request.tools_config,
     };
