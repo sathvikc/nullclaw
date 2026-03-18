@@ -48,6 +48,7 @@ This page groups the NullClaw CLI by task so you can find the right command quic
 ### Interactive model routing
 
 - In `nullclaw agent`, `/model` shows the current model plus configured routing/fallback status.
+- `/config reload` hot reloads supported keys from `config.json` (including agent profiles).
 - When auto-routing is configured, `/model` also shows the last auto-route decision and why it was chosen.
 - If a routed provider is temporarily rate-limited or out of credits, `/model` shows that route as degraded until its cooldown expires.
 - `/model` also lists configured auto routes with their `cost_class` and `quota_class` metadata.
