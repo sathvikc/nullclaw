@@ -41,8 +41,7 @@ const HEARTBEAT_THREAD_STACK_SIZE: usize = thread_stacks.SESSION_TURN_STACK_SIZE
 
 /// Maximum number of supervised components.
 const MAX_COMPONENTS: usize = 8;
-var outbound_draft_id_counter: u64 = 1;
-var outbound_draft_id_mutex: std.Thread.Mutex = .{};
+var outbound_draft_id_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(1);
 
 /// Component status for state file serialization.
 pub const ComponentStatus = struct {
@@ -401,10 +400,12 @@ fn mergeSchedulerTickChangesAndSave(
 /// Scheduler thread — executes due cron jobs and periodically reloads cron.json
 /// so tasks created/updated after daemon startup are picked up without restart.
 fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *DaemonState, event_bus: *bus_mod.Bus) void {
+    const gateway_mod = @import("gateway.zig");
     var scheduler = CronScheduler.init(allocator, config.scheduler.max_tasks, config.scheduler.enabled);
     scheduler.setShellCwd(config.workspace_dir);
     scheduler.setAgentTimeoutSecs(config.scheduler.agent_timeout_secs);
     defer scheduler.deinit();
+    defer gateway_mod.clearSharedScheduler();
     var before_tick: std.StringHashMapUnmanaged(SchedulerJobSnapshot) = .empty;
     defer {
         clearSchedulerSnapshot(allocator, &before_tick);
@@ -415,6 +416,9 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
 
     // Initial load from disk (ignore errors — start empty if file missing/corrupt)
     cron.loadJobs(&scheduler) catch {};
+
+    // Register live scheduler pointer with the gateway for /cron HTTP endpoints.
+    gateway_mod.setSharedScheduler(&scheduler);
 
     state.markRunning("scheduler");
     health.markComponentOk("scheduler");
@@ -790,11 +794,7 @@ const StreamingOutboundCtx = struct {
 };
 
 fn nextOutboundDraftId() u64 {
-    outbound_draft_id_mutex.lock();
-    defer outbound_draft_id_mutex.unlock();
-    const id = outbound_draft_id_counter;
-    outbound_draft_id_counter += 1;
-    return id;
+    return outbound_draft_id_counter.fetchAdd(1, .monotonic);
 }
 
 fn publishStreamingChunk(ctx_ptr: *anyopaque, event: streaming.Event) void {

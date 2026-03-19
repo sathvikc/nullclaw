@@ -35,6 +35,7 @@ const bus_mod = @import("bus.zig");
 const a2a = @import("a2a.zig");
 const thread_stacks = @import("thread_stacks.zig");
 const channel_adapters = @import("channel_adapters.zig");
+const cron_mod = @import("cron.zig");
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 const buildConversationContext = @import("agent/prompt.zig").buildConversationContext;
 
@@ -473,6 +474,8 @@ pub const GatewayState = struct {
     qq_channels: std.ArrayListUnmanaged(channels.qq.QQChannel) = .empty,
     pairing_guard: ?PairingGuard,
     event_bus: ?*bus_mod.Bus = null,
+    scheduler: ?*cron_mod.CronScheduler = null,
+    scheduler_mutex: std.Thread.Mutex = .{},
 
     pub fn init(allocator: std.mem.Allocator) GatewayState {
         return initWithVerifyToken(allocator, "");
@@ -2229,6 +2232,368 @@ fn findWebhookRouteDescriptor(path: []const u8) ?*const WebhookRouteDescriptor {
     return null;
 }
 
+// ── Cron REST API route descriptors ──────────────────────────────
+
+const CronRouteDescriptor = struct {
+    path: []const u8,
+    method: []const u8,
+    handler: *const fn (ctx: *WebhookHandlerContext) void,
+};
+
+const cron_route_descriptors = [_]CronRouteDescriptor{
+    .{ .path = "/cron",        .method = "GET",  .handler = handleCronList },
+    .{ .path = "/cron/add",    .method = "POST", .handler = handleCronAdd },
+    .{ .path = "/cron/remove", .method = "POST", .handler = handleCronRemove },
+    .{ .path = "/cron/pause",  .method = "POST", .handler = handleCronPause },
+    .{ .path = "/cron/resume", .method = "POST", .handler = handleCronResume },
+    .{ .path = "/cron/update", .method = "POST", .handler = handleCronUpdate },
+};
+
+fn findCronRouteDescriptor(path: []const u8) ?*const CronRouteDescriptor {
+    for (&cron_route_descriptors) |*desc| {
+        if (std.mem.eql(u8, desc.path, path)) return desc;
+    }
+    return null;
+}
+
+/// Serialize a single CronJob to a JSON object appended to `buf`.
+fn appendCronJobJson(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, job: cron_mod.CronJob) !void {
+    try buf.appendSlice(allocator, "{");
+    try buf.appendSlice(allocator, "\"id\":");
+    try appendJsonStringBuf(buf, allocator, job.id);
+    try buf.appendSlice(allocator, ",\"expression\":");
+    try appendJsonStringBuf(buf, allocator, job.expression);
+    try buf.appendSlice(allocator, ",\"command\":");
+    try appendJsonStringBuf(buf, allocator, job.command);
+    var int_buf: [32]u8 = undefined;
+    try buf.appendSlice(allocator, ",\"next_run_secs\":");
+    try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{job.next_run_secs}) catch "0");
+    try buf.appendSlice(allocator, ",\"last_run_secs\":");
+    if (job.last_run_secs) |lrs| {
+        try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{lrs}) catch "0");
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",\"last_status\":");
+    if (job.last_status) |ls| {
+        try appendJsonStringBuf(buf, allocator, ls);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",\"paused\":");
+    try buf.appendSlice(allocator, if (job.paused) "true" else "false");
+    try buf.appendSlice(allocator, ",\"one_shot\":");
+    try buf.appendSlice(allocator, if (job.one_shot) "true" else "false");
+    try buf.appendSlice(allocator, ",\"job_type\":");
+    try appendJsonStringBuf(buf, allocator, job.job_type.asStr());
+    try buf.appendSlice(allocator, ",\"enabled\":");
+    try buf.appendSlice(allocator, if (job.enabled) "true" else "false");
+    try buf.appendSlice(allocator, ",\"prompt\":");
+    if (job.prompt) |p| try appendJsonStringBuf(buf, allocator, p) else try buf.appendSlice(allocator, "null");
+    try buf.appendSlice(allocator, ",\"model\":");
+    if (job.model) |m| try appendJsonStringBuf(buf, allocator, m) else try buf.appendSlice(allocator, "null");
+    try buf.appendSlice(allocator, ",\"created_at_s\":");
+    try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{job.created_at_s}) catch "0");
+    try buf.appendSlice(allocator, "}");
+}
+
+/// Append a JSON-escaped string literal (with surrounding quotes) to `buf`.
+fn appendJsonStringBuf(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, s: []const u8) !void {
+    try buf.append(allocator, '"');
+    for (s) |c| {
+        switch (c) {
+            '"' => try buf.appendSlice(allocator, "\\\""),
+            '\\' => try buf.appendSlice(allocator, "\\\\"),
+            '\n' => try buf.appendSlice(allocator, "\\n"),
+            '\r' => try buf.appendSlice(allocator, "\\r"),
+            '\t' => try buf.appendSlice(allocator, "\\t"),
+            else => try buf.append(allocator, c),
+        }
+    }
+    try buf.append(allocator, '"');
+}
+
+fn handleCronList(ctx: *WebhookHandlerContext) void {
+    if (!std.mem.eql(u8, ctx.method, "GET")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    ctx.state.scheduler_mutex.lock();
+    defer ctx.state.scheduler_mutex.unlock();
+
+    const sched = ctx.state.scheduler orelse {
+        ctx.response_status = "503 Service Unavailable";
+        ctx.response_body = "{\"error\":\"scheduler not running\"}";
+        return;
+    };
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    buf.appendSlice(ctx.req_allocator, "[") catch {
+        ctx.response_status = "500 Internal Server Error";
+        ctx.response_body = "{\"error\":\"out of memory\"}";
+        return;
+    };
+    const jobs = sched.listJobs();
+    for (jobs, 0..) |job, i| {
+        if (i > 0) buf.appendSlice(ctx.req_allocator, ",") catch {};
+        appendCronJobJson(&buf, ctx.req_allocator, job) catch {
+            ctx.response_status = "500 Internal Server Error";
+            ctx.response_body = "{\"error\":\"serialization failed\"}";
+            return;
+        };
+    }
+    buf.appendSlice(ctx.req_allocator, "]") catch {};
+    ctx.response_body = buf.items;
+}
+
+fn handleCronAdd(ctx: *WebhookHandlerContext) void {
+    if (!std.mem.eql(u8, ctx.method, "POST")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    const body = extractBody(ctx.raw_request) orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing body\"}";
+        return;
+    };
+
+    const expression = jsonStringField(body, "expression") orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing expression\"}";
+        return;
+    };
+
+    const prompt_opt = jsonStringField(body, "prompt");
+    const command_opt = jsonStringField(body, "command");
+    const model_opt = jsonStringField(body, "model");
+    const delivery_channel_opt = jsonStringField(body, "delivery_channel");
+    const delivery_to_opt = jsonStringField(body, "delivery_to");
+
+    ctx.state.scheduler_mutex.lock();
+    defer ctx.state.scheduler_mutex.unlock();
+
+    const sched = ctx.state.scheduler orelse {
+        ctx.response_status = "503 Service Unavailable";
+        ctx.response_body = "{\"error\":\"scheduler not running\"}";
+        return;
+    };
+
+    const delivery = cron_mod.DeliveryConfig{
+        .mode = if (delivery_channel_opt != null) .always else .none,
+        .channel = delivery_channel_opt,
+        .to = delivery_to_opt,
+        .channel_owned = false,
+        .to_owned = false,
+    };
+
+    const job_ptr = if (prompt_opt != null)
+        sched.addAgentJob(expression, prompt_opt.?, model_opt, delivery) catch |err| {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = if (err == error.MaxTasksReached)
+                "{\"error\":\"max tasks reached\"}"
+            else if (err == error.InvalidCronExpression)
+                "{\"error\":\"invalid cron expression\"}"
+            else
+                "{\"error\":\"add failed\"}";
+            return;
+        }
+    else blk: {
+        const cmd = command_opt orelse {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"missing command or prompt\"}";
+            return;
+        };
+        break :blk sched.addJob(expression, cmd) catch |err| {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = if (err == error.MaxTasksReached)
+                "{\"error\":\"max tasks reached\"}"
+            else if (err == error.InvalidCronExpression)
+                "{\"error\":\"invalid cron expression\"}"
+            else
+                "{\"error\":\"add failed\"}";
+            return;
+        };
+    };
+
+    cron_mod.saveJobs(sched) catch {};
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    appendCronJobJson(&buf, ctx.req_allocator, job_ptr.*) catch {
+        ctx.response_status = "500 Internal Server Error";
+        ctx.response_body = "{\"error\":\"serialization failed\"}";
+        return;
+    };
+    ctx.response_body = buf.items;
+}
+
+fn handleCronRemove(ctx: *WebhookHandlerContext) void {
+    if (!std.mem.eql(u8, ctx.method, "POST")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    const body = extractBody(ctx.raw_request) orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing body\"}";
+        return;
+    };
+    const id = jsonStringField(body, "id") orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing id\"}";
+        return;
+    };
+
+    ctx.state.scheduler_mutex.lock();
+    defer ctx.state.scheduler_mutex.unlock();
+
+    const sched = ctx.state.scheduler orelse {
+        ctx.response_status = "503 Service Unavailable";
+        ctx.response_body = "{\"error\":\"scheduler not running\"}";
+        return;
+    };
+
+    if (!sched.removeJob(id)) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"job not found\"}";
+        return;
+    }
+    cron_mod.saveJobs(sched) catch {};
+    ctx.response_body = "{\"status\":\"removed\"}";
+}
+
+fn handleCronPause(ctx: *WebhookHandlerContext) void {
+    if (!std.mem.eql(u8, ctx.method, "POST")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    const body = extractBody(ctx.raw_request) orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing body\"}";
+        return;
+    };
+    const id = jsonStringField(body, "id") orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing id\"}";
+        return;
+    };
+
+    ctx.state.scheduler_mutex.lock();
+    defer ctx.state.scheduler_mutex.unlock();
+
+    const sched = ctx.state.scheduler orelse {
+        ctx.response_status = "503 Service Unavailable";
+        ctx.response_body = "{\"error\":\"scheduler not running\"}";
+        return;
+    };
+
+    if (!sched.pauseJob(id)) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"job not found\"}";
+        return;
+    }
+    cron_mod.saveJobs(sched) catch {};
+    ctx.response_body = "{\"status\":\"paused\"}";
+}
+
+fn handleCronResume(ctx: *WebhookHandlerContext) void {
+    if (!std.mem.eql(u8, ctx.method, "POST")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    const body = extractBody(ctx.raw_request) orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing body\"}";
+        return;
+    };
+    const id = jsonStringField(body, "id") orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing id\"}";
+        return;
+    };
+
+    ctx.state.scheduler_mutex.lock();
+    defer ctx.state.scheduler_mutex.unlock();
+
+    const sched = ctx.state.scheduler orelse {
+        ctx.response_status = "503 Service Unavailable";
+        ctx.response_body = "{\"error\":\"scheduler not running\"}";
+        return;
+    };
+
+    if (!sched.resumeJob(id)) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"job not found\"}";
+        return;
+    }
+    cron_mod.saveJobs(sched) catch {};
+    ctx.response_body = "{\"status\":\"resumed\"}";
+}
+
+fn handleCronUpdate(ctx: *WebhookHandlerContext) void {
+    if (!std.mem.eql(u8, ctx.method, "POST")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    const body = extractBody(ctx.raw_request) orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing body\"}";
+        return;
+    };
+    const id = jsonStringField(body, "id") orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing id\"}";
+        return;
+    };
+
+    const expression = jsonStringField(body, "expression");
+    const command = jsonStringField(body, "command");
+    const prompt = jsonStringField(body, "prompt");
+    const model = jsonStringField(body, "model");
+
+    // Parse optional boolean "paused" field
+    var enabled_opt: ?bool = null;
+    if (std.mem.indexOf(u8, body, "\"paused\":true") != null) {
+        enabled_opt = false; // paused=true means enabled=false
+    } else if (std.mem.indexOf(u8, body, "\"paused\":false") != null) {
+        enabled_opt = true;
+    }
+    if (std.mem.indexOf(u8, body, "\"enabled\":true") != null) {
+        enabled_opt = true;
+    } else if (std.mem.indexOf(u8, body, "\"enabled\":false") != null) {
+        enabled_opt = false;
+    }
+
+    ctx.state.scheduler_mutex.lock();
+    defer ctx.state.scheduler_mutex.unlock();
+
+    const sched = ctx.state.scheduler orelse {
+        ctx.response_status = "503 Service Unavailable";
+        ctx.response_body = "{\"error\":\"scheduler not running\"}";
+        return;
+    };
+
+    const patch = cron_mod.CronJobPatch{
+        .expression = expression,
+        .command = command,
+        .prompt = prompt,
+        .model = model,
+        .enabled = enabled_opt,
+    };
+
+    if (!sched.updateJob(ctx.req_allocator, id, patch)) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"job not found or update failed\"}";
+        return;
+    }
+    cron_mod.saveJobs(sched) catch {};
+    ctx.response_body = "{\"status\":\"updated\"}";
+}
+
 fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
     if (!build_options.enable_channel_telegram) {
         ctx.response_status = "404 Not Found";
@@ -3730,6 +4095,37 @@ fn spawnA2aStreamingWorker(
     thread.detach();
 }
 
+// ── Shared gateway state for cross-thread access ─────────────────
+
+/// Module-level pointer to the active GatewayState, used by the scheduler
+/// thread to register itself with the live gateway (so /cron HTTP endpoints
+/// can operate on the running scheduler).  Protected by `g_state_mutex`.
+var g_state_ptr: ?*GatewayState = null;
+var g_state_mutex: std.Thread.Mutex = .{};
+
+/// Called by the scheduler thread after it initialises its CronScheduler.
+/// Sets the scheduler pointer on the active GatewayState so /cron endpoints work.
+pub fn setSharedScheduler(sched: *cron_mod.CronScheduler) void {
+    g_state_mutex.lock();
+    defer g_state_mutex.unlock();
+    if (g_state_ptr) |gs| {
+        gs.scheduler_mutex.lock();
+        defer gs.scheduler_mutex.unlock();
+        gs.scheduler = sched;
+    }
+}
+
+/// Called by the scheduler thread on exit to clear the scheduler pointer.
+pub fn clearSharedScheduler() void {
+    g_state_mutex.lock();
+    defer g_state_mutex.unlock();
+    if (g_state_ptr) |gs| {
+        gs.scheduler_mutex.lock();
+        defer gs.scheduler_mutex.unlock();
+        gs.scheduler = null;
+    }
+}
+
 /// Run the HTTP gateway. Binds to host:port and serves HTTP requests.
 /// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark, POST /qq, POST /max
 /// If config_ptr is null, loads config internally (for backward compatibility).
@@ -3739,6 +4135,17 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     var state = GatewayState.init(allocator);
     defer state.deinit();
     state.event_bus = event_bus;
+
+    // Register this GatewayState as the active state so the scheduler thread
+    // can set its scheduler pointer via setSharedScheduler/clearSharedScheduler.
+    g_state_mutex.lock();
+    g_state_ptr = &state;
+    g_state_mutex.unlock();
+    defer {
+        g_state_mutex.lock();
+        if (g_state_ptr == &state) g_state_ptr = null;
+        g_state_mutex.unlock();
+    }
 
     var owned_config: ?Config = null;
     var config_opt: ?*const Config = null;
@@ -4015,7 +4422,31 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         var response_body: []const u8 = "";
         var pair_response_buf: [256]u8 = undefined;
 
-        if (findWebhookRouteDescriptor(base_path)) |desc| {
+        if (findCronRouteDescriptor(base_path)) |desc| {
+            // Auth check — require a valid bearer token for all /cron endpoints.
+            const auth_header = extractHeader(raw, "Authorization");
+            const bearer = if (auth_header) |ah| extractBearerToken(ah) else null;
+            const pairing_guard = if (state.pairing_guard) |*guard| guard else null;
+            if (!isWebhookAuthorized(pairing_guard, bearer)) {
+                response_status = "401 Unauthorized";
+                response_body = "{\"error\":\"unauthorized\"}";
+            } else {
+                _ = desc.method; // method check is inside each handler
+                var cron_ctx = WebhookHandlerContext{
+                    .root_allocator = allocator,
+                    .req_allocator = req_allocator,
+                    .raw_request = raw,
+                    .method = method_str,
+                    .target = target,
+                    .config_opt = config_opt,
+                    .state = &state,
+                    .session_mgr_opt = if (session_mgr_opt) |*sm| sm else null,
+                };
+                desc.handler(&cron_ctx);
+                response_status = cron_ctx.response_status;
+                response_body = cron_ctx.response_body;
+            }
+        } else if (findWebhookRouteDescriptor(base_path)) |desc| {
             var webhook_ctx = WebhookHandlerContext{
                 .root_allocator = allocator,
                 .req_allocator = req_allocator,

@@ -1547,6 +1547,88 @@ fn isRecoverableCronStoreError(err: anyerror) bool {
 
 // ── CLI entry points (called from main.zig) ──────────────────────
 
+const http_util = @import("http_util.zig");
+
+/// Try to read the gateway URL from ~/.nullclaw/daemon_state.json.
+/// Returns an allocated string like "http://127.0.0.1:3000" or null.
+fn readGatewayUrl(allocator: std.mem.Allocator) ?[]const u8 {
+    const home = platform.getHomeDir(allocator) catch return null;
+    defer allocator.free(home);
+    const state_path = std.fs.path.join(allocator, &.{ home, ".nullclaw", "daemon_state.json" }) catch return null;
+    defer allocator.free(state_path);
+
+    const content = fs_compat.readFileAlloc(std.fs.cwd(), allocator, state_path, 64 * 1024) catch return null;
+    defer allocator.free(content);
+
+    // Parse "gateway": "host:port" field
+    const key = "\"gateway\":";
+    const key_pos = std.mem.indexOf(u8, content, key) orelse return null;
+    const after_key = content[key_pos + key.len ..];
+    var i: usize = 0;
+    while (i < after_key.len and (after_key[i] == ' ' or after_key[i] == '\t')) : (i += 1) {}
+    if (i >= after_key.len or after_key[i] != '"') return null;
+    i += 1; // skip opening quote
+    const val_start = i;
+    while (i < after_key.len and after_key[i] != '"') : (i += 1) {}
+    if (i >= after_key.len) return null;
+    const host_port = after_key[val_start..i];
+    if (host_port.len == 0) return null;
+    return std.fmt.allocPrint(allocator, "http://{s}", .{host_port}) catch null;
+}
+
+/// Read the paired bearer token from ~/.nullclaw/paired_token (if present).
+fn readPairedToken(allocator: std.mem.Allocator) ?[]const u8 {
+    const home = platform.getHomeDir(allocator) catch return null;
+    defer allocator.free(home);
+    const token_path = std.fs.path.join(allocator, &.{ home, ".nullclaw", "paired_token" }) catch return null;
+    defer allocator.free(token_path);
+    const raw = fs_compat.readFileAlloc(std.fs.cwd(), allocator, token_path, 4096) catch return null;
+    // Strip trailing whitespace
+    return std.mem.trimRight(u8, raw, " \t\r\n");
+}
+
+/// Build Authorization header slice (caller owns via arena/allocator).
+fn buildAuthHeader(allocator: std.mem.Allocator, token: ?[]const u8) ?[]const u8 {
+    const t = token orelse return null;
+    return std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{t}) catch null;
+}
+
+/// Issue an HTTP GET to the live gateway and print the JSON response.
+/// Returns true on success (2xx), false if gateway not reachable or non-2xx.
+fn gatewayGet(allocator: std.mem.Allocator, base_url: []const u8, path: []const u8) bool {
+    const token = readPairedToken(allocator);
+    defer if (token) |t| allocator.free(t);
+    const auth_hdr = buildAuthHeader(allocator, token);
+    defer if (auth_hdr) |h| allocator.free(h);
+
+    const url = std.fmt.allocPrint(allocator, "{s}{s}", .{ base_url, path }) catch return false;
+    defer allocator.free(url);
+
+    const headers: []const []const u8 = if (auth_hdr) |h| &.{h} else &.{};
+    const body = http_util.curlGet(allocator, url, headers, "5") catch return false;
+    defer allocator.free(body);
+    log.info("{s}", .{body});
+    return true;
+}
+
+/// Issue an HTTP POST to the live gateway with a JSON body.
+/// Returns true on success (2xx).
+fn gatewayPost(allocator: std.mem.Allocator, base_url: []const u8, path: []const u8, json_body: []const u8) bool {
+    const token = readPairedToken(allocator);
+    defer if (token) |t| allocator.free(t);
+    const auth_hdr = buildAuthHeader(allocator, token);
+    defer if (auth_hdr) |h| allocator.free(h);
+
+    const url = std.fmt.allocPrint(allocator, "{s}{s}", .{ base_url, path }) catch return false;
+    defer allocator.free(url);
+
+    const headers: []const []const u8 = if (auth_hdr) |h| &.{h} else &.{};
+    const resp = http_util.curlPostWithStatus(allocator, url, json_body, headers) catch return false;
+    defer allocator.free(resp.body);
+    log.info("{s}", .{resp.body});
+    return resp.status_code >= 200 and resp.status_code < 300;
+}
+
 const SchedulerStatus = struct {
     config_exists: bool,
     scheduler_enabled: bool,
@@ -1592,6 +1674,12 @@ fn checkSchedulerStatus(allocator: std.mem.Allocator) SchedulerStatus {
 }
 
 pub fn cliListJobs(allocator: std.mem.Allocator) !void {
+    // If the gateway is running, query it directly instead of reading from disk.
+    if (readGatewayUrl(allocator)) |url| {
+        defer allocator.free(url);
+        if (gatewayGet(allocator, url, "/cron")) return;
+    }
+
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
     try loadJobs(&scheduler);
@@ -1694,6 +1782,15 @@ pub fn cliStatus(allocator: std.mem.Allocator) !void {
 
 /// CLI: add a recurring cron job.
 pub fn cliAddJob(allocator: std.mem.Allocator, expression: []const u8, command: []const u8) !void {
+    if (readGatewayUrl(allocator)) |url| {
+        defer allocator.free(url);
+        const body = std.fmt.allocPrint(allocator, "{{\"expression\":\"{s}\",\"command\":\"{s}\"}}", .{ expression, command }) catch null;
+        if (body) |b| {
+            defer allocator.free(b);
+            if (gatewayPost(allocator, url, "/cron/add", b)) return;
+        }
+    }
+
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
     try loadJobs(&scheduler);
@@ -1709,6 +1806,33 @@ pub fn cliAddJob(allocator: std.mem.Allocator, expression: []const u8, command: 
 
 /// CLI: add a recurring agent job.
 pub fn cliAddAgentJob(allocator: std.mem.Allocator, expression: []const u8, prompt: []const u8, model: ?[]const u8, delivery: DeliveryConfig) !void {
+    if (readGatewayUrl(allocator)) |url| {
+        defer allocator.free(url);
+        // Build JSON body, escaping string values through json_util
+        var body_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_buf.deinit(allocator);
+        body_buf.appendSlice(allocator, "{") catch {};
+        json_util.appendJsonKeyValue(&body_buf, allocator, "expression", expression) catch {};
+        body_buf.appendSlice(allocator, ",") catch {};
+        json_util.appendJsonKeyValue(&body_buf, allocator, "prompt", prompt) catch {};
+        if (model) |m| {
+            body_buf.appendSlice(allocator, ",") catch {};
+            json_util.appendJsonKeyValue(&body_buf, allocator, "model", m) catch {};
+        }
+        if (delivery.channel) |ch| {
+            body_buf.appendSlice(allocator, ",") catch {};
+            json_util.appendJsonKeyValue(&body_buf, allocator, "delivery_channel", ch) catch {};
+        }
+        if (delivery.to) |t| {
+            body_buf.appendSlice(allocator, ",") catch {};
+            json_util.appendJsonKeyValue(&body_buf, allocator, "delivery_to", t) catch {};
+        }
+        body_buf.appendSlice(allocator, "}") catch {};
+        if (body_buf.items.len > 2) {
+            if (gatewayPost(allocator, url, "/cron/add", body_buf.items)) return;
+        }
+    }
+
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
     try loadJobs(&scheduler);
@@ -1753,6 +1877,16 @@ pub fn cliAddAgentOnce(allocator: std.mem.Allocator, delay: []const u8, prompt: 
 
 /// CLI: remove a cron job by ID.
 pub fn cliRemoveJob(allocator: std.mem.Allocator, id: []const u8) !void {
+    if (readGatewayUrl(allocator)) |url| {
+        defer allocator.free(url);
+        var body_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_buf.deinit(allocator);
+        body_buf.appendSlice(allocator, "{") catch {};
+        json_util.appendJsonKeyValue(&body_buf, allocator, "id", id) catch {};
+        body_buf.appendSlice(allocator, "}") catch {};
+        if (gatewayPost(allocator, url, "/cron/remove", body_buf.items)) return;
+    }
+
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
     try loadJobs(&scheduler);
@@ -1767,6 +1901,16 @@ pub fn cliRemoveJob(allocator: std.mem.Allocator, id: []const u8) !void {
 
 /// CLI: pause a cron job by ID.
 pub fn cliPauseJob(allocator: std.mem.Allocator, id: []const u8) !void {
+    if (readGatewayUrl(allocator)) |url| {
+        defer allocator.free(url);
+        var body_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_buf.deinit(allocator);
+        body_buf.appendSlice(allocator, "{") catch {};
+        json_util.appendJsonKeyValue(&body_buf, allocator, "id", id) catch {};
+        body_buf.appendSlice(allocator, "}") catch {};
+        if (gatewayPost(allocator, url, "/cron/pause", body_buf.items)) return;
+    }
+
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
     try loadJobs(&scheduler);
@@ -1781,6 +1925,16 @@ pub fn cliPauseJob(allocator: std.mem.Allocator, id: []const u8) !void {
 
 /// CLI: resume a paused cron job by ID.
 pub fn cliResumeJob(allocator: std.mem.Allocator, id: []const u8) !void {
+    if (readGatewayUrl(allocator)) |url| {
+        defer allocator.free(url);
+        var body_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_buf.deinit(allocator);
+        body_buf.appendSlice(allocator, "{") catch {};
+        json_util.appendJsonKeyValue(&body_buf, allocator, "id", id) catch {};
+        body_buf.appendSlice(allocator, "}") catch {};
+        if (gatewayPost(allocator, url, "/cron/resume", body_buf.items)) return;
+    }
+
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
     try loadJobs(&scheduler);
@@ -1881,6 +2035,36 @@ pub fn cliUpdateJob(
     model: ?[]const u8,
     enabled: ?bool,
 ) !void {
+    if (readGatewayUrl(allocator)) |url| {
+        defer allocator.free(url);
+        var body_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_buf.deinit(allocator);
+        body_buf.appendSlice(allocator, "{") catch {};
+        json_util.appendJsonKeyValue(&body_buf, allocator, "id", id) catch {};
+        if (expression) |e| {
+            body_buf.appendSlice(allocator, ",") catch {};
+            json_util.appendJsonKeyValue(&body_buf, allocator, "expression", e) catch {};
+        }
+        if (command) |c| {
+            body_buf.appendSlice(allocator, ",") catch {};
+            json_util.appendJsonKeyValue(&body_buf, allocator, "command", c) catch {};
+        }
+        if (prompt) |p| {
+            body_buf.appendSlice(allocator, ",") catch {};
+            json_util.appendJsonKeyValue(&body_buf, allocator, "prompt", p) catch {};
+        }
+        if (model) |m| {
+            body_buf.appendSlice(allocator, ",") catch {};
+            json_util.appendJsonKeyValue(&body_buf, allocator, "model", m) catch {};
+        }
+        if (enabled) |ena| {
+            body_buf.appendSlice(allocator, ",\"enabled\":") catch {};
+            body_buf.appendSlice(allocator, if (ena) "true" else "false") catch {};
+        }
+        body_buf.appendSlice(allocator, "}") catch {};
+        if (gatewayPost(allocator, url, "/cron/update", body_buf.items)) return;
+    }
+
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
     try loadJobs(&scheduler);
