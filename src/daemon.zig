@@ -2216,6 +2216,35 @@ test "makeAssistantReplyOutbound extracts structured choices from assistant repl
     try std.testing.expectEqual(@as(u64, 17), msg.draft_id);
 }
 
+test "nextOutboundDraftId stays unique across concurrent callers" {
+    const Worker = struct {
+        fn run(out: *u64) void {
+            out.* = nextOutboundDraftId();
+        }
+    };
+
+    const previous = outbound_draft_id_counter.swap(1, .monotonic);
+    defer _ = outbound_draft_id_counter.swap(previous, .monotonic);
+
+    var results: [8]u64 = undefined;
+    var threads: [results.len]std.Thread = undefined;
+    const max_id: u64 = results.len;
+
+    for (&results, 0..) |*result, i| {
+        threads[i] = try std.Thread.spawn(.{}, Worker.run, .{result});
+    }
+    for (threads) |thread| thread.join();
+
+    var seen: [results.len + 1]bool = [_]bool{false} ** (results.len + 1);
+    for (results) |id| {
+        // Regression: daemon draft IDs must remain unique after replacing the
+        // mutex-protected counter with portable atomic access on 32-bit targets.
+        try std.testing.expect(id >= 1 and id <= max_id);
+        try std.testing.expect(!seen[@intCast(id)]);
+        seen[@intCast(id)] = true;
+    }
+}
+
 test "resolveSlackStatusTarget prefers thread_id then falls back to message_id" {
     const with_thread = resolveSlackStatusTarget(.{
         .channel_id = "C123",
