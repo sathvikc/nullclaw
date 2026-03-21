@@ -107,6 +107,15 @@ fn defaultAgentErrorMessage(err: anyerror) []const u8 {
     };
 }
 
+fn compactAgentErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
+        error.NoResponseContent => "Model returned an empty response. Please try again.",
+        error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError, error.AllProvidersFailed, error.OutOfMemory => defaultAgentErrorMessage(err),
+        else => "An error occurred. Try again.",
+    };
+}
+
 const TelegramSessionTarget = struct {
     base_chat_id: []const u8,
     thread_id: ?i64,
@@ -1634,15 +1643,10 @@ pub fn runSignalLoop(
             });
 
             const reply = runtime.session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
-                log.err("Signal agent error: {}", .{err});
-                const err_msg: []const u8 = switch (err) {
-                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
-                    error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
-                    error.NoResponseContent => "Model returned an empty response. Please try again.",
-                    error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
-                    error.OutOfMemory => "Out of memory.",
-                    else => "An error occurred. Try again.",
-                };
+                logAgentProcessingError(allocator, "Signal agent error", err);
+                const owned_err_msg = detailedProviderErrorForDisplay(allocator, err) catch null;
+                defer if (owned_err_msg) |owned_msg| allocator.free(owned_msg);
+                const err_msg = owned_err_msg orelse compactAgentErrorMessage(err);
                 if (msg.reply_target) |target| {
                     sg_ptr.sendMessage(target, err_msg, &.{}) catch |send_err| log.err("failed to send signal error reply: {}", .{send_err});
                 }
@@ -1868,15 +1872,10 @@ pub fn runMatrixLoop(
             });
 
             const reply = runtime.session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
-                log.err("Matrix agent error: {}", .{err});
-                const err_msg: []const u8 = switch (err) {
-                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
-                    error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
-                    error.NoResponseContent => "Model returned an empty response. Please try again.",
-                    error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
-                    error.OutOfMemory => "Out of memory.",
-                    else => "An error occurred. Try again.",
-                };
+                logAgentProcessingError(allocator, "Matrix agent error", err);
+                const owned_err_msg = detailedProviderErrorForDisplay(allocator, err) catch null;
+                defer if (owned_err_msg) |owned_msg| allocator.free(owned_msg);
+                const err_msg = owned_err_msg orelse compactAgentErrorMessage(err);
                 mx_ptr.sendMessage(typing_target, err_msg) catch |send_err| log.err("failed to send matrix error reply: {}", .{send_err});
                 continue;
             };
@@ -2018,11 +2017,7 @@ pub fn runMaxLoop(
                 logAgentProcessingError(allocator, "Max agent error", err);
                 const owned_err_msg = detailedProviderErrorForDisplay(allocator, err) catch null;
                 defer if (owned_err_msg) |owned_msg| allocator.free(owned_msg);
-                const err_msg = owned_err_msg orelse switch (err) {
-                    error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
-                    error.NoResponseContent => "Model returned an empty response. Please try again.",
-                    else => defaultAgentErrorMessage(err),
-                };
+                const err_msg = owned_err_msg orelse compactAgentErrorMessage(err);
                 mx_ptr.sendMessage(reply_target, err_msg) catch |send_err| log.err("failed to send max error reply: {}", .{send_err});
                 continue;
             };
@@ -2453,6 +2448,11 @@ test "detailedProviderErrorForDisplay ignores non-provider errors" {
 
     providers.setLastApiErrorDetail("compatible", "status=429 message=Rate limit exceeded");
     try std.testing.expect((try detailedProviderErrorForDisplay(allocator, error.OutOfMemory)) == null);
+}
+
+test "compactAgentErrorMessage keeps non-telegram fallback concise" {
+    // Regression: Signal/Matrix/Max should not inherit Telegram's `/new` guidance for generic failures.
+    try std.testing.expectEqualStrings("An error occurred. Try again.", compactAgentErrorMessage(error.Unexpected));
 }
 
 test "telegram update offset store returns null for mismatched bot id" {
