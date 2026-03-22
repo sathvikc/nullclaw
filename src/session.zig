@@ -1282,6 +1282,11 @@ pub const SessionManager = struct {
             agent.usage_record_ctx = @ptrCast(self);
         }
 
+        // Warm start: load history from message logs if enabled
+        if (agent.warm_start) {
+            agent.attemptWarmStart();
+        }
+
         const session_provider_holder = session.provider_holder;
         const session_owned_provider_api_key = session.owned_provider_api_key;
         session.* = .{
