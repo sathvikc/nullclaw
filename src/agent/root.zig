@@ -2577,6 +2577,14 @@ pub const Agent = struct {
         call: ParsedToolCall,
         result: ToolExecutionResult,
     ) void {
+        // Only cache successful results, unless it's a native tool call with an ID.
+        // For ID-based calls, we must preserve the result (even if failed) to support
+        // exact replays requested by the provider.
+        // Signature-based calls (XML) that failed are not cached so they can be
+        // re-tried if a subsequent tool in the same turn fixes the environment.
+        const has_id = call.tool_call_id != null and call.tool_call_id.?.len > 0;
+        if (!result.success and !has_id) return;
+
         const fingerprint = toolCallDedupFingerprint(call);
         if (seen_tool_call_results.contains(fingerprint)) return;
 
