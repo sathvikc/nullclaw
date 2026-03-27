@@ -24,6 +24,7 @@ extern "kernel32" fn WideCharToMultiByte(
 ) callconv(.winapi) i32;
 
 extern "kernel32" fn GetACP() callconv(.winapi) std.os.windows.UINT;
+extern "kernel32" fn GetProcessId(process_handle: std.os.windows.HANDLE) callconv(.winapi) std.os.windows.DWORD;
 
 const CP_UTF8: std.os.windows.UINT = 65001;
 const CP_GBK: std.os.windows.UINT = 936;
@@ -70,6 +71,20 @@ const ProcessWatcherCtx = struct {
 
 fn terminateChild(child: *std.process.Child) void {
     if (comptime builtin.os.tag == .windows) {
+        const pid = GetProcessId(child.id);
+        if (pid != 0) {
+            var pid_buf: [32]u8 = undefined;
+            if (std.fmt.bufPrint(&pid_buf, "{d}", .{pid})) |pid_arg| {
+                // `TerminateProcess` only reaches the direct child handle; use
+                // `taskkill /T` first so shell wrappers do not strand descendants.
+                var taskkill = std.process.Child.init(&.{ "taskkill", "/T", "/F", "/PID", pid_arg }, std.heap.page_allocator);
+                taskkill.stdin_behavior = .Ignore;
+                taskkill.stdout_behavior = .Ignore;
+                taskkill.stderr_behavior = .Ignore;
+                taskkill.create_no_window = true;
+                _ = taskkill.spawnAndWait() catch null;
+            } else |_| {}
+        }
         std.os.windows.TerminateProcess(child.id, 1) catch {};
     } else if (comptime builtin.os.tag == .wasi) {
         return;
