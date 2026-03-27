@@ -26,12 +26,19 @@ const MemoryCategory = root.MemoryCategory;
 const MemoryEntry = root.MemoryEntry;
 const log = std.log.scoped(.memory_kg);
 
+const ENTITY_STORE_PREFIX = "__kg:entity:";
+const RELATION_STORE_PREFIX = "__kg:rel:";
+const TRAVERSE_QUERY_PREFIX = "kg:traverse:";
+const PATH_QUERY_PREFIX = "kg:path:";
+const RELATIONS_QUERY_PREFIX = "kg:relations:";
+const RELATION_CATEGORY = "relation";
+const DEFAULT_QUERY_LIMIT: usize = 100;
+
 pub const c = @cImport({
     @cInclude("sqlite3.h");
 });
 
 pub const SQLITE_STATIC: c.sqlite3_destructor_type = null;
-pub const SQLITE_TRANSIENT: c.sqlite3_destructor_type = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
 const BUSY_TIMEOUT_MS: c_int = 5000;
 
 pub const KgMemory = struct {
@@ -121,13 +128,29 @@ pub const KgMemory = struct {
         return std.fmt.allocPrint(allocator, "{d}", .{ts});
     }
 
-    fn generateId(allocator: std.mem.Allocator) ![]u8 {
-        const ts = std.time.nanoTimestamp();
-        var buf: [16]u8 = undefined;
-        std.crypto.random.bytes(&buf);
-        const rand_hi = std.mem.readInt(u64, buf[0..8], .little);
-        const rand_lo = std.mem.readInt(u64, buf[8..16], .little);
-        return std.fmt.allocPrint(allocator, "{d}-{x}-{x}", .{ ts, rand_hi, rand_lo });
+    fn effectiveLimit(limit: usize) usize {
+        return if (limit > 0) limit else DEFAULT_QUERY_LIMIT;
+    }
+
+    fn entityIdForKey(key: []const u8) []const u8 {
+        if (std.mem.startsWith(u8, key, ENTITY_STORE_PREFIX)) return key[ENTITY_STORE_PREFIX.len..];
+        return key;
+    }
+
+    fn relationIdForKey(key: []const u8) []const u8 {
+        if (std.mem.startsWith(u8, key, RELATION_STORE_PREFIX)) return key[RELATION_STORE_PREFIX.len..];
+        return key;
+    }
+
+    fn categoryFromOwnedString(allocator: std.mem.Allocator, raw: []u8) MemoryCategory {
+        const parsed = MemoryCategory.fromString(raw);
+        switch (parsed) {
+            .core, .daily, .conversation => {
+                allocator.free(raw);
+                return parsed;
+            },
+            .custom => return .{ .custom = raw },
+        }
     }
 
     // ── Graph operations ──────────────────────────────────────────────
@@ -143,11 +166,10 @@ pub const KgMemory = struct {
         if (rc != c.SQLITE_OK) return error.PrepareFailed;
         defer _ = c.sqlite3_finalize(stmt);
 
-        // SQLITE_TRANSIENT for now: freed before finalize
         _ = c.sqlite3_bind_text(stmt, 1, id.ptr, @intCast(id.len), SQLITE_STATIC);
         _ = c.sqlite3_bind_text(stmt, 2, entity_type.ptr, @intCast(entity_type.len), SQLITE_STATIC);
         _ = c.sqlite3_bind_text(stmt, 3, content.ptr, @intCast(content.len), SQLITE_STATIC);
-        _ = c.sqlite3_bind_text(stmt, 4, now.ptr, @intCast(now.len), SQLITE_TRANSIENT);
+        _ = c.sqlite3_bind_text(stmt, 4, now.ptr, @intCast(now.len), SQLITE_STATIC);
 
         rc = c.sqlite3_step(stmt);
         if (rc != c.SQLITE_DONE) return error.StepFailed;
@@ -170,17 +192,20 @@ pub const KgMemory = struct {
         defer self.allocator.free(now);
 
         const sql = "INSERT INTO kg_relations (id, subject_id, predicate, object_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5) " ++
-            "ON CONFLICT(id) DO UPDATE SET predicate = excluded.predicate";
+            "ON CONFLICT(id) DO UPDATE SET " ++
+            "subject_id = excluded.subject_id, " ++
+            "predicate = excluded.predicate, " ++
+            "object_id = excluded.object_id";
         var stmt: ?*c.sqlite3_stmt = null;
         var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
         if (rc != c.SQLITE_OK) return error.PrepareFailed;
         defer _ = c.sqlite3_finalize(stmt);
 
-        _ = c.sqlite3_bind_text(stmt, 1, id.ptr, @intCast(id.len), SQLITE_TRANSIENT);
+        _ = c.sqlite3_bind_text(stmt, 1, id.ptr, @intCast(id.len), SQLITE_STATIC);
         _ = c.sqlite3_bind_text(stmt, 2, subject_id.ptr, @intCast(subject_id.len), SQLITE_STATIC);
         _ = c.sqlite3_bind_text(stmt, 3, predicate.ptr, @intCast(predicate.len), SQLITE_STATIC);
         _ = c.sqlite3_bind_text(stmt, 4, object_id.ptr, @intCast(object_id.len), SQLITE_STATIC);
-        _ = c.sqlite3_bind_text(stmt, 5, now.ptr, @intCast(now.len), SQLITE_TRANSIENT);
+        _ = c.sqlite3_bind_text(stmt, 5, now.ptr, @intCast(now.len), SQLITE_STATIC);
 
         rc = c.sqlite3_step(stmt);
         if (rc != c.SQLITE_DONE) return error.StepFailed;
@@ -210,7 +235,7 @@ pub const KgMemory = struct {
 
         _ = c.sqlite3_bind_text(stmt, 1, start_id.ptr, @intCast(start_id.len), SQLITE_STATIC);
         _ = c.sqlite3_bind_int64(stmt, 2, @intCast(max_depth));
-        _ = c.sqlite3_bind_int64(stmt, 3, @intCast(if (limit > 0) limit else 100));
+        _ = c.sqlite3_bind_int64(stmt, 3, @intCast(effectiveLimit(limit)));
 
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
             const entry = try self.readEntityFromRow(stmt.?, allocator);
@@ -230,18 +255,37 @@ pub const KgMemory = struct {
         }
 
         const sql =
-            \\WITH RECURSIVE path(visited, id, depth) AS (
+            \\WITH RECURSIVE path(path_ids, id, depth) AS (
             \\  SELECT '<' || ?1, ?1, 0
             \\  UNION ALL
-            \\  SELECT p.visited || '<' || r.object_id, r.object_id, p.depth + 1
-            \\   FROM kg_relations r, path p
+            \\  SELECT p.path_ids || '<' || r.object_id, r.object_id, p.depth + 1
+            \\   FROM kg_relations r
+            \\   JOIN path p ON r.subject_id = p.id
             \\   WHERE r.subject_id = p.id AND p.depth < ?3
-            \\     AND INSTR(p.visited, '<' || r.object_id) = 0
+            \\     AND INSTR(p.path_ids || '<', '<' || r.object_id || '<') = 0
             \\)
-            \\SELECT DISTINCT e.id, e.type, e.content, e.created_at
-            \\FROM kg_entities e, path p
-            \\WHERE e.id = p.id
-            \\ORDER BY p.depth ASC
+            \\, target(path_ids) AS (
+            \\  SELECT path_ids
+            \\  FROM path
+            \\  WHERE id = ?2
+            \\  ORDER BY depth ASC
+            \\  LIMIT 1
+            \\)
+            \\, split(rest, node_id, ord) AS (
+            \\  SELECT substr(path_ids, 2) || '<', '', 0
+            \\  FROM target
+            \\  UNION ALL
+            \\  SELECT substr(rest, instr(rest, '<') + 1),
+            \\         substr(rest, 1, instr(rest, '<') - 1),
+            \\         ord + 1
+            \\  FROM split
+            \\  WHERE rest <> ''
+            \\)
+            \\SELECT e.id, e.type, e.content, e.created_at
+            \\FROM split s
+            \\JOIN kg_entities e ON e.id = s.node_id
+            \\WHERE s.node_id <> ''
+            \\ORDER BY s.ord ASC
             \\LIMIT ?4
         ;
 
@@ -252,7 +296,7 @@ pub const KgMemory = struct {
         _ = c.sqlite3_bind_text(stmt, 1, from_id.ptr, @intCast(from_id.len), SQLITE_STATIC);
         _ = c.sqlite3_bind_text(stmt, 2, to_id.ptr, @intCast(to_id.len), SQLITE_STATIC);
         _ = c.sqlite3_bind_int64(stmt, 3, @intCast(max_depth));
-        _ = c.sqlite3_bind_int64(stmt, 4, @intCast(if (limit > 0) limit else 100));
+        _ = c.sqlite3_bind_int64(stmt, 4, @intCast(effectiveLimit(limit)));
 
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
             const entry = try self.readEntityFromRow(stmt.?, allocator);
@@ -284,43 +328,26 @@ pub const KgMemory = struct {
         _ = c.sqlite3_bind_text(stmt, 1, entity_id.ptr, @intCast(entity_id.len), SQLITE_STATIC);
 
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
-            const id_ptr = c.sqlite3_column_text(stmt, 0);
-            const subject_ptr = c.sqlite3_column_text(stmt, 1);
-            const predicate_ptr = c.sqlite3_column_text(stmt, 2);
-            const object_ptr = c.sqlite3_column_text(stmt, 3);
-            const created_ptr = c.sqlite3_column_text(stmt, 4);
-
-            if (id_ptr == null or subject_ptr == null or predicate_ptr == null or object_ptr == null or created_ptr == null) continue;
-
-            const id = try allocator.dupe(u8, std.mem.span(id_ptr));
-            errdefer allocator.free(id);
-
-            const content = try std.fmt.allocPrint(allocator, "{s} --{s}--> {s}", .{
-                std.mem.span(subject_ptr),
-                std.mem.span(predicate_ptr),
-                std.mem.span(object_ptr),
-            });
-            errdefer allocator.free(content);
-
-            const created_at = try allocator.dupe(u8, std.mem.span(created_ptr));
-            errdefer allocator.free(created_at);
-
-            const cat_str = try allocator.dupe(u8, "relation");
-            errdefer allocator.free(cat_str);
-
-            const key = try allocator.dupe(u8, id);
-            errdefer allocator.free(key);
-
-            try entries.append(allocator, MemoryEntry{
-                .id = id,
-                .key = key,
-                .content = content,
-                .category = .{ .custom = cat_str },
-                .timestamp = created_at,
-            });
+            try entries.append(allocator, try self.readRelationFromRow(stmt.?, allocator));
         }
 
         return entries.toOwnedSlice(allocator);
+    }
+
+    fn getRelationById(self: *Self, allocator: std.mem.Allocator, relation_id: []const u8) !?MemoryEntry {
+        const sql = "SELECT id, subject_id, predicate, object_id, created_at FROM kg_relations WHERE id = ?1";
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, relation_id.ptr, @intCast(relation_id.len), SQLITE_STATIC);
+
+        rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_ROW) {
+            return try self.readRelationFromRow(stmt.?, allocator);
+        }
+        return null;
     }
 
     /// FTS5 search on entity content.
@@ -384,7 +411,55 @@ pub const KgMemory = struct {
             .id = id,
             .key = key,
             .content = content,
-            .category = .{ .custom = type_str },
+            .category = categoryFromOwnedString(allocator, type_str),
+            .timestamp = created_at,
+        };
+    }
+
+    fn readRelationFromRow(_: *Self, stmt: *c.sqlite3_stmt, allocator: std.mem.Allocator) !MemoryEntry {
+        const id_ptr = c.sqlite3_column_text(stmt, 0);
+        const subject_ptr = c.sqlite3_column_text(stmt, 1);
+        const predicate_ptr = c.sqlite3_column_text(stmt, 2);
+        const object_ptr = c.sqlite3_column_text(stmt, 3);
+        const created_ptr = c.sqlite3_column_text(stmt, 4);
+
+        if (id_ptr == null or subject_ptr == null or predicate_ptr == null or object_ptr == null or created_ptr == null) {
+            return error.StepFailed;
+        }
+
+        const id = try allocator.dupe(u8, std.mem.span(id_ptr));
+        errdefer allocator.free(id);
+
+        const subject_id = try allocator.dupe(u8, std.mem.span(subject_ptr));
+        defer allocator.free(subject_id);
+
+        const predicate = try allocator.dupe(u8, std.mem.span(predicate_ptr));
+        defer allocator.free(predicate);
+
+        const object_id = try allocator.dupe(u8, std.mem.span(object_ptr));
+        defer allocator.free(object_id);
+
+        const created_at = try allocator.dupe(u8, std.mem.span(created_ptr));
+        errdefer allocator.free(created_at);
+
+        const key = try std.fmt.allocPrint(allocator, RELATION_STORE_PREFIX ++ "{s}", .{id});
+        errdefer allocator.free(key);
+
+        const content = try std.fmt.allocPrint(allocator, "{s} --{s}--> {s}", .{
+            subject_id,
+            predicate,
+            object_id,
+        });
+        errdefer allocator.free(content);
+
+        const category_name = try allocator.dupe(u8, RELATION_CATEGORY);
+        errdefer allocator.free(category_name);
+
+        return MemoryEntry{
+            .id = id,
+            .key = key,
+            .content = content,
+            .category = .{ .custom = category_name },
             .timestamp = created_at,
         };
     }
@@ -399,19 +474,17 @@ pub const KgMemory = struct {
         const self_: *Self = @ptrCast(@alignCast(ptr));
         const cat_str = category.toString();
 
-        if (std.mem.startsWith(u8, key, "__kg:entity:")) {
-            const entity_id = key[12..];
+        if (std.mem.startsWith(u8, key, ENTITY_STORE_PREFIX)) {
+            const entity_id = entityIdForKey(key);
             try self_.storeEntity(entity_id, cat_str, content);
-        } else if (std.mem.startsWith(u8, key, "__kg:rel:")) {
+        } else if (std.mem.startsWith(u8, key, RELATION_STORE_PREFIX)) {
             // Format: __kg:rel:{subject_id}:{predicate}:{object_id}
-            const rel_part = key[9..];
+            const rel_id = relationIdForKey(key);
+            const rel_part = rel_id;
             var it = std.mem.splitScalar(u8, rel_part, ':');
             const subject_id = it.next() orelse return error.StepFailed;
             const predicate = it.next() orelse return error.StepFailed;
             const object_id = it.rest();
-
-            const rel_id = try generateId(self_.allocator);
-            defer self_.allocator.free(rel_id);
 
             try self_.storeRelation(rel_id, subject_id, predicate, object_id);
         } else {
@@ -426,8 +499,8 @@ pub const KgMemory = struct {
         const trimmed = std.mem.trim(u8, query, " \t\n\r");
         if (trimmed.len == 0) return allocator.alloc(MemoryEntry, 0);
 
-        if (std.mem.startsWith(u8, trimmed, "kg:traverse:")) {
-            const args = trimmed[12..];
+        if (std.mem.startsWith(u8, trimmed, TRAVERSE_QUERY_PREFIX)) {
+            const args = trimmed[TRAVERSE_QUERY_PREFIX.len..];
             var it = std.mem.splitScalar(u8, args, ':');
             const entity_id = it.next() orelse return allocator.alloc(MemoryEntry, 0);
             const depth_str = it.next() orelse "3";
@@ -435,8 +508,8 @@ pub const KgMemory = struct {
             return self_.traverse(allocator, entity_id, max_depth, limit);
         }
 
-        if (std.mem.startsWith(u8, trimmed, "kg:path:")) {
-            const args = trimmed[8..];
+        if (std.mem.startsWith(u8, trimmed, PATH_QUERY_PREFIX)) {
+            const args = trimmed[PATH_QUERY_PREFIX.len..];
             var it = std.mem.splitScalar(u8, args, ':');
             const from_id = it.next() orelse return allocator.alloc(MemoryEntry, 0);
             const to_id = it.next() orelse return allocator.alloc(MemoryEntry, 0);
@@ -445,8 +518,8 @@ pub const KgMemory = struct {
             return self_.findPath(allocator, from_id, to_id, max_depth, limit);
         }
 
-        if (std.mem.startsWith(u8, trimmed, "kg:relations:")) {
-            const entity_id = trimmed[14..];
+        if (std.mem.startsWith(u8, trimmed, RELATIONS_QUERY_PREFIX)) {
+            const entity_id = trimmed[RELATIONS_QUERY_PREFIX.len..];
             if (entity_id.len == 0) return allocator.alloc(MemoryEntry, 0);
             return self_.getRelations(allocator, entity_id);
         }
@@ -457,6 +530,7 @@ pub const KgMemory = struct {
 
     fn implGet(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8) anyerror!?MemoryEntry {
         const self_: *Self = @ptrCast(@alignCast(ptr));
+        const entity_id = entityIdForKey(key);
 
         const sql = "SELECT id, type, content, created_at FROM kg_entities WHERE id = ?1";
         var stmt: ?*c.sqlite3_stmt = null;
@@ -464,13 +538,13 @@ pub const KgMemory = struct {
         if (rc != c.SQLITE_OK) return error.PrepareFailed;
         defer _ = c.sqlite3_finalize(stmt);
 
-        _ = c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 1, entity_id.ptr, @intCast(entity_id.len), SQLITE_STATIC);
 
         rc = c.sqlite3_step(stmt);
         if (rc == c.SQLITE_ROW) {
             return try self_.readEntityFromRow(stmt.?, allocator);
         }
-        return null;
+        return try self_.getRelationById(allocator, relationIdForKey(key));
     }
 
     fn implList(ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory, _: ?[]const u8) anyerror![]MemoryEntry {
@@ -506,6 +580,7 @@ pub const KgMemory = struct {
 
     fn implForget(ptr: *anyopaque, key: []const u8) anyerror!bool {
         const self_: *Self = @ptrCast(@alignCast(ptr));
+        const entity_id = entityIdForKey(key);
 
         // Try to delete as entity first
         {
@@ -514,7 +589,7 @@ pub const KgMemory = struct {
             var rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
             if (rc != c.SQLITE_OK) return error.PrepareFailed;
             defer _ = c.sqlite3_finalize(stmt);
-            _ = c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), SQLITE_STATIC);
+            _ = c.sqlite3_bind_text(stmt, 1, entity_id.ptr, @intCast(entity_id.len), SQLITE_STATIC);
             rc = c.sqlite3_step(stmt);
             if (rc != c.SQLITE_DONE) return error.StepFailed;
             if (c.sqlite3_changes(self_.db) > 0) {
@@ -522,7 +597,7 @@ pub const KgMemory = struct {
                 var fts_stmt: ?*c.sqlite3_stmt = null;
                 if (c.sqlite3_prepare_v2(self_.db, "DELETE FROM kg_entities_fts WHERE id = ?1", -1, &fts_stmt, null) == c.SQLITE_OK) {
                     defer _ = c.sqlite3_finalize(fts_stmt);
-                    _ = c.sqlite3_bind_text(fts_stmt, 1, key.ptr, @intCast(key.len), SQLITE_STATIC);
+                    _ = c.sqlite3_bind_text(fts_stmt, 1, entity_id.ptr, @intCast(entity_id.len), SQLITE_STATIC);
                     _ = c.sqlite3_step(fts_stmt);
                 }
                 return true;
@@ -531,12 +606,13 @@ pub const KgMemory = struct {
 
         // Try as relation id
         {
+            const relation_id = relationIdForKey(key);
             const sql = "DELETE FROM kg_relations WHERE id = ?1";
             var stmt: ?*c.sqlite3_stmt = null;
             var rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
             if (rc != c.SQLITE_OK) return error.PrepareFailed;
             defer _ = c.sqlite3_finalize(stmt);
-            _ = c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), SQLITE_STATIC);
+            _ = c.sqlite3_bind_text(stmt, 1, relation_id.ptr, @intCast(relation_id.len), SQLITE_STATIC);
             rc = c.sqlite3_step(stmt);
             if (rc != c.SQLITE_DONE) return error.StepFailed;
             return c.sqlite3_changes(self_.db) > 0;
@@ -645,4 +721,78 @@ test "kg get entity" {
     defer entry.?.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("e1", entry.?.key);
     try std.testing.expectEqualStrings("Test entity content", entry.?.content);
+}
+
+test "kg built-in categories round-trip" {
+    var kg = try KgMemory.init(std.testing.allocator, ":memory:");
+    defer kg.deinit();
+    const m = kg.memory();
+
+    // Regression: built-in categories must not come back as `.custom`.
+    try m.store("__kg:entity:e1", "Core entity", .core, null);
+
+    const entry = try m.get(std.testing.allocator, "e1");
+    try std.testing.expect(entry != null);
+    defer entry.?.deinit(std.testing.allocator);
+    try std.testing.expect(entry.?.category.eql(.core));
+}
+
+test "kg path recall stops at requested destination" {
+    var kg = try KgMemory.init(std.testing.allocator, ":memory:");
+    defer kg.deinit();
+    const m = kg.memory();
+
+    // Regression: `kg:path` must use the destination instead of returning a generic traversal.
+    try m.store("__kg:entity:a", "Alice", .core, null);
+    try m.store("__kg:entity:b", "Bob", .core, null);
+    try m.store("__kg:entity:c", "Carol", .core, null);
+    try m.store("__kg:entity:d", "Dora", .core, null);
+    try m.store("__kg:rel:a:knows:b", "", .core, null);
+    try m.store("__kg:rel:b:knows:c", "", .core, null);
+    try m.store("__kg:rel:a:knows:d", "", .core, null);
+
+    const results = try m.recall(std.testing.allocator, "kg:path:a:c:3", 10, null);
+    defer root.freeEntries(std.testing.allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    try std.testing.expectEqualStrings("a", results[0].key);
+    try std.testing.expectEqualStrings("b", results[1].key);
+    try std.testing.expectEqualStrings("c", results[2].key);
+}
+
+test "kg relations recall preserves entity id prefix parsing" {
+    var kg = try KgMemory.init(std.testing.allocator, ":memory:");
+    defer kg.deinit();
+    const m = kg.memory();
+
+    // Regression: `kg:relations:` must not drop the first byte of the entity id.
+    try m.store("__kg:entity:abc", "Alpha", .core, null);
+    try m.store("__kg:entity:def", "Delta", .core, null);
+    try m.store("__kg:rel:abc:links:def", "", .core, null);
+
+    const results = try m.recall(std.testing.allocator, "kg:relations:abc", 10, null);
+    defer root.freeEntries(std.testing.allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("__kg:rel:abc:links:def", results[0].key);
+}
+
+test "kg relations round-trip through get and forget" {
+    var kg = try KgMemory.init(std.testing.allocator, ":memory:");
+    defer kg.deinit();
+    const m = kg.memory();
+
+    // Regression: relation keys must remain retrievable and forgettable through the Memory vtable.
+    const relation_key = "__kg:rel:test1:knows:test2";
+    try m.store(relation_key, "", .core, null);
+
+    const entry = try m.get(std.testing.allocator, relation_key);
+    try std.testing.expect(entry != null);
+    defer entry.?.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(relation_key, entry.?.key);
+    try std.testing.expectEqualStrings("test1 --knows--> test2", entry.?.content);
+
+    try std.testing.expect(try m.forget(relation_key));
+    const missing = try m.get(std.testing.allocator, relation_key);
+    try std.testing.expect(missing == null);
 }
