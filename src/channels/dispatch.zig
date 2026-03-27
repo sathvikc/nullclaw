@@ -5,6 +5,7 @@ const bus = @import("../bus.zig");
 const outbound = @import("../outbound.zig");
 const Atomic = @import("../portable_atomic.zig").Atomic;
 const thread_stacks = @import("../thread_stacks.zig");
+const builtin = @import("builtin");
 
 /// Message dispatch — routes incoming ChannelMessages to the agent,
 /// routes agent responses back to the originating channel.
@@ -198,7 +199,7 @@ pub fn runOutboundDispatcher(
             registry.findByName(msg.channel);
 
         if (channel_opt) |channel| {
-            dispatchOutboundMessage(allocator, channel, msg, &draft_messages) catch {
+            dispatchOutboundMessageWithRetry(allocator, channel, msg, &draft_messages) catch {
                 _ = stats.errors.fetchAdd(1, .monotonic);
                 continue;
             };
@@ -206,6 +207,51 @@ pub fn runOutboundDispatcher(
         } else {
             _ = stats.channel_not_found.fetchAdd(1, .monotonic);
         }
+    }
+}
+
+const DeliveryFailureClass = enum {
+    transient,
+    permanent,
+};
+
+const MAX_FINAL_SEND_ATTEMPTS: usize = 3;
+const FINAL_SEND_RETRY_BACKOFF_MS = if (builtin.is_test)
+    [_]u64{ 0, 0 }
+else
+    [_]u64{ 250, 1000 };
+
+fn classifyOutboundFailure(err: anyerror) DeliveryFailureClass {
+    return switch (err) {
+        error.NotSupported,
+        error.InvalidTarget,
+        error.InvalidMessageRef,
+        => .permanent,
+        else => .transient,
+    };
+}
+
+fn shouldRetryOutboundMessage(msg: bus.OutboundMessage, err: anyerror) bool {
+    return msg.stage == .final and classifyOutboundFailure(err) == .transient;
+}
+
+fn dispatchOutboundMessageWithRetry(
+    allocator: Allocator,
+    channel: root.Channel,
+    msg: bus.OutboundMessage,
+    draft_messages: *DraftMessageMap,
+) !void {
+    var attempt: usize = 1;
+    while (true) {
+        dispatchOutboundMessage(allocator, channel, msg, draft_messages) catch |err| {
+            if (!shouldRetryOutboundMessage(msg, err) or attempt >= MAX_FINAL_SEND_ATTEMPTS) return err;
+            const backoff_idx = @min(attempt - 1, FINAL_SEND_RETRY_BACKOFF_MS.len - 1);
+            const backoff_ms = FINAL_SEND_RETRY_BACKOFF_MS[backoff_idx];
+            if (backoff_ms > 0) std.Thread.sleep(backoff_ms * std.time.ns_per_ms);
+            attempt += 1;
+            continue;
+        };
+        return;
     }
 }
 
@@ -531,6 +577,8 @@ const MockChannel = struct {
     sent_count: Atomic(u64) = Atomic(u64).init(0),
     chunk_count: Atomic(u64) = Atomic(u64).init(0),
     should_fail: bool = false,
+    fail_first_final: bool = false,
+    final_attempts: Atomic(u64) = Atomic(u64).init(0),
 
     const vtable = root.Channel.VTable{
         .start = mockStart,
@@ -550,6 +598,8 @@ const MockChannel = struct {
     fn mockSend(ctx: *anyopaque, _: []const u8, _: []const u8, _: []const []const u8) anyerror!void {
         const self: *MockChannel = @ptrCast(@alignCast(ctx));
         if (self.should_fail) return error.SendFailed;
+        const attempt = self.final_attempts.fetchAdd(1, .monotonic) + 1;
+        if (self.fail_first_final and attempt == 1) return error.SendFailed;
         _ = self.sent_count.fetchAdd(1, .monotonic);
     }
     fn mockSendEvent(
@@ -563,7 +613,11 @@ const MockChannel = struct {
         if (self.should_fail) return error.SendFailed;
         switch (stage) {
             .chunk => _ = self.chunk_count.fetchAdd(1, .monotonic),
-            .final => _ = self.sent_count.fetchAdd(1, .monotonic),
+            .final => {
+                const attempt = self.final_attempts.fetchAdd(1, .monotonic) + 1;
+                if (self.fail_first_final and attempt == 1) return error.SendFailed;
+                _ = self.sent_count.fetchAdd(1, .monotonic);
+            },
         }
     }
     fn mockName(ctx: *anyopaque) []const u8 {
@@ -1196,6 +1250,37 @@ test "dispatcher increments errors on channel.send failure" {
     try std.testing.expectEqual(@as(u64, 0), stats.getDispatched());
     try std.testing.expectEqual(@as(u64, 1), stats.getErrors());
     try std.testing.expectEqual(@as(u64, 0), stats.getChannelNotFound());
+}
+
+// Regression: transient final-send failures must not drop the reply permanently.
+test "dispatcher retries transient final send once" {
+    const allocator = std.testing.allocator;
+
+    var mock_retry = MockChannel{ .name_str = "qq", .fail_first_final = true };
+    var reg = ChannelRegistry.init(allocator);
+    defer reg.deinit();
+    try reg.register(mock_retry.channel());
+
+    var event_bus = bus.Bus.init();
+    var stats = DispatchStats{};
+
+    const msg = try bus.makeOutbound(allocator, "qq", "c1", "hello");
+    try event_bus.publishOutbound(msg);
+    event_bus.close();
+
+    runOutboundDispatcher(allocator, &event_bus, &reg, &stats);
+
+    try std.testing.expectEqual(@as(u64, 1), stats.getDispatched());
+    try std.testing.expectEqual(@as(u64, 0), stats.getErrors());
+    try std.testing.expectEqual(@as(u64, 1), mock_retry.sent_count.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 2), mock_retry.final_attempts.load(.monotonic));
+}
+
+test "dispatcher classifies permanent and transient outbound failures" {
+    try std.testing.expectEqual(DeliveryFailureClass.permanent, classifyOutboundFailure(error.InvalidTarget));
+    try std.testing.expectEqual(DeliveryFailureClass.permanent, classifyOutboundFailure(error.NotSupported));
+    try std.testing.expectEqual(DeliveryFailureClass.transient, classifyOutboundFailure(error.QQApiError));
+    try std.testing.expectEqual(DeliveryFailureClass.transient, classifyOutboundFailure(error.SendFailed));
 }
 
 test "dispatcher handles multiple messages" {
