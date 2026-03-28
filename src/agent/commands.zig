@@ -205,7 +205,14 @@ fn parsePositiveUsize(raw: []const u8) ?usize {
     return n;
 }
 
-fn interactiveModelMenuChannel(session_id: ?[]const u8) ?[]const u8 {
+fn interactiveModelMenuChannel(session_id: ?[]const u8, context_channel: ?[]const u8) ?[]const u8 {
+    if (context_channel) |channel| {
+        if (provider_names.providerNamesMatchIgnoreCase(channel, "telegram")) return "telegram";
+        if (provider_names.providerNamesMatchIgnoreCase(channel, "discord")) return "discord";
+        if (provider_names.providerNamesMatchIgnoreCase(channel, "slack")) return "slack";
+        if (provider_names.providerNamesMatchIgnoreCase(channel, "lark")) return "lark";
+    }
+
     const sid = session_id orelse return null;
 
     if (std.mem.startsWith(u8, sid, "agent:")) {
@@ -214,10 +221,14 @@ fn interactiveModelMenuChannel(session_id: ?[]const u8) ?[]const u8 {
         const routed = after_agent[agent_sep + 1 ..];
         if (std.mem.startsWith(u8, routed, "telegram:")) return "telegram";
         if (std.mem.startsWith(u8, routed, "discord:")) return "discord";
+        if (std.mem.startsWith(u8, routed, "slack:")) return "slack";
+        if (std.mem.startsWith(u8, routed, "lark:")) return "lark";
     }
 
     if (std.mem.startsWith(u8, sid, "telegram:")) return "telegram";
     if (std.mem.startsWith(u8, sid, "discord:")) return "discord";
+    if (std.mem.startsWith(u8, sid, "slack:")) return "slack";
+    if (std.mem.startsWith(u8, sid, "lark:")) return "lark";
     return null;
 }
 
@@ -231,6 +242,107 @@ fn modelMenuChoiceLabel(allocator: std.mem.Allocator, model_id: []const u8, is_c
 fn freeOwnedStringSlice(allocator: std.mem.Allocator, items: [][]const u8) void {
     for (items) |item| allocator.free(item);
     allocator.free(items);
+}
+
+fn providerMenuChoiceLabel(allocator: std.mem.Allocator, provider_name: []const u8, is_current: bool) ![]u8 {
+    const prefix = if (is_current) "* " else "";
+    const max_provider_len = interaction_choices.MAX_LABEL_LEN - prefix.len;
+    const visible_provider = if (provider_name.len <= max_provider_len) provider_name else provider_name[0..max_provider_len];
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, visible_provider });
+}
+
+fn appendUniqueOwnedString(
+    allocator: std.mem.Allocator,
+    items: *std.ArrayListUnmanaged([]const u8),
+    value: []const u8,
+) !void {
+    for (items.items) |existing| {
+        if (provider_names.providerNamesMatchIgnoreCase(existing, value)) return;
+    }
+    try items.append(allocator, try allocator.dupe(u8, value));
+}
+
+fn collectInteractiveProviderNames(self: anytype, allocator: std.mem.Allocator) ![][]const u8 {
+    var items: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer freeOwnedStringSlice(allocator, items.items);
+
+    if (@hasField(@TypeOf(self.*), "default_provider") and self.default_provider.len > 0) {
+        try appendUniqueOwnedString(allocator, &items, self.default_provider);
+    }
+    if (@hasField(@TypeOf(self.*), "configured_providers")) {
+        for (self.configured_providers) |entry| {
+            if (entry.name.len == 0) continue;
+            try appendUniqueOwnedString(allocator, &items, entry.name);
+        }
+    }
+    return try items.toOwnedSlice(allocator);
+}
+
+fn renderInteractiveProviderMenuFromProviders(
+    allocator: std.mem.Allocator,
+    current_provider: []const u8,
+    current_model: []const u8,
+    page_number: usize,
+    providers_list: []const []const u8,
+) !?[]u8 {
+    if (providers_list.len == 0) return null;
+
+    const total_pages = @max(@as(usize, 1), std.math.divCeil(usize, providers_list.len, MODEL_MENU_PAGE_SIZE) catch 1);
+    const clamped_page = @min(@max(page_number, 1), total_pages);
+    const start = (clamped_page - 1) * MODEL_MENU_PAGE_SIZE;
+    const end = @min(start + MODEL_MENU_PAGE_SIZE, providers_list.len);
+
+    const ChoiceDraft = struct {
+        id: []const u8,
+        label: []const u8,
+        submit_text: []const u8,
+    };
+
+    var options: [interaction_choices.MAX_OPTIONS]ChoiceDraft = undefined;
+    var option_id_bufs: [interaction_choices.MAX_OPTIONS][interaction_choices.MAX_ID_LEN]u8 = undefined;
+    var submit_text_bufs: [interaction_choices.MAX_OPTIONS][interaction_choices.MAX_SUBMIT_TEXT_LEN]u8 = undefined;
+    var option_count: usize = 0;
+    var labels_to_free: [interaction_choices.MAX_OPTIONS]?[]u8 = .{null} ** interaction_choices.MAX_OPTIONS;
+    defer {
+        for (labels_to_free) |label_opt| {
+            if (label_opt) |label| allocator.free(label);
+        }
+    }
+
+    for (providers_list[start..end], 0..) |provider_name, idx| {
+        const label = try providerMenuChoiceLabel(allocator, provider_name, provider_names.providerNamesMatchIgnoreCase(provider_name, current_provider));
+        labels_to_free[option_count] = label;
+        const submit_text = try std.fmt.bufPrint(&submit_text_bufs[option_count], "/model provider {s}", .{provider_name});
+        const option_id = try std.fmt.bufPrint(&option_id_bufs[option_count], "p{d}", .{idx + 1});
+        options[option_count] = .{
+            .id = option_id,
+            .label = label,
+            .submit_text = submit_text,
+        };
+        option_count += 1;
+    }
+
+    if (clamped_page > 1 and option_count < interaction_choices.MAX_OPTIONS) {
+        const submit_text = try std.fmt.bufPrint(&submit_text_bufs[option_count], "/model page {d}", .{clamped_page - 1});
+        options[option_count] = .{ .id = "prev", .label = "Prev", .submit_text = submit_text };
+        option_count += 1;
+    }
+    if (clamped_page < total_pages and option_count < interaction_choices.MAX_OPTIONS) {
+        const submit_text = try std.fmt.bufPrint(&submit_text_bufs[option_count], "/model page {d}", .{clamped_page + 1});
+        options[option_count] = .{ .id = "next", .label = "Next", .submit_text = submit_text };
+        option_count += 1;
+    }
+
+    if (option_count < interaction_choices.MIN_OPTIONS) return null;
+
+    const visible = try std.fmt.allocPrint(
+        allocator,
+        "Current model: {s}\nProvider: {s}\nChoose a provider (page {d}/{d}).",
+        .{ current_model, current_provider, clamped_page, total_pages },
+    );
+    defer allocator.free(visible);
+
+    return try interaction_choices.renderAssistantChoices(allocator, visible, options[0..option_count]);
 }
 
 fn renderInteractiveModelMenuFromModels(
@@ -279,7 +391,7 @@ fn renderInteractiveModelMenuFromModels(
     }
 
     if (clamped_page > 1) {
-        const submit_text = try std.fmt.bufPrint(&submit_text_bufs[option_count], "/model page {d}", .{clamped_page - 1});
+        const submit_text = try std.fmt.bufPrint(&submit_text_bufs[option_count], "/model provider {s} page {d}", .{ provider, clamped_page - 1 });
         options[option_count] = .{
             .id = "prev",
             .label = "Prev",
@@ -288,7 +400,7 @@ fn renderInteractiveModelMenuFromModels(
         option_count += 1;
     }
     if (clamped_page < total_pages) {
-        const submit_text = try std.fmt.bufPrint(&submit_text_bufs[option_count], "/model page {d}", .{clamped_page + 1});
+        const submit_text = try std.fmt.bufPrint(&submit_text_bufs[option_count], "/model provider {s} page {d}", .{ provider, clamped_page + 1 });
         options[option_count] = .{
             .id = "next",
             .label = "Next",
@@ -309,8 +421,39 @@ fn renderInteractiveModelMenuFromModels(
     return try interaction_choices.renderAssistantChoices(allocator, visible, options[0..option_count]);
 }
 
-fn renderInteractiveModelMenu(self: anytype, page_number: usize) !?[]u8 {
-    if (interactiveModelMenuChannel(if (@hasField(@TypeOf(self.*), "memory_session_id")) self.memory_session_id else null) == null) {
+fn renderInteractiveProviderMenu(self: anytype, page_number: usize) !?[]u8 {
+    const context_channel = if (@hasField(@TypeOf(self.*), "conversation_context"))
+        if (self.conversation_context) |ctx| ctx.channel else null
+    else
+        null;
+    if (interactiveModelMenuChannel(if (@hasField(@TypeOf(self.*), "memory_session_id")) self.memory_session_id else null, context_channel) == null) {
+        return null;
+    }
+    if (!@hasField(@TypeOf(self.*), "default_provider")) return null;
+    if (!@hasField(@TypeOf(self.*), "model_name")) return null;
+
+    const providers_list = try collectInteractiveProviderNames(self, self.allocator);
+    defer freeOwnedStringSlice(self.allocator, providers_list);
+
+    if (providers_list.len == 1) {
+        return renderInteractiveModelMenu(self, providers_list[0], page_number);
+    }
+
+    return renderInteractiveProviderMenuFromProviders(
+        self.allocator,
+        self.default_provider,
+        self.model_name,
+        page_number,
+        providers_list,
+    );
+}
+
+fn renderInteractiveModelMenu(self: anytype, provider_name: []const u8, page_number: usize) !?[]u8 {
+    const context_channel = if (@hasField(@TypeOf(self.*), "conversation_context"))
+        if (self.conversation_context) |ctx| ctx.channel else null
+    else
+        null;
+    if (interactiveModelMenuChannel(if (@hasField(@TypeOf(self.*), "memory_session_id")) self.memory_session_id else null, context_channel) == null) {
         return null;
     }
     if (!@hasField(@TypeOf(self.*), "default_provider")) return null;
@@ -319,27 +462,33 @@ fn renderInteractiveModelMenu(self: anytype, page_number: usize) !?[]u8 {
     var cfg_opt: ?config_module.Config = if (builtin.is_test) null else config_module.Config.load(self.allocator) catch null;
     defer if (cfg_opt) |*cfg| cfg.deinit();
 
-    const api_key = if (cfg_opt) |*cfg| cfg.getProviderKey(self.default_provider) else null;
-    const models = onboard.fetchModels(self.allocator, self.default_provider, api_key) catch return null;
+    const api_key = if (cfg_opt) |*cfg| cfg.getProviderKey(provider_name) else null;
+    const models = onboard.fetchModels(self.allocator, provider_name, api_key) catch return null;
     defer freeOwnedStringSlice(self.allocator, models);
 
     return renderInteractiveModelMenuFromModels(
         self.allocator,
-        self.default_provider,
+        provider_name,
         self.model_name,
         page_number,
         models,
     );
 }
 
-test "interactiveModelMenuChannel only enables telegram and discord" {
-    try std.testing.expectEqualStrings("telegram", interactiveModelMenuChannel("telegram:chat-1").?);
-    try std.testing.expectEqualStrings("telegram", interactiveModelMenuChannel("telegram:main:chat-1").?);
-    try std.testing.expectEqualStrings("discord", interactiveModelMenuChannel("discord:dm-1").?);
-    try std.testing.expectEqualStrings("telegram", interactiveModelMenuChannel("agent:main:telegram:group:42").?);
-    try std.testing.expectEqualStrings("discord", interactiveModelMenuChannel("agent:main:discord:direct:42").?);
-    try std.testing.expect(interactiveModelMenuChannel("cli") == null);
-    try std.testing.expect(interactiveModelMenuChannel(null) == null);
+test "interactiveModelMenuChannel enables supported interactive channels" {
+    try std.testing.expectEqualStrings("telegram", interactiveModelMenuChannel("telegram:chat-1", null).?);
+    try std.testing.expectEqualStrings("telegram", interactiveModelMenuChannel("telegram:main:chat-1", null).?);
+    try std.testing.expectEqualStrings("discord", interactiveModelMenuChannel("discord:dm-1", null).?);
+    try std.testing.expectEqualStrings("slack", interactiveModelMenuChannel("slack:main:C123", null).?);
+    try std.testing.expectEqualStrings("lark", interactiveModelMenuChannel("lark:main:oc_123", null).?);
+    try std.testing.expectEqualStrings("telegram", interactiveModelMenuChannel("agent:main:telegram:group:42", null).?);
+    try std.testing.expectEqualStrings("discord", interactiveModelMenuChannel("agent:main:discord:direct:42", null).?);
+    try std.testing.expectEqualStrings("telegram", interactiveModelMenuChannel("agent:tg-ops:main", "telegram").?);
+    try std.testing.expectEqualStrings("discord", interactiveModelMenuChannel("agent:discord-ops:main", "discord").?);
+    try std.testing.expectEqualStrings("slack", interactiveModelMenuChannel("agent:slack-ops:main", "slack").?);
+    try std.testing.expectEqualStrings("lark", interactiveModelMenuChannel("agent:lark-ops:main", "lark").?);
+    try std.testing.expect(interactiveModelMenuChannel("cli", null) == null);
+    try std.testing.expect(interactiveModelMenuChannel(null, null) == null);
 }
 
 test "renderInteractiveModelMenuFromModels builds first page with next button" {
@@ -364,7 +513,7 @@ test "renderInteractiveModelMenuFromModels builds first page with next button" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, interaction_choices.START_TAG) != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "page 1/2") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\"label\":\"* beta\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"submit_text\":\"/model page 2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"submit_text\":\"/model provider anthropic page 2\"") != null);
 }
 
 test "renderInteractiveModelMenuFromModels builds later page with prev button" {
@@ -387,8 +536,25 @@ test "renderInteractiveModelMenuFromModels builds later page with prev button" {
     defer allocator.free(rendered);
 
     try std.testing.expect(std.mem.indexOf(u8, rendered, "page 2/2") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"submit_text\":\"/model page 1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"submit_text\":\"/model provider anthropic page 1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\"submit_text\":\"/model nu\"") != null);
+}
+
+test "renderInteractiveProviderMenuFromProviders builds provider page with next button" {
+    const allocator = std.testing.allocator;
+    const providers_list = [_][]const u8{
+        "anthropic", "openai",   "openrouter", "moonshot-intl", "groq",
+        "mistral",   "deepseek", "vertex",     "gemini",        "ollama",
+        "qwen",
+    };
+
+    const rendered = (try renderInteractiveProviderMenuFromProviders(allocator, "openrouter", "claude-sonnet-4-6", 1, &providers_list)).?;
+    defer allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Choose a provider (page 1/2)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"label\":\"* openrouter\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"submit_text\":\"/model provider anthropic\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"submit_text\":\"/model page 2\"") != null);
 }
 
 fn isInternalMemoryEntryKeyOrContent(key: []const u8, content: []const u8) bool {
@@ -3528,16 +3694,37 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
             if (std.ascii.eqlIgnoreCase(first, "page")) {
                 const page_raw = std.mem.trim(u8, splitFirstToken(cmd.arg).tail, " \t");
                 const page_number = parsePositiveUsize(page_raw) orelse 1;
-                if (try renderInteractiveModelMenu(self, page_number)) |menu| {
+                if (try renderInteractiveProviderMenu(self, page_number)) |menu| {
                     return menu;
                 }
                 return try self.formatModelStatus();
+            }
+            if (std.ascii.eqlIgnoreCase(first, "provider")) {
+                const provider_tail = splitFirstToken(cmd.arg).tail;
+                const provider_name = firstToken(provider_tail);
+                if (provider_name.len == 0) {
+                    if (try renderInteractiveProviderMenu(self, 1)) |menu| {
+                        return menu;
+                    }
+                    return try self.formatModelStatus();
+                }
+
+                const remainder = splitFirstToken(provider_tail).tail;
+                const page_number = if (std.ascii.eqlIgnoreCase(firstToken(remainder), "page"))
+                    parsePositiveUsize(std.mem.trim(u8, splitFirstToken(remainder).tail, " \t")) orelse 1
+                else
+                    1;
+
+                if (try renderInteractiveModelMenu(self, provider_name, page_number)) |menu| {
+                    return menu;
+                }
+                return try std.fmt.allocPrint(self.allocator, "No models available for provider: {s}", .{provider_name});
             }
             if (cmd.arg.len == 0 or
                 std.ascii.eqlIgnoreCase(cmd.arg, "list") or
                 std.ascii.eqlIgnoreCase(cmd.arg, "status"))
             {
-                if (try renderInteractiveModelMenu(self, 1)) |menu| {
+                if (try renderInteractiveProviderMenu(self, 1)) |menu| {
                     return menu;
                 }
                 return try self.formatModelStatus();
@@ -3565,6 +3752,9 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
                     "Automatic model routing enabled. Reverted to the configured default model: {s}",
                     .{self.model_name},
                 );
+            }
+            if (splitPrimaryModelRef(cmd.arg)) |parsed| {
+                try setDefaultProvider(self, parsed.provider);
             }
             try setModelName(self, cmd.arg);
             if (@hasField(@TypeOf(self.*), "model_pinned_by_user")) {

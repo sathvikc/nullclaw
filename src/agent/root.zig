@@ -5116,6 +5116,7 @@ test "slash /model with telegram bot mention switches model" {
     try std.testing.expect(std.mem.indexOf(u8, response, "qianfan/custom-model") != null);
     try std.testing.expectEqualStrings("qianfan/custom-model", agent.model_name);
     try std.testing.expectEqualStrings("qianfan/custom-model", agent.default_model);
+    try std.testing.expectEqualStrings("qianfan", agent.default_provider);
     try std.testing.expectEqual(@as(u32, 32_768), agent.max_tokens);
 }
 
@@ -5130,6 +5131,7 @@ test "slash /model resolves provider max_tokens fallback" {
 
     try std.testing.expect(std.mem.indexOf(u8, response, "qianfan/custom-model") != null);
     try std.testing.expectEqualStrings("qianfan/custom-model", agent.model_name);
+    try std.testing.expectEqualStrings("qianfan", agent.default_provider);
     try std.testing.expectEqual(@as(u32, 32_768), agent.max_tokens);
 }
 
@@ -5460,6 +5462,94 @@ test "slash /model without name shows current" {
     defer allocator.free(response);
 
     try std.testing.expect(std.mem.indexOf(u8, response, "test-model") != null);
+}
+
+test "slash /model renders interactive choices for telegram sessions" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    const configured_providers = [_]config_types.ProviderEntry{
+        .{ .name = "anthropic" },
+        .{ .name = "openai" },
+    };
+    agent.memory_session_id = "telegram:chat123";
+    agent.default_provider = "anthropic";
+    agent.model_name = "claude-opus-4-6";
+    agent.default_model = "claude-opus-4-6";
+    agent.configured_providers = &configured_providers;
+
+    const response = (try agent.handleSlashCommand("/model")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "<nc_choices>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Choose a provider") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/model provider anthropic") != null);
+}
+
+test "slash /model provider renders interactive model choices for selected provider" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    const configured_providers = [_]config_types.ProviderEntry{
+        .{ .name = "anthropic" },
+        .{ .name = "openai" },
+    };
+    agent.memory_session_id = "telegram:chat123";
+    agent.default_provider = "anthropic";
+    agent.model_name = "claude-opus-4-6";
+    agent.default_model = "claude-opus-4-6";
+    agent.configured_providers = &configured_providers;
+
+    const response = (try agent.handleSlashCommand("/model provider anthropic")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "<nc_choices>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Choose a model") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/model claude-sonnet-4-6") != null);
+}
+
+test "slash /model with a single configured provider renders models directly" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    const configured_providers = [_]config_types.ProviderEntry{
+        .{ .name = "anthropic" },
+    };
+    agent.memory_session_id = "telegram:chat123";
+    agent.default_provider = "anthropic";
+    agent.model_name = "claude-opus-4-6";
+    agent.default_model = "claude-opus-4-6";
+    agent.configured_providers = &configured_providers;
+
+    const response = (try agent.handleSlashCommand("/model")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "<nc_choices>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Choose a model") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/model claude-sonnet-4-6") != null);
+}
+
+test "slash /model renders interactive choices for routed slack sessions" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    const configured_providers = [_]config_types.ProviderEntry{
+        .{ .name = "anthropic" },
+        .{ .name = "openai" },
+    };
+    agent.memory_session_id = "agent:slack-ops:main";
+    agent.conversation_context = .{ .channel = "slack" };
+    agent.default_provider = "anthropic";
+    agent.model_name = "claude-opus-4-6";
+    agent.default_model = "claude-opus-4-6";
+    agent.configured_providers = &configured_providers;
+
+    const response = (try agent.handleSlashCommand("/model")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "<nc_choices>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Choose a provider") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/model provider anthropic") != null);
 }
 
 test "slash /models aliases to /model" {
