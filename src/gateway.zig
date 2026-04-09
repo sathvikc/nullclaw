@@ -1378,6 +1378,19 @@ fn verifySlackSignature(
     return constantTimeEql(&mac, &provided);
 }
 
+const SIGNED_WEBHOOK_MAX_SKEW_SECS: i64 = 300;
+
+fn isFreshSignedWebhookTimestampAt(timestamp_value: []const u8, now: i64, max_skew_secs: i64) bool {
+    const ts_trimmed = std.mem.trim(u8, timestamp_value, " \t\r\n");
+    const ts = std.fmt.parseInt(i64, ts_trimmed, 10) catch return false;
+    const delta = if (now >= ts) now - ts else ts - now;
+    return delta <= max_skew_secs;
+}
+
+fn isFreshSignedWebhookTimestamp(timestamp_value: []const u8) bool {
+    return isFreshSignedWebhookTimestampAt(timestamp_value, std.time.timestamp(), SIGNED_WEBHOOK_MAX_SKEW_SECS);
+}
+
 fn findSlackConfigForRequest(
     allocator: std.mem.Allocator,
     cfg_opt: ?*const Config,
@@ -4029,6 +4042,11 @@ fn handleWeChatWebhookRoute(ctx: *WebhookHandlerContext) void {
                 ctx.response_body = "{\"error\":\"missing nonce\"}";
                 return;
             };
+            if (!isFreshSignedWebhookTimestamp(timestamp)) {
+                ctx.response_status = "403 Forbidden";
+                ctx.response_body = "{\"error\":\"stale timestamp\"}";
+                return;
+            }
 
             if (secure_enabled) {
                 const msg_signature = parseQueryParam(ctx.target, "msg_signature") orelse {
@@ -4111,6 +4129,11 @@ fn handleWeChatWebhookRoute(ctx: *WebhookHandlerContext) void {
             ctx.response_body = "{\"error\":\"missing nonce\"}";
             return;
         };
+        if (!isFreshSignedWebhookTimestamp(timestamp)) {
+            ctx.response_status = "403 Forbidden";
+            ctx.response_body = "{\"error\":\"stale timestamp\"}";
+            return;
+        }
 
         if (!channels.wechat.verifyMessageSignature(callback_token, timestamp, nonce, encrypted, msg_signature)) {
             ctx.response_status = "403 Forbidden";
@@ -4146,6 +4169,11 @@ fn handleWeChatWebhookRoute(ctx: *WebhookHandlerContext) void {
                 ctx.response_body = "{\"error\":\"missing nonce\"}";
                 return;
             };
+            if (!isFreshSignedWebhookTimestamp(timestamp)) {
+                ctx.response_status = "403 Forbidden";
+                ctx.response_body = "{\"error\":\"stale timestamp\"}";
+                return;
+            }
             if (!channels.wechat.verifySignature(callback_token, timestamp, nonce, signature)) {
                 ctx.response_status = "403 Forbidden";
                 ctx.response_body = "{\"error\":\"invalid signature\"}";
@@ -4271,6 +4299,11 @@ fn handleWeComWebhookRoute(ctx: *WebhookHandlerContext) void {
                 ctx.response_body = "{\"error\":\"missing nonce\"}";
                 return;
             };
+            if (!isFreshSignedWebhookTimestamp(timestamp)) {
+                ctx.response_status = "403 Forbidden";
+                ctx.response_body = "{\"error\":\"stale timestamp\"}";
+                return;
+            }
 
             if (!channels.wecom.verifySignature(secure_token, timestamp, nonce, echo_str, msg_sig)) {
                 ctx.response_status = "403 Forbidden";
@@ -4333,6 +4366,11 @@ fn handleWeComWebhookRoute(ctx: *WebhookHandlerContext) void {
             ctx.response_body = "{\"error\":\"missing nonce\"}";
             return;
         };
+        if (!isFreshSignedWebhookTimestamp(timestamp)) {
+            ctx.response_status = "403 Forbidden";
+            ctx.response_body = "{\"error\":\"stale timestamp\"}";
+            return;
+        }
 
         if (!channels.wecom.verifySignature(secure_token, timestamp, nonce, encrypted, msg_sig)) {
             ctx.response_status = "403 Forbidden";
@@ -7163,6 +7201,14 @@ fn testEncodeWeChatSecurePayload(
     return encoded;
 }
 
+test "signed webhook timestamp freshness accepts bounded skew and rejects stale values" {
+    const now: i64 = 1_710_000_000;
+    try std.testing.expect(isFreshSignedWebhookTimestampAt("1710000000", now, SIGNED_WEBHOOK_MAX_SKEW_SECS));
+    try std.testing.expect(isFreshSignedWebhookTimestampAt("1709999700", now, SIGNED_WEBHOOK_MAX_SKEW_SECS));
+    try std.testing.expect(!isFreshSignedWebhookTimestampAt("1709999699", now, SIGNED_WEBHOOK_MAX_SKEW_SECS));
+    try std.testing.expect(!isFreshSignedWebhookTimestampAt("not-a-timestamp", now, SIGNED_WEBHOOK_MAX_SKEW_SECS));
+}
+
 test "handleWeChatWebhookRoute accepts secure encrypted callback" {
     if (!build_options.enable_channel_wechat) return;
 
@@ -7173,16 +7219,21 @@ test "handleWeChatWebhookRoute accepts secure encrypted callback" {
     var key_b64: [44]u8 = undefined;
     _ = std.base64.standard.Encoder.encode(&key_b64, &raw_key);
     const encoding_aes_key = key_b64[0..43];
-    const timestamp = "1710000000";
+    var timestamp_buf: [32]u8 = undefined;
+    const timestamp = try std.fmt.bufPrint(&timestamp_buf, "{d}", .{std.time.timestamp()});
     const nonce = "123456";
-    const plain_xml =
+    const plain_xml = try std.fmt.allocPrint(
+        std.testing.allocator,
         "<xml>" ++
-        "<ToUserName><![CDATA[gh_abcdef]]></ToUserName>" ++
-        "<FromUserName><![CDATA[o_user123]]></FromUserName>" ++
-        "<CreateTime>1710000000</CreateTime>" ++
-        "<MsgType><![CDATA[text]]></MsgType>" ++
-        "<Content><![CDATA[hello secure]]></Content>" ++
-        "</xml>";
+            "<ToUserName><![CDATA[gh_abcdef]]></ToUserName>" ++
+            "<FromUserName><![CDATA[o_user123]]></FromUserName>" ++
+            "<CreateTime>{s}</CreateTime>" ++
+            "<MsgType><![CDATA[text]]></MsgType>" ++
+            "<Content><![CDATA[hello secure]]></Content>" ++
+            "</xml>",
+        .{timestamp},
+    );
+    defer std.testing.allocator.free(plain_xml);
 
     const encrypted = try testEncodeWeChatSecurePayload(std.testing.allocator, encoding_aes_key, app_id, plain_xml);
     defer std.testing.allocator.free(encrypted);
@@ -7242,6 +7293,129 @@ test "handleWeChatWebhookRoute accepts secure encrypted callback" {
     try std.testing.expectEqualStrings("200 OK", ctx.response_status);
     try std.testing.expectEqualStrings(CONTENT_TYPE_TEXT, ctx.response_content_type);
     try std.testing.expectEqualStrings("success", ctx.response_body);
+}
+
+test "handleWeChatWebhookRoute rejects stale signed callbacks" {
+    if (!build_options.enable_channel_wechat) return;
+
+    const token = "wechat-token";
+    const now = std.time.timestamp();
+    var timestamp_buf: [32]u8 = undefined;
+    const timestamp = try std.fmt.bufPrint(&timestamp_buf, "{d}", .{now - SIGNED_WEBHOOK_MAX_SKEW_SECS - 1});
+    const nonce = "123456";
+    const signature = tencent_crypto.wechatSha1Signature(token, timestamp, nonce);
+    const target = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "/wechat?timestamp={s}&nonce={s}&signature={s}&echostr=ok",
+        .{ timestamp, nonce, signature },
+    );
+    defer std.testing.allocator.free(target);
+
+    const raw_request = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "GET {s} HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        .{target},
+    );
+    defer std.testing.allocator.free(raw_request);
+
+    const wechat_accounts = [_]config_types.WeChatConfig{
+        .{
+            .account_id = "main",
+            .callback_token = token,
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{ .wechat = &wechat_accounts },
+    };
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = std.testing.allocator,
+        .req_allocator = std.testing.allocator,
+        .raw_request = raw_request,
+        .method = "GET",
+        .target = target,
+        .config_opt = &cfg,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+
+    handleWeChatWebhookRoute(&ctx);
+    try std.testing.expectEqualStrings("403 Forbidden", ctx.response_status);
+    try std.testing.expectEqualStrings("{\"error\":\"stale timestamp\"}", ctx.response_body);
+}
+
+test "handleWeComWebhookRoute rejects stale signed callbacks" {
+    if (!build_options.enable_channel_wecom) return;
+
+    const token = "wecom-token";
+    const corp_id = "wxcorp123";
+    var raw_key: [32]u8 = undefined;
+    for (&raw_key, 0..) |*b, idx| b.* = @as(u8, @intCast(idx));
+    var key_b64: [44]u8 = undefined;
+    _ = std.base64.standard.Encoder.encode(&key_b64, &raw_key);
+    const encoding_aes_key = key_b64[0..43];
+
+    const now = std.time.timestamp();
+    var timestamp_buf: [32]u8 = undefined;
+    const timestamp = try std.fmt.bufPrint(&timestamp_buf, "{d}", .{now - SIGNED_WEBHOOK_MAX_SKEW_SECS - 1});
+    const nonce = "654321";
+    const echo_str = try testEncodeWeChatSecurePayload(std.testing.allocator, encoding_aes_key, corp_id, "echo-ok");
+    defer std.testing.allocator.free(echo_str);
+    const msg_sig = tencent_crypto.wechatMessageSha1Signature(token, timestamp, nonce, echo_str);
+
+    const target = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "/wecom?timestamp={s}&nonce={s}&msg_signature={s}&echostr={s}",
+        .{ timestamp, nonce, msg_sig, echo_str },
+    );
+    defer std.testing.allocator.free(target);
+
+    const raw_request = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "GET {s} HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        .{target},
+    );
+    defer std.testing.allocator.free(raw_request);
+
+    const wecom_accounts = [_]config_types.WeComConfig{
+        .{
+            .account_id = "main",
+            .webhook_url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=main",
+            .callback_token = token,
+            .encoding_aes_key = encoding_aes_key,
+            .corp_id = corp_id,
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{ .wecom = &wecom_accounts },
+    };
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = std.testing.allocator,
+        .req_allocator = std.testing.allocator,
+        .raw_request = raw_request,
+        .method = "GET",
+        .target = target,
+        .config_opt = &cfg,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+
+    handleWeComWebhookRoute(&ctx);
+    try std.testing.expectEqualStrings("403 Forbidden", ctx.response_status);
+    try std.testing.expectEqualStrings("{\"error\":\"stale timestamp\"}", ctx.response_body);
 }
 
 test "whatsappSessionKey builds direct key by sender" {
