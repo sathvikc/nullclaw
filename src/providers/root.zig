@@ -67,6 +67,7 @@ pub const extractContent = helpers.extractContent;
 pub const SplitThinkContent = helpers.SplitThinkContent;
 pub const splitThinkContent = helpers.splitThinkContent;
 pub const stripThinkBlocks = helpers.stripThinkBlocks;
+pub const extractReasoningTextFromDetails = helpers.extractReasoningTextFromDetails;
 pub const normalizeOpenAiReasoningEffort = helpers.normalizeOpenAiReasoningEffort;
 
 // Direct re-exports from utility modules
@@ -251,6 +252,7 @@ pub const StreamCallback = *const fn (ctx: *anyopaque, chunk: StreamChunk) void;
 /// Result of a streaming chat call (accumulated after stream completes).
 pub const StreamChatResult = struct {
     content: ?[]const u8 = null,
+    reasoning_content: ?[]const u8 = null,
     usage: TokenUsage = .{},
     model: []const u8 = "",
 };
@@ -281,6 +283,8 @@ pub fn emitChatResponseAsStream(
     callback: StreamCallback,
     callback_ctx: *anyopaque,
 ) StreamChatResult {
+    const reasoning_content = response.reasoning_content;
+    response.reasoning_content = null;
     if (response.content) |content| {
         if (content.len > 0) {
             callback(callback_ctx, StreamChunk.textDelta(content));
@@ -290,6 +294,7 @@ pub fn emitChatResponseAsStream(
     freeStreamUnusedChatResponseFields(allocator, response);
     return .{
         .content = response.content,
+        .reasoning_content = reasoning_content,
         .usage = response.usage,
         .model = response.model,
     };
@@ -317,6 +322,8 @@ pub const ChatRequest = struct {
     timeout_secs: u64 = 0,
     /// Reasoning effort for reasoning models (o1, o3, gpt-5*). null = don't send.
     reasoning_effort: ?[]const u8 = null,
+    /// Provider hint for surfacing reasoning traces when supported.
+    include_reasoning: ?bool = null,
 };
 
 /// A single tool result message in a conversation.
@@ -847,6 +854,7 @@ test "emitChatResponseAsStream frees unused chat response fields" {
     var ctx = CallbackCtx{};
     const result = emitChatResponseAsStream(allocator, &response, CallbackCtx.onChunk, @ptrCast(&ctx));
     defer if (result.content) |content| allocator.free(content);
+    defer if (result.reasoning_content) |reasoning| allocator.free(reasoning);
     defer if (result.model.len > 0) allocator.free(result.model);
 
     try std.testing.expectEqual(@as(usize, 1), ctx.text_count);
@@ -855,6 +863,7 @@ test "emitChatResponseAsStream frees unused chat response fields" {
     try std.testing.expectEqualStrings("", response.provider);
     try std.testing.expect(response.reasoning_content == null);
     try std.testing.expectEqualStrings("hello", result.content.?);
+    try std.testing.expectEqualStrings("private reasoning", result.reasoning_content.?);
     try std.testing.expectEqualStrings("test-model", result.model);
 }
 

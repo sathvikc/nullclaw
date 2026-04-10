@@ -91,6 +91,50 @@ pub fn stripThinkBlocks(allocator: std.mem.Allocator, text: []const u8) ![]const
     return allocator.dupe(u8, trimmed);
 }
 
+fn appendReasoningDetailText(
+    out: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    detail: std.json.Value,
+) !void {
+    if (detail != .object) return;
+    const obj = detail.object;
+
+    if (obj.get("type")) |type_val| {
+        if (type_val == .string and std.mem.eql(u8, type_val.string, "reasoning.encrypted")) return;
+    }
+
+    const text = blk: {
+        if (obj.get("text")) |value| {
+            if (value == .string and value.string.len > 0) break :blk value.string;
+        }
+        if (obj.get("summary")) |value| {
+            if (value == .string and value.string.len > 0) break :blk value.string;
+        }
+        break :blk null;
+    } orelse return;
+
+    if (out.items.len > 0) try out.append(allocator, '\n');
+    try out.appendSlice(allocator, text);
+}
+
+/// Extract plain-text reasoning from OpenRouter/OpenAI-style `reasoning_details`.
+/// Encrypted detail variants are intentionally ignored.
+pub fn extractReasoningTextFromDetails(allocator: std.mem.Allocator, details: std.json.Value) !?[]const u8 {
+    if (details != .array) return null;
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+
+    for (details.array.items) |detail| {
+        try appendReasoningDetailText(&out, allocator, detail);
+    }
+
+    const trimmed = std.mem.trim(u8, out.items, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    const owned = try allocator.dupe(u8, trimmed);
+    return owned;
+}
+
 /// Extract api_key from a config-like struct (supports both Config.defaultProviderKey() and plain .api_key field).
 fn resolveApiKeyFromCfg(cfg: anytype) ?[]const u8 {
     const T = @TypeOf(cfg);

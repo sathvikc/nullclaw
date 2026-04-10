@@ -2905,19 +2905,9 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         std.debug.print("\n", .{});
     }
 
-    var tg = yc.channels.telegram.TelegramChannel.init(allocator, telegram_config.bot_token, allowed, telegram_config.group_allow_from, telegram_config.group_policy);
-    tg.proxy = telegram_config.proxy;
-    tg.account_id = telegram_config.account_id;
-    tg.reply_in_private = telegram_config.reply_in_private;
-    tg.interactive = telegram_config.interactive;
-    tg.require_mention = telegram_config.require_mention;
-    tg.streaming_enabled = telegram_config.streaming;
-    tg.status_reactions_enabled = telegram_config.status_reactions;
-    tg.reaction_emojis = telegram_config.reaction_emojis;
-    tg.binding_commands_enabled = telegram_config.binding_commands_enabled;
-    tg.topic_commands_enabled = telegram_config.topic_commands_enabled;
-    tg.topic_map_command_enabled = telegram_config.topic_map_command_enabled;
-    tg.commands_menu_mode = telegram_config.commands_menu_mode;
+    var runtime_telegram_config = telegram_config;
+    runtime_telegram_config.allow_from = allowed;
+    var tg = yc.channels.telegram.TelegramChannel.initFromConfig(allocator, runtime_telegram_config);
     tg.text_debounce_secs = yc.channels.telegram.TelegramChannel.textDebounceSecsFromMs(
         config.messages.inbound.debounce_ms,
     );

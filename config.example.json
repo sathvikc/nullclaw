@@ -36,7 +36,8 @@
       "accounts": {
         "main": {
           "bot_token": "YOUR_TELEGRAM_BOT_TOKEN",
-          "allow_from": ["YOUR_TELEGRAM_USER_ID"]
+          "allow_from": ["YOUR_TELEGRAM_USER_ID"],
+          "draft_previews": false
         }
       }
     },

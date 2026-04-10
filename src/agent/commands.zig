@@ -213,7 +213,6 @@ fn interactiveModelMenuChannel(session_id: ?[]const u8, context_channel: ?[]cons
         if (provider_names.providerNamesMatchIgnoreCase(channel, "slack")) return "slack";
         if (provider_names.providerNamesMatchIgnoreCase(channel, "lark")) return "lark";
     }
-
     const sid = session_id orelse return null;
 
     if (std.mem.startsWith(u8, sid, "agent:")) {
@@ -345,7 +344,6 @@ fn renderInteractiveProviderMenuFromProviders(
 
     return try interaction_choices.renderAssistantChoices(allocator, visible, options[0..option_count]);
 }
-
 fn renderInteractiveModelMenuFromModels(
     allocator: std.mem.Allocator,
     provider: []const u8,
@@ -557,7 +555,6 @@ test "renderInteractiveProviderMenuFromProviders builds provider page with next 
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\"submit_text\":\"/model provider anthropic\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\"submit_text\":\"/model page 2\"") != null);
 }
-
 fn isInternalMemoryEntryKeyOrContent(key: []const u8, content: []const u8) bool {
     return memory_mod.isInternalMemoryEntryKeyOrContent(key, content);
 }
@@ -4083,7 +4080,12 @@ pub fn composeFinalReply(
 
     if (show_reasoning) {
         try w.writeAll("Reasoning:\n");
-        try w.writeAll(reasoning_content.?);
+        var lines = std.mem.splitScalar(u8, reasoning_content.?, '\n');
+        while (lines.next()) |line| {
+            try w.writeAll("> ");
+            try w.writeAll(line);
+            try w.writeAll("\n");
+        }
         try w.writeAll("\n\n");
     }
     try w.writeAll(base_text);

@@ -134,6 +134,45 @@ fn loadConfigForFromJson(allocator: std.mem.Allocator, custom_home: ?[]const u8)
     return Config.load(allocator) catch try onboard.initFreshConfig(allocator);
 }
 
+fn providerBaseUrlForKey(cfg: *const Config, provider_key: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, provider_key, "custom:")) {
+        return provider_key["custom:".len..];
+    }
+    return cfg.getProviderBaseUrl(provider_key);
+}
+
+fn applyLegacyProviderAnswers(cfg: *Config, answers: WizardAnswers) !void {
+    var provider_overridden = false;
+
+    if (answers.provider) |p| {
+        const provider_info = onboard.resolveProviderForQuickSetup(p) orelse return error.UnknownProvider;
+        cfg.default_provider = try cfg.allocator.dupe(u8, provider_info.key);
+        provider_overridden = true;
+
+        if (answers.api_key) |key| {
+            try onboard.appendOrReplaceProviderEntry(
+                cfg,
+                provider_info.key,
+                key,
+                providerBaseUrlForKey(cfg, provider_info.key),
+            );
+        }
+    } else if (answers.api_key) |key| {
+        try onboard.appendOrReplaceProviderEntry(
+            cfg,
+            cfg.default_provider,
+            key,
+            providerBaseUrlForKey(cfg, cfg.default_provider),
+        );
+    }
+
+    if (answers.model) |m| {
+        cfg.default_model = try cfg.allocator.dupe(u8, m);
+    } else if (provider_overridden) {
+        cfg.default_model = try cfg.allocator.dupe(u8, onboard.defaultModelForProvider(cfg.default_provider));
+    }
+}
+
 /// Apply providers from the wizard's providers array (new multi-provider format).
 /// Sets default_provider and default_model from the first entry, and creates
 /// ProviderEntry array from all entries.
@@ -183,6 +222,10 @@ fn applyProvidersFromArray(cfg: *Config, items: []const std.json.Value) !void {
         try entries_list.append(cfg.allocator, .{
             .name = try cfg.allocator.dupe(u8, resolved.key),
             .api_key = if (api_key) |k| try cfg.allocator.dupe(u8, k) else null,
+            .base_url = if (std.mem.startsWith(u8, resolved.key, "custom:"))
+                try cfg.allocator.dupe(u8, resolved.key["custom:".len..])
+            else
+                null,
         });
     }
 
@@ -461,37 +504,14 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         const prov_arr = raw_parsed.?.value.object.get("providers").?.array;
         try applyProvidersFromArray(&cfg, prov_arr.items);
     } else {
-        // Legacy flat provider/api_key/model fields
-        if (answers.provider) |p| {
-            const provider_info = onboard.resolveProviderForQuickSetup(p) orelse {
-                std.debug.print("error: unknown provider '{s}'\n", .{p});
+        applyLegacyProviderAnswers(&cfg, answers) catch |err| switch (err) {
+            error.UnknownProvider => {
+                const provider = answers.provider orelse "unknown";
+                std.debug.print("error: unknown provider '{s}'\n", .{provider});
                 std.process.exit(1);
-            };
-            cfg.default_provider = try cfg.allocator.dupe(u8, provider_info.key);
-
-            if (answers.api_key) |key| {
-                const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
-                entries[0] = .{
-                    .name = try cfg.allocator.dupe(u8, provider_info.key),
-                    .api_key = try cfg.allocator.dupe(u8, key),
-                };
-                cfg.providers = entries;
-            }
-        } else if (answers.api_key) |key| {
-            const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
-            entries[0] = .{
-                .name = try cfg.allocator.dupe(u8, cfg.default_provider),
-                .api_key = try cfg.allocator.dupe(u8, key),
-            };
-            cfg.providers = entries;
-        }
-
-        // Apply model (explicit or derive from provider)
-        if (answers.model) |m| {
-            cfg.default_model = try cfg.allocator.dupe(u8, m);
-        } else if (answers.provider != null) {
-            cfg.default_model = try cfg.allocator.dupe(u8, onboard.defaultModelForProvider(cfg.default_provider));
-        }
+            },
+            else => return err,
+        };
     }
 
     // Apply memory backend
@@ -739,4 +759,70 @@ test "applyProvidersFromArray sets model default from primary provider when omit
     try std.testing.expect(cfg.default_model != null);
     try std.testing.expectEqualStrings(onboard.defaultModelForProvider("groq"), cfg.default_model.?);
     try std.testing.expectEqual(@as(usize, 2), cfg.providers.len);
+}
+
+test "applyProvidersFromArray keeps custom provider base_url for runtime wiring" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+    };
+
+    const payload =
+        \\{
+        \\  "providers": [
+        \\    { "provider": "custom:https://chat.example.com/v1", "api_key": "sk-test" }
+        \\  ]
+        \\}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    const providers = parsed.value.object.get("providers").?.array.items;
+    try applyProvidersFromArray(&cfg, providers);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.providers.len);
+    try std.testing.expectEqualStrings("custom:https://chat.example.com/v1", cfg.default_provider);
+    try std.testing.expectEqualStrings("https://chat.example.com/v1", cfg.providers[0].base_url.?);
+}
+
+test "applyLegacyProviderAnswers preserves existing providers when updating flat provider fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .default_provider = "openrouter",
+        .default_model = "anthropic/claude-sonnet-4.6",
+        .providers = &.{
+            .{
+                .name = "openrouter",
+                .api_key = "sk-or-existing",
+            },
+            .{
+                .name = "google-vertex",
+                .api_key = "vertex-old",
+                .base_url = "https://vertex.example/v1",
+            },
+        },
+    };
+
+    try applyLegacyProviderAnswers(&cfg, .{
+        .provider = "vertex",
+        .api_key = "vertex-new",
+    });
+
+    try std.testing.expectEqualStrings("vertex", cfg.default_provider);
+    try std.testing.expectEqualStrings(onboard.defaultModelForProvider("vertex"), cfg.default_model.?);
+    try std.testing.expectEqual(@as(usize, 2), cfg.providers.len);
+    try std.testing.expectEqualStrings("sk-or-existing", cfg.getProviderKey("openrouter").?);
+    try std.testing.expectEqualStrings("vertex-new", cfg.getProviderKey("google-vertex").?);
+    try std.testing.expectEqualStrings("https://vertex.example/v1", cfg.getProviderBaseUrl("vertex").?);
 }

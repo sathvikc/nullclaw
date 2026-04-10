@@ -153,6 +153,7 @@ pub fn shouldDebounceTextMessageWithBase(
 ) bool {
     if (base_debounce_secs == 0) return false;
     if (!hasMessageId(msg)) return false;
+    if (msg.is_interaction) return false;
     if (isSlashCommandMessage(msg.content)) return false;
     if (isLikelySplitTextChunk(msg)) return true;
 
@@ -550,6 +551,21 @@ test "telegram ingress shouldDebounceTextMessage does not debounce stale pending
     try received_at.append(alloc, now - (TEXT_MESSAGE_DEBOUNCE_SECS + 5));
 
     try std.testing.expect(!shouldDebounceTextMessage(now, pending_messages.items, received_at.items, short_msg));
+}
+
+test "telegram ingress shouldDebounceTextMessage skips interaction messages" {
+    const now = root.nowEpochSecs();
+    const interaction_msg = root.ChannelMessage{
+        .id = "user-a",
+        .sender = "chat-a",
+        .content = "Yes, please",
+        .channel = "telegram",
+        .timestamp = now,
+        .message_id = 77,
+        .is_interaction = true,
+    };
+
+    try std.testing.expect(!shouldDebounceTextMessage(now, &.{}, &.{}, interaction_msg));
 }
 
 test "telegram ingress shouldDebounceTextMessage catches real-world ~3.4k split chunk" {

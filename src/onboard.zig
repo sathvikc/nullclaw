@@ -423,7 +423,6 @@ const claude_cli_fallback = [_][]const u8{
     "claude-opus-4-6",
 };
 
-const MAX_MODELS = 20;
 const MODELS_DEV_URL = "https://models.dev/api.json";
 
 const ModelsDevProvider = struct {
@@ -506,7 +505,6 @@ pub fn fetchModels(allocator: std.mem.Allocator, provider: []const u8, api_key: 
 /// Native list endpoints are preferred when available. For providers without a
 /// native listing API, or when setup lacks credentials, production builds fall
 /// back to the public models.dev catalog before using hardcoded defaults.
-/// Results are limited to MAX_MODELS entries.
 pub fn fetchModelsFromApi(allocator: std.mem.Allocator, provider: []const u8, api_key: ?[]const u8) ![][]const u8 {
     const canonical = canonicalProviderName(provider);
 
@@ -620,7 +618,7 @@ fn fetchModelsFromModelsDev(allocator: std.mem.Allocator, provider: []const u8) 
 fn parseModelsDevModelIds(
     allocator: std.mem.Allocator,
     json_response: []const u8,
-    provider: []const u8,
+    _: []const u8,
     provider_key: []const u8,
 ) ![][]const u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_response, .{}) catch return error.FetchFailed;
@@ -641,13 +639,12 @@ fn parseModelsDevModelIds(
 
     var it = models_val.object.iterator();
     while (it.next()) |entry| {
-        if (result.items.len >= MAX_MODELS) break;
         if (!modelsDevModelSupportsChat(entry.key_ptr.*, entry.value_ptr.*)) continue;
         try result.append(allocator, try allocator.dupe(u8, entry.key_ptr.*));
     }
 
     if (result.items.len == 0) return error.FetchFailed;
-    prioritizeDefaultModel(result.items, defaultModelForProvider(provider));
+    sortModelIds(result.items);
     return result.toOwnedSlice(allocator);
 }
 
@@ -678,17 +675,6 @@ fn jsonStringArrayContains(value: std.json.Value, needle: []const u8) bool {
     return false;
 }
 
-fn prioritizeDefaultModel(models: [][]const u8, default_model: []const u8) void {
-    for (models, 0..) |model, idx| {
-        if (!std.mem.eql(u8, model, default_model)) continue;
-        if (idx == 0) return;
-        const tmp = models[0];
-        models[0] = model;
-        models[idx] = tmp;
-        return;
-    }
-}
-
 fn fetchAndParseModels(allocator: std.mem.Allocator, url: []const u8, headers: []const []const u8, prefix_filter: ?[]const u8) ![][]const u8 {
     const response = http_util.curlGet(allocator, url, headers, "10") catch return error.FetchFailed;
     defer allocator.free(response);
@@ -711,7 +697,6 @@ fn fetchAndParseModels(allocator: std.mem.Allocator, url: []const u8, headers: [
     }
 
     for (data.array.items) |item| {
-        if (result.items.len >= MAX_MODELS) break;
         if (item != .object) continue;
         const id_val = item.object.get("id") orelse continue;
         if (id_val != .string) continue;
@@ -723,6 +708,7 @@ fn fetchAndParseModels(allocator: std.mem.Allocator, url: []const u8, headers: [
     }
 
     if (result.items.len == 0) return error.FetchFailed;
+    sortModelIds(result.items);
     return result.toOwnedSlice(allocator);
 }
 
@@ -817,6 +803,7 @@ fn readCachedModels(allocator: std.mem.Allocator, cache_path: []const u8, provid
     }
 
     if (result.items.len == 0) return error.CacheEmpty;
+    sortModelIds(result.items);
     return result.toOwnedSlice(allocator);
 }
 
@@ -872,6 +859,7 @@ pub fn parseModelIds(allocator: std.mem.Allocator, json_response: []const u8) ![
         try result.append(allocator, try allocator.dupe(u8, id_val.string));
     }
 
+    sortModelIds(result.items);
     return result.toOwnedSlice(allocator);
 }
 
@@ -923,14 +911,8 @@ pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provide
         }
     }
     if (api_key) |key| {
-        // Store in providers section for the default provider (arena frees old values)
-        const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
-        entries[0] = .{
-            .name = try cfg.allocator.dupe(u8, cfg.default_provider),
-            .api_key = try cfg.allocator.dupe(u8, key),
-            .base_url = custom_base_url,
-        };
-        cfg.providers = entries;
+        const provider_base_url = if (custom_base_url) |configured| configured else cfg.getProviderBaseUrl(cfg.default_provider);
+        try appendOrReplaceProviderEntry(&cfg, cfg.default_provider, key, provider_base_url);
     }
     if (memory_backend) |mb| {
         const desc = try resolveMemoryBackendForQuickSetup(mb);
@@ -1113,6 +1095,149 @@ fn promptChoice(out: *std.Io.Writer, buf: []u8, max: usize, default_idx: usize) 
     const num = std.fmt.parseInt(usize, line, 10) catch return default_idx;
     if (num < 1 or num > max) return default_idx;
     return num - 1;
+}
+
+const MODEL_PAGE_SIZE: usize = 15;
+
+const ModelWizardInput = union(enum) {
+    use_default,
+    page_next,
+    page_prev,
+    page_index: usize,
+    typed_model: []const u8,
+};
+
+fn parseModelWizardInput(input: []const u8, visible_count: usize) ModelWizardInput {
+    if (input.len == 0) return .use_default;
+
+    if (std.ascii.eqlIgnoreCase(input, "n") or std.ascii.eqlIgnoreCase(input, "next")) {
+        return .page_next;
+    }
+    if (std.ascii.eqlIgnoreCase(input, "p") or std.ascii.eqlIgnoreCase(input, "prev")) {
+        return .page_prev;
+    }
+
+    if (std.fmt.parseInt(usize, input, 10)) |num| {
+        if (num >= 1 and num <= visible_count) {
+            return .{ .page_index = num - 1 };
+        }
+    } else |_| {}
+
+    return .{ .typed_model = input };
+}
+
+const ProviderSelection = struct {
+    key: []const u8,
+    default_model: []const u8,
+    env_var: []const u8,
+    base_url: ?[]const u8 = null,
+};
+
+pub fn appendOrReplaceProviderEntry(
+    cfg: *Config,
+    provider_name: []const u8,
+    api_key: ?[]const u8,
+    base_url: ?[]const u8,
+) !void {
+    var replace_idx: ?usize = null;
+    for (cfg.providers, 0..) |entry, idx| {
+        if (provider_names.providerNamesMatch(entry.name, provider_name)) {
+            replace_idx = idx;
+            break;
+        }
+    }
+
+    const new_len = if (replace_idx != null) cfg.providers.len else cfg.providers.len + 1;
+    const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, new_len);
+
+    var out_idx: usize = 0;
+    for (cfg.providers, 0..) |entry, idx| {
+        if (replace_idx != null and idx == replace_idx.?) {
+            entries[out_idx] = .{
+                .name = try cfg.allocator.dupe(u8, provider_name),
+                .api_key = if (api_key) |value| try cfg.allocator.dupe(u8, value) else null,
+                .base_url = if (base_url) |value| try cfg.allocator.dupe(u8, value) else null,
+                .native_tools = entry.native_tools,
+                .user_agent = entry.user_agent,
+                .api_mode = entry.api_mode,
+                .chat_template_enable_thinking_param = entry.chat_template_enable_thinking_param,
+                .max_streaming_prompt_bytes = entry.max_streaming_prompt_bytes,
+            };
+        } else {
+            entries[out_idx] = entry;
+        }
+        out_idx += 1;
+    }
+
+    if (replace_idx == null) {
+        entries[out_idx] = .{
+            .name = try cfg.allocator.dupe(u8, provider_name),
+            .api_key = if (api_key) |value| try cfg.allocator.dupe(u8, value) else null,
+            .base_url = if (base_url) |value| try cfg.allocator.dupe(u8, value) else null,
+        };
+    }
+
+    cfg.providers = entries;
+}
+
+fn promptProviderSelection(
+    allocator: std.mem.Allocator,
+    out: *std.Io.Writer,
+    input_buf: []u8,
+) !?ProviderSelection {
+    try out.writeAll("    Available providers:\n");
+    for (known_providers, 0..) |p, i| {
+        try out.print("      [{d}] {s}\n", .{ i + 1, p.label });
+    }
+    try out.print("      [{d}] Custom OpenAI-compatible provider (custom:https://.../v1)\n", .{known_providers.len + 1});
+    try out.writeAll("    Choice [1]: ");
+    const provider_idx = promptChoice(out, input_buf, known_providers.len + 1, 0) orelse return null;
+
+    if (provider_idx < known_providers.len) {
+        const provider = known_providers[provider_idx];
+        return .{
+            .key = provider.key,
+            .default_model = provider.default_model,
+            .env_var = provider.env_var,
+        };
+    }
+
+    try out.writeAll("    Enter custom base URL (must include version segment, e.g. https://host/v1): ");
+    while (true) {
+        const custom_url = prompt(out, input_buf, "", "") orelse return null;
+        if (isValidCustomProviderUrl(custom_url)) {
+            return .{
+                .key = try std.fmt.allocPrint(allocator, "custom:{s}", .{custom_url}),
+                .default_model = "gpt-5.2",
+                .env_var = "API_KEY",
+                .base_url = try allocator.dupe(u8, custom_url),
+            };
+        }
+        try out.writeAll("    Invalid URL. It must start with http:// or https:// and include a version path like /v1. Try again: ");
+    }
+}
+
+fn isFreeModelId(model_id: []const u8) bool {
+    return std.mem.endsWith(u8, model_id, ":free");
+}
+
+fn modelCatalogLessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+    const lhs_free = isFreeModelId(lhs);
+    const rhs_free = isFreeModelId(rhs);
+    if (lhs_free != rhs_free) return lhs_free and !rhs_free;
+    return std.ascii.lessThanIgnoreCase(lhs, rhs);
+}
+
+fn sortModelIds(models: [][]const u8) void {
+    std.mem.sortUnstable([]const u8, models, {}, modelCatalogLessThan);
+}
+
+fn selectDefaultFetchedModel(models: []const []const u8, default_model: []const u8) []const u8 {
+    for (models) |model| {
+        if (std.mem.eql(u8, model, default_model)) return model;
+    }
+    if (models.len > 0) return models[0];
+    return default_model;
 }
 
 pub const tunnel_options = [_][]const u8{ "none", "cloudflare", "ngrok", "tailscale" };
@@ -1922,59 +2047,24 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
 
     // ── Step 1: Provider selection ──
     try out.writeAll("  Step 1/8: Select a provider\n");
-    for (known_providers, 0..) |p, i| {
-        try out.print("    [{d}] {s}\n", .{ i + 1, p.label });
-    }
-    try out.print("    [{d}] Custom OpenAI-compatible provider (custom:https://.../v1)\n", .{known_providers.len + 1});
-    try out.writeAll("  Choice [1]: ");
-    const provider_idx = promptChoice(out, &input_buf, known_providers.len + 1, 0) orelse {
+    const provider_selection = (try promptProviderSelection(cfg.allocator, out, &input_buf)) orelse {
         try out.writeAll("\n  Aborted.\n");
         try out.flush();
         return;
     };
-
-    if (provider_idx < known_providers.len) {
-        const provider = known_providers[provider_idx];
-        cfg.default_provider = provider.key;
-        try out.print("  -> {s}\n\n", .{provider.label});
-    } else {
-        // Custom provider - prompt for URL
-        var custom_url_buf: [512]u8 = undefined;
-        try out.writeAll("\n  Custom provider configuration:\n");
-        try out.writeAll("  Enter OpenAI-compatible endpoint URL (e.g., https://api.example.com/v1): ");
-        const custom_url = prompt(out, &custom_url_buf, "", "") orelse {
-            try out.writeAll("\n  Aborted.\n");
-            try out.flush();
-            return;
-        };
-        if (custom_url.len == 0) {
-            try out.writeAll("\n  Error: Custom provider URL cannot be empty\n");
-            try out.flush();
-            return;
-        }
-        if (!isValidCustomProviderUrl(custom_url)) {
-            try out.writeAll("\n  Error: endpoint must be http(s) and include a version segment like /v1\n");
-            try out.flush();
-            return;
-        }
-        const custom_provider_key = try std.fmt.allocPrint(cfg.allocator, "custom:{s}", .{custom_url});
-        cfg.default_provider = custom_provider_key;
-
-        // Add to providers section with base_url
-        const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
-        entries[0] = .{ .name = try cfg.allocator.dupe(u8, cfg.default_provider), .base_url = try cfg.allocator.dupe(u8, custom_url) };
-        cfg.providers = entries;
-
+    cfg.default_provider = provider_selection.key;
+    if (provider_selection.base_url) |custom_url| {
+        try appendOrReplaceProviderEntry(&cfg, cfg.default_provider, null, custom_url);
         try out.print("  -> Custom: {s}\n\n", .{custom_url});
+    } else if (findProviderInfoByCanonical(cfg.default_provider)) |info| {
+        try out.print("  -> {s}\n\n", .{info.label});
+    } else {
+        try out.print("  -> {s}\n\n", .{cfg.default_provider});
     }
 
-    const is_azure_provider = provider_idx < known_providers.len and
-        std.mem.eql(u8, known_providers[provider_idx].key, "azure");
+    const is_azure_provider = std.mem.eql(u8, canonicalProviderName(cfg.default_provider), "azure");
 
-    var provider_base_url: ?[]const u8 = null;
-    if (cfg.providers.len > 0 and cfg.providers[0].base_url != null) {
-        provider_base_url = cfg.providers[0].base_url;
-    }
+    var provider_base_url = cfg.getProviderBaseUrl(cfg.default_provider);
 
     if (is_azure_provider) {
         var azure_endpoint_buf: [512]u8 = undefined;
@@ -2000,7 +2090,7 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     }
 
     // ── Step 2: API key ──
-    const env_hint = if (provider_idx < known_providers.len) known_providers[provider_idx].env_var else "API_KEY";
+    const env_hint = provider_selection.env_var;
     const requires_api_key = providerRequiresApiKeyForSetup(cfg.default_provider, provider_base_url);
     if (requires_api_key) {
         try out.print("  Step 2/8: Enter API key (or press Enter to use env var {s}): ", .{env_hint});
@@ -2010,23 +2100,11 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
             return;
         };
         if (api_key_input.len > 0) {
-            // Store in providers section (preserve base_url if already set for custom provider)
-            const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
-            entries[0] = .{
-                .name = try cfg.allocator.dupe(u8, cfg.default_provider),
-                .api_key = try cfg.allocator.dupe(u8, api_key_input),
-                .base_url = provider_base_url,
-            };
-            cfg.providers = entries;
+            try appendOrReplaceProviderEntry(&cfg, cfg.default_provider, api_key_input, provider_base_url);
             try out.writeAll("  -> API key set\n\n");
         } else {
             if (is_azure_provider) {
-                const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
-                entries[0] = .{
-                    .name = try cfg.allocator.dupe(u8, cfg.default_provider),
-                    .base_url = provider_base_url,
-                };
-                cfg.providers = entries;
+                try appendOrReplaceProviderEntry(&cfg, cfg.default_provider, null, provider_base_url);
             }
             try out.print("  -> Will use ${s} from environment\n\n", .{env_hint});
         }
@@ -2044,10 +2122,7 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     }
 
     // ── Step 3: Model (with live fetching) ──
-    const default_model_for_provider = if (provider_idx < known_providers.len)
-        known_providers[provider_idx].default_model
-    else
-        "gpt-5.2";
+    const default_model_for_provider = provider_selection.default_model;
 
     try out.writeAll("  Step 3/8: Select a model\n");
     try out.writeAll("  Fetching available models...\n");
@@ -2083,57 +2158,144 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
         }
     }
 
-    // Show up to 15 models as numbered choices if we successfully fetched them
+    // Show fetched models in pages so operators do not have to type a valid
+    // model name manually just because it was outside the first page.
     if (models_fetched) {
-        const display_max: usize = @min(models_to_use.len, 15);
-        for (models_to_use[0..display_max], 0..) |m, i| {
-            const is_default = std.mem.eql(u8, m, default_model_for_provider);
-            if (is_default) {
-                try out.print("    [{d}] {s} (default)\n", .{ i + 1, m });
-            } else {
-                try out.print("    [{d}] {s}\n", .{ i + 1, m });
+        const total_pages = @max(@as(usize, 1), std.math.divCeil(usize, models_to_use.len, MODEL_PAGE_SIZE) catch 1);
+        var page_idx: usize = 0;
+
+        while (true) {
+            const page_start = page_idx * MODEL_PAGE_SIZE;
+            const page_end = @min(page_start + MODEL_PAGE_SIZE, models_to_use.len);
+            const visible_models = models_to_use[page_start..page_end];
+
+            try out.print("  Models page {d}/{d}\n", .{ page_idx + 1, total_pages });
+            for (visible_models, 0..) |m, i| {
+                const is_default = std.mem.eql(u8, m, default_model_for_provider);
+                if (is_default) {
+                    try out.print("    [{d}] {s} (default)\n", .{ i + 1, m });
+                } else {
+                    try out.print("    [{d}] {s}\n", .{ i + 1, m });
+                }
             }
+            if (total_pages > 1) {
+                if (page_idx + 1 < total_pages and page_idx > 0) {
+                    try out.writeAll("    Type `n` for next page or `p` for previous page\n");
+                } else if (page_idx + 1 < total_pages) {
+                    try out.writeAll("    Type `n` for next page\n");
+                } else if (page_idx > 0) {
+                    try out.writeAll("    Type `p` for previous page\n");
+                }
+            }
+            try out.print("  Choice [1], `n`/`p`, or model name [{s}]: ", .{default_model_for_provider});
+
+            const model_input = prompt(out, &input_buf, "", "") orelse {
+                try out.writeAll("\n  Aborted.\n");
+                try out.flush();
+                return;
+            };
+
+            switch (parseModelWizardInput(model_input, visible_models.len)) {
+                .use_default => {
+                    const selected_default = selectDefaultFetchedModel(models_to_use, default_model_for_provider);
+                    cfg.default_model = try cfg.allocator.dupe(u8, selected_default);
+                    break;
+                },
+                .page_next => {
+                    if (page_idx + 1 < total_pages) {
+                        page_idx += 1;
+                        continue;
+                    }
+                },
+                .page_prev => {
+                    if (page_idx > 0) {
+                        page_idx -= 1;
+                        continue;
+                    }
+                },
+                .page_index => |visible_idx| {
+                    cfg.default_model = try cfg.allocator.dupe(u8, visible_models[visible_idx]);
+                    break;
+                },
+                .typed_model => |typed_model| {
+                    cfg.default_model = try cfg.allocator.dupe(u8, typed_model);
+                    break;
+                },
+            }
+
+            try out.writeAll("  Invalid page navigation for current page; try again.\n");
         }
-        if (models_to_use.len > display_max) {
-            try out.print("    ... and {d} more (type name to use any model)\n", .{models_to_use.len - display_max});
-        }
-        try out.print("  Choice [1] or model name [{s}]: ", .{default_model_for_provider});
     } else {
         try out.writeAll("  Enter model name directly:\n");
         try out.print("  Model name [{s}]: ", .{default_model_for_provider});
-    }
-    const model_input = prompt(out, &input_buf, "", "") orelse {
-        try out.writeAll("\n  Aborted.\n");
-        try out.flush();
-        return;
-    };
-    if (model_input.len == 0) {
-        // Default: use first model from the list (or provider default)
-        // Must dupe because models_to_use will be freed in defer block
-        cfg.default_model = if (models_to_use.len > 0)
-            try cfg.allocator.dupe(u8, models_to_use[0])
-        else
-            try cfg.allocator.dupe(u8, default_model_for_provider);
-    } else if (models_fetched) {
-        // If we successfully fetched models, try to parse as number (menu selection) or use as free-form model name
-        const display_max: usize = @min(models_to_use.len, 15);
-        if (std.fmt.parseInt(usize, model_input, 10)) |num| {
-            if (num >= 1 and num <= display_max) {
-                // Must dupe because models_to_use will be freed in defer block
-                cfg.default_model = try cfg.allocator.dupe(u8, models_to_use[num - 1]);
-            } else {
-                // Must dupe because default_model_for_provider is from const static data
-                cfg.default_model = try cfg.allocator.dupe(u8, default_model_for_provider);
-            }
-        } else |_| {
-            // Free-form model name typed by user
-            cfg.default_model = try cfg.allocator.dupe(u8, model_input);
-        }
-    } else {
-        // If we couldn't fetch models, use input as model name directly
+        const model_input = prompt(out, &input_buf, "", "") orelse {
+            try out.writeAll("\n  Aborted.\n");
+            try out.flush();
+            return;
+        };
         cfg.default_model = try cfg.allocator.dupe(u8, model_input);
     }
     try out.print("  -> {s}\n\n", .{cfg.default_model.?});
+
+    while (true) {
+        try out.writeAll("  Add another provider? [y/N]: ");
+        const add_more = prompt(out, &input_buf, "", "n") orelse {
+            try out.writeAll("\n  Aborted.\n");
+            try out.flush();
+            return;
+        };
+        if (add_more.len == 0 or !(add_more[0] == 'y' or add_more[0] == 'Y')) break;
+
+        try out.writeAll("\n  Additional provider setup:\n");
+        const extra_provider = (try promptProviderSelection(cfg.allocator, out, &input_buf)) orelse {
+            try out.writeAll("\n  Aborted.\n");
+            try out.flush();
+            return;
+        };
+
+        const extra_is_azure = std.mem.eql(u8, canonicalProviderName(extra_provider.key), "azure");
+        var extra_base_url: ?[]const u8 = extra_provider.base_url;
+
+        if (extra_is_azure) {
+            var azure_endpoint_buf: [512]u8 = undefined;
+            const default_endpoint = extra_base_url orelse "";
+            if (default_endpoint.len > 0) {
+                try out.print("    Azure OpenAI endpoint [{s}]: ", .{default_endpoint});
+            } else {
+                try out.writeAll("    Azure OpenAI endpoint (e.g., https://your-resource.openai.azure.com): ");
+            }
+            const azure_endpoint = prompt(out, &azure_endpoint_buf, "", default_endpoint) orelse {
+                try out.writeAll("\n  Aborted.\n");
+                try out.flush();
+                return;
+            };
+            if (azure_endpoint.len == 0) {
+                try out.writeAll("\n  Error: Azure OpenAI endpoint is required\n");
+                try out.flush();
+                return;
+            }
+            extra_base_url = try cfg.allocator.dupe(u8, azure_endpoint);
+        }
+
+        if (providerRequiresApiKeyForSetup(extra_provider.key, extra_base_url)) {
+            try out.print("    API key for {s} (or press Enter to use env var {s}): ", .{ extra_provider.key, extra_provider.env_var });
+            const api_key_input = prompt(out, &input_buf, "", "") orelse {
+                try out.writeAll("\n  Aborted.\n");
+                try out.flush();
+                return;
+            };
+            if (api_key_input.len > 0) {
+                try appendOrReplaceProviderEntry(&cfg, extra_provider.key, api_key_input, extra_base_url);
+                try out.writeAll("    -> API key set\n\n");
+            } else {
+                try appendOrReplaceProviderEntry(&cfg, extra_provider.key, null, extra_base_url);
+                try out.print("    -> Will use ${s} from environment\n\n", .{extra_provider.env_var});
+            }
+        } else {
+            try appendOrReplaceProviderEntry(&cfg, extra_provider.key, null, extra_base_url);
+            try out.writeAll("    -> No API key required\n\n");
+        }
+    }
 
     // ── Step 4: Memory backend ──
     const backends = try selectableBackendsForWizard(allocator);
@@ -2268,8 +2430,7 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     try out.print("  [OK] Workspace:  {s}\n", .{cfg.workspace_dir});
     try out.print("  [OK] Config:     {s}\n", .{cfg.config_path});
     try out.writeAll("\n  Next steps:\n");
-    const final_env_hint = if (provider_idx < known_providers.len) known_providers[provider_idx].env_var else "API_KEY";
-    try printProviderNextSteps(out, cfg.default_provider, final_env_hint, requires_api_key, cfg.defaultProviderKey() != null);
+    try printProviderNextSteps(out, cfg.default_provider, provider_selection.env_var, requires_api_key, cfg.defaultProviderKey() != null);
     try out.writeAll("\n");
     try out.flush();
 }
@@ -3233,6 +3394,89 @@ test "StdinLineReader flushRemainder returns final unterminated line" {
 
 test "BANNER contains descriptive text" {
     try std.testing.expect(std.mem.indexOf(u8, BANNER, "smallest AI assistant") != null);
+}
+
+test "appendOrReplaceProviderEntry appends a second provider without dropping the first" {
+    var cfg = try initFreshConfig(std.testing.allocator);
+    defer cfg.deinit();
+
+    try appendOrReplaceProviderEntry(&cfg, "openrouter", "sk-or-test", null);
+    try appendOrReplaceProviderEntry(&cfg, "moonshot", "sk-ms-test", null);
+
+    try std.testing.expectEqual(@as(usize, 2), cfg.providers.len);
+    try std.testing.expectEqualStrings("openrouter", cfg.providers[0].name);
+    try std.testing.expectEqualStrings("moonshot", cfg.providers[1].name);
+}
+
+test "appendOrReplaceProviderEntry replaces existing provider entry in place" {
+    var cfg = try initFreshConfig(std.testing.allocator);
+    defer cfg.deinit();
+
+    try appendOrReplaceProviderEntry(&cfg, "openrouter", "sk-or-test", null);
+    try appendOrReplaceProviderEntry(&cfg, "openrouter", "sk-or-updated", "https://openrouter.ai/api/v1");
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.providers.len);
+    try std.testing.expectEqualStrings("openrouter", cfg.providers[0].name);
+    try std.testing.expectEqualStrings("sk-or-updated", cfg.providers[0].api_key.?);
+    try std.testing.expectEqualStrings("https://openrouter.ai/api/v1", cfg.providers[0].base_url.?);
+}
+
+test "appendOrReplaceProviderEntry preserves advanced provider overrides when updating credentials" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+        .providers = &.{.{
+            .name = "sub2api",
+            .api_key = "sk-old",
+            .base_url = "https://old.example/v1",
+            .native_tools = false,
+            .user_agent = "nullclaw-test/1.0",
+            .api_mode = .responses,
+            .chat_template_enable_thinking_param = true,
+            .max_streaming_prompt_bytes = 65536,
+        }},
+    };
+
+    try appendOrReplaceProviderEntry(&cfg, "sub2api", "sk-new", "https://new.example/v1");
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.providers.len);
+    try std.testing.expectEqualStrings("sub2api", cfg.providers[0].name);
+    try std.testing.expectEqualStrings("sk-new", cfg.providers[0].api_key.?);
+    try std.testing.expectEqualStrings("https://new.example/v1", cfg.providers[0].base_url.?);
+    try std.testing.expect(!cfg.providers[0].native_tools);
+    try std.testing.expectEqualStrings("nullclaw-test/1.0", cfg.providers[0].user_agent.?);
+    try std.testing.expectEqual(config_mod.ProviderEntry.ApiMode.responses, cfg.providers[0].api_mode);
+    try std.testing.expect(cfg.providers[0].chat_template_enable_thinking_param);
+    try std.testing.expectEqual(@as(?usize, 65536), cfg.providers[0].max_streaming_prompt_bytes);
+}
+
+test "appendOrReplaceProviderEntry replaces canonical alias matches instead of appending duplicates" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+        .providers = &.{.{
+            .name = "google-vertex",
+            .api_key = "vertex-old",
+            .base_url = "https://vertex.example/v1",
+        }},
+    };
+
+    try appendOrReplaceProviderEntry(&cfg, "vertex", "vertex-new", "https://vertex-new.example/v1");
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.providers.len);
+    try std.testing.expectEqualStrings("vertex", cfg.providers[0].name);
+    try std.testing.expectEqualStrings("vertex-new", cfg.getProviderKey("google-vertex").?);
+    try std.testing.expectEqualStrings("https://vertex-new.example/v1", cfg.getProviderBaseUrl("vertex-ai").?);
 }
 
 test "scaffoldWorkspace creates core files and leaves MEMORY.md optional" {
@@ -4202,7 +4446,7 @@ test "fallbackModelsForProvider uses provider defaults for uncataloged providers
     try std.testing.expectEqualStrings("glm-5", z_ai_models[0]);
 }
 
-test "parseModelIds extracts IDs from OpenRouter-style response" {
+test "parseModelIds extracts IDs from OpenRouter-style response and sorts them" {
     const json =
         \\{"data": [
         \\  {"id": "openai/gpt-4", "name": "GPT-4"},
@@ -4217,9 +4461,67 @@ test "parseModelIds extracts IDs from OpenRouter-style response" {
     }
 
     try std.testing.expect(models.len == 3);
-    try std.testing.expectEqualStrings("openai/gpt-4", models[0]);
-    try std.testing.expectEqualStrings("anthropic/claude-3", models[1]);
-    try std.testing.expectEqualStrings("meta/llama-3", models[2]);
+    try std.testing.expectEqualStrings("anthropic/claude-3", models[0]);
+    try std.testing.expectEqualStrings("meta/llama-3", models[1]);
+    try std.testing.expectEqualStrings("openai/gpt-4", models[2]);
+}
+
+test "parseModelWizardInput handles paging commands and selections" {
+    try std.testing.expect(parseModelWizardInput("", 5) == .use_default);
+    try std.testing.expect(parseModelWizardInput("n", 5) == .page_next);
+    try std.testing.expect(parseModelWizardInput("NEXT", 5) == .page_next);
+    try std.testing.expect(parseModelWizardInput("p", 5) == .page_prev);
+    try std.testing.expect(parseModelWizardInput("prev", 5) == .page_prev);
+
+    switch (parseModelWizardInput("3", 5)) {
+        .page_index => |idx| try std.testing.expectEqual(@as(usize, 2), idx),
+        else => return error.TestUnexpectedResult,
+    }
+
+    switch (parseModelWizardInput("17", 5)) {
+        .typed_model => |name| try std.testing.expectEqualStrings("17", name),
+        else => return error.TestUnexpectedResult,
+    }
+
+    switch (parseModelWizardInput("moonshotai/kimi-k2.5", 5)) {
+        .typed_model => |name| try std.testing.expectEqualStrings("moonshotai/kimi-k2.5", name),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "sortModelIds places free models first and keeps alphabetical order" {
+    var models = [_][]const u8{
+        "z-ai/glm-5-turbo",
+        "openai/gpt-5.4",
+        "nvidia/nemotron-3-super-120b-a12b:free",
+        "anthropic/claude-sonnet-4.6",
+        "a-provider/freebie:free",
+    };
+
+    sortModelIds(models[0..]);
+
+    try std.testing.expectEqualStrings("a-provider/freebie:free", models[0]);
+    try std.testing.expectEqualStrings("nvidia/nemotron-3-super-120b-a12b:free", models[1]);
+    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4.6", models[2]);
+    try std.testing.expectEqualStrings("openai/gpt-5.4", models[3]);
+    try std.testing.expectEqualStrings("z-ai/glm-5-turbo", models[4]);
+}
+
+test "selectDefaultFetchedModel prefers provider default when present" {
+    const models = [_][]const u8{
+        "a-provider/freebie:free",
+        "anthropic/claude-sonnet-4.6",
+        "openai/gpt-5.4",
+    };
+
+    try std.testing.expectEqualStrings(
+        "anthropic/claude-sonnet-4.6",
+        selectDefaultFetchedModel(models[0..], "anthropic/claude-sonnet-4.6"),
+    );
+    try std.testing.expectEqualStrings(
+        "a-provider/freebie:free",
+        selectDefaultFetchedModel(models[0..], "missing/default"),
+    );
 }
 
 test "parseModelIds handles empty data array" {
@@ -4298,6 +4600,38 @@ test "cache round-trip: write then read fresh cache" {
     try std.testing.expectEqualStrings("model-alpha", loaded[0]);
     try std.testing.expectEqualStrings("model-beta", loaded[1]);
     try std.testing.expectEqualStrings("model-gamma", loaded[2]);
+}
+
+test "cache read sorts stale model ordering on load" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const cache_path = try std.fs.path.join(std.testing.allocator, &.{ base, "models_cache.json" });
+    defer std.testing.allocator.free(cache_path);
+
+    const cache_json = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"fetched_at\": {d}, \"openrouter\": [\"z-model\", \"a-model:free\", \"m-model\"]}}",
+        .{std.time.timestamp()},
+    );
+    defer std.testing.allocator.free(cache_json);
+
+    const file = try tmp.dir.createFile("models_cache.json", .{});
+    defer file.close();
+    try file.writeAll(cache_json);
+
+    const loaded = try readCachedModels(std.testing.allocator, cache_path, "openrouter");
+    defer {
+        for (loaded) |m| std.testing.allocator.free(m);
+        std.testing.allocator.free(loaded);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), loaded.len);
+    try std.testing.expectEqualStrings("a-model:free", loaded[0]);
+    try std.testing.expectEqualStrings("m-model", loaded[1]);
+    try std.testing.expectEqualStrings("z-model", loaded[2]);
 }
 
 test "cache read returns error for wrong provider" {
@@ -4470,10 +4804,6 @@ test "CACHE_TTL_SECS is 12 hours" {
     try std.testing.expect(CACHE_TTL_SECS == 43200);
 }
 
-test "MAX_MODELS is 20" {
-    try std.testing.expect(MAX_MODELS == 20);
-}
-
 test "fetchModels returns models for anthropic (no network)" {
     const models = try fetchModels(std.testing.allocator, "anthropic", null);
     // Anthropic uses hardcoded fallback (allocated copies via fetchModelsFromApi)
@@ -4546,7 +4876,7 @@ test "modelsDevProviderKey maps known providers" {
     try std.testing.expect(modelsDevProviderKey("ollama") == null);
 }
 
-test "parseModelsDevModelIds filters non-chat models and prioritizes default" {
+test "parseModelsDevModelIds filters non-chat models and sorts them" {
     const json =
         \\{
         \\  "anthropic": {
@@ -4576,11 +4906,11 @@ test "parseModelsDevModelIds filters non-chat models and prioritizes default" {
     }
 
     try std.testing.expectEqual(@as(usize, 2), models.len);
-    try std.testing.expectEqualStrings("claude-opus-4-6", models[0]);
-    try std.testing.expectEqualStrings("claude-haiku-4-5", models[1]);
+    try std.testing.expectEqualStrings("claude-haiku-4-5", models[0]);
+    try std.testing.expectEqualStrings("claude-opus-4-6", models[1]);
 }
 
-test "parseModelIds respects data ordering" {
+test "parseModelIds sorts alphabetically when no free suffix is present" {
     const json =
         \\{"data": [
         \\  {"id": "z-model"},
@@ -4594,8 +4924,7 @@ test "parseModelIds respects data ordering" {
         std.testing.allocator.free(models);
     }
     try std.testing.expect(models.len == 3);
-    // Should preserve original order, not sort
-    try std.testing.expectEqualStrings("z-model", models[0]);
-    try std.testing.expectEqualStrings("a-model", models[1]);
-    try std.testing.expectEqualStrings("m-model", models[2]);
+    try std.testing.expectEqualStrings("a-model", models[0]);
+    try std.testing.expectEqualStrings("m-model", models[1]);
+    try std.testing.expectEqualStrings("z-model", models[2]);
 }

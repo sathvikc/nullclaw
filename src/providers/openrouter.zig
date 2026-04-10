@@ -121,6 +121,8 @@ pub const OpenRouterProvider = struct {
 
                 var content: ?[]const u8 = null;
                 var reasoning_content: ?[]const u8 = null;
+                errdefer if (content) |c| if (c.len > 0) allocator.free(c);
+                errdefer if (reasoning_content) |rc| if (rc.len > 0) allocator.free(rc);
                 if (msg_obj.get("content")) |c| {
                     if (c == .string) {
                         const split = try root.splitThinkContent(allocator, c.string);
@@ -144,8 +146,21 @@ pub const OpenRouterProvider = struct {
                             reasoning_content = try allocator.dupe(u8, rc.string);
                     }
                 }
+                if (reasoning_content == null) {
+                    if (msg_obj.get("reasoning_details")) |details| {
+                        reasoning_content = try root.extractReasoningTextFromDetails(allocator, details);
+                    }
+                }
 
                 var tool_calls_list: std.ArrayListUnmanaged(ToolCall) = .empty;
+                errdefer {
+                    for (tool_calls_list.items) |tc| {
+                        if (tc.id.len > 0) allocator.free(tc.id);
+                        if (tc.name.len > 0) allocator.free(tc.name);
+                        if (tc.arguments.len > 0) allocator.free(tc.arguments);
+                    }
+                    tool_calls_list.deinit(allocator);
+                }
 
                 if (msg_obj.get("tool_calls")) |tc_arr| {
                     for (tc_arr.array.items) |tc| {
@@ -457,6 +472,7 @@ pub const OpenRouterProvider = struct {
         }
 
         try buf.append(allocator, ']');
+        try appendOpenRouterRequestFields(&buf, allocator, request);
         try root.appendGenerationFields(&buf, allocator, model, temperature, request.max_tokens, request.reasoning_effort);
         try appendOpenRouterReasoning(&buf, allocator, request.reasoning_effort);
 
@@ -500,6 +516,7 @@ pub const OpenRouterProvider = struct {
         }
 
         try buf.append(allocator, ']');
+        try appendOpenRouterRequestFields(&buf, allocator, request);
         try root.appendGenerationFields(&buf, allocator, model, temperature, request.max_tokens, request.reasoning_effort);
         try appendOpenRouterReasoning(&buf, allocator, request.reasoning_effort);
 
@@ -530,6 +547,21 @@ fn appendOpenRouterReasoning(
     try buf.appendSlice(allocator, ",\"reasoning\":{\"effort\":");
     try root.appendJsonString(buf, allocator, effort);
     try buf.append(allocator, '}');
+}
+
+fn appendOpenRouterRequestFields(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    request: ChatRequest,
+) !void {
+    if (request.session_id) |session_id| {
+        try buf.appendSlice(allocator, ",\"session_id\":");
+        try root.appendJsonString(buf, allocator, session_id);
+    }
+    if (request.include_reasoning) |include_reasoning| {
+        try buf.appendSlice(allocator, ",\"include_reasoning\":");
+        try buf.appendSlice(allocator, if (include_reasoning) "true" else "false");
+    }
 }
 
 /// HTTP GET via curl subprocess with auth header.
@@ -772,6 +804,25 @@ test "buildChatRequestBody escapes OpenRouter reasoning effort value" {
     try std.testing.expect(parsed.value.object.get("pwned") == null);
 }
 
+test "buildChatRequestBody includes session_id and include_reasoning" {
+    const msgs = [_]ChatMessage{
+        .{ .role = .user, .content = "hello" },
+    };
+    const req = ChatRequest{
+        .messages = &msgs,
+        .model = "moonshotai/kimi-k2.5",
+        .session_id = "telegram:chat123",
+        .include_reasoning = true,
+    };
+    const body = try OpenRouterProvider.buildChatRequestBody(std.testing.allocator, req, "moonshotai/kimi-k2.5", 0.7);
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("telegram:chat123", parsed.value.object.get("session_id").?.string);
+    try std.testing.expect(parsed.value.object.get("include_reasoning").?.bool);
+}
+
 test "chatWithHistory fails without key" {
     var p = OpenRouterProvider.init(std.testing.allocator, null);
     const messages = &[_]ChatMessage{
@@ -818,6 +869,25 @@ test "buildStreamingChatRequestBody escapes tool_call_id" {
     defer parsed.deinit();
     const msg = parsed.value.object.get("messages").?.array.items[0].object;
     try std.testing.expectEqualStrings("call_\"x\\y", msg.get("tool_call_id").?.string);
+}
+
+test "buildStreamingChatRequestBody includes session_id and include_reasoning" {
+    const msgs = [_]ChatMessage{
+        .{ .role = .user, .content = "hello" },
+    };
+    const req = ChatRequest{
+        .messages = &msgs,
+        .model = "moonshotai/kimi-k2.5",
+        .session_id = "discord:dm42",
+        .include_reasoning = true,
+    };
+    const body = try OpenRouterProvider.buildStreamingChatRequestBody(std.testing.allocator, req, "moonshotai/kimi-k2.5", 0.7);
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("discord:dm42", parsed.value.object.get("session_id").?.string);
+    try std.testing.expect(parsed.value.object.get("include_reasoning").?.bool);
 }
 
 test "streamChatImpl fails without key" {
@@ -876,6 +946,22 @@ test "parseNativeResponse reads native reasoning_content field" {
     }
     try std.testing.expectEqualStrings("The answer is 42", response.content.?);
     try std.testing.expectEqualStrings("I computed this", response.reasoning_content.?);
+}
+
+test "parseNativeResponse reads reasoning_details field" {
+    const body =
+        \\{"choices":[{"message":{"content":"Visible answer","reasoning_details":[{"type":"reasoning.summary","summary":"plan"},{"type":"reasoning.text","text":"step by step"}]}}],"model":"moonshotai/kimi-k2.5","usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}
+    ;
+    const alloc = std.testing.allocator;
+    const response = try OpenRouterProvider.parseNativeResponse(alloc, body);
+    defer {
+        if (response.content) |c| alloc.free(c);
+        if (response.reasoning_content) |rc| alloc.free(rc);
+        alloc.free(response.tool_calls);
+        alloc.free(response.model);
+    }
+    try std.testing.expectEqualStrings("Visible answer", response.content.?);
+    try std.testing.expectEqualStrings("plan\nstep by step", response.reasoning_content.?);
 }
 
 test "parseNativeResponse no think tags leaves reasoning_content null" {
