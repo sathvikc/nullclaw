@@ -4122,6 +4122,35 @@ test "parse agents.defaults.model.primary custom provider supports versioned pat
     try std.testing.expectEqualStrings("minimaxai/minimax-m2.1", cfg.default_model.?);
 }
 
+test "parse agents.defaults.model.primary matches configured cloudflare custom provider key" {
+    // Regression: issue #721 Cloudflare AI refs append "@cf/..." after a configured custom provider URL.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{
+        \\  "models": {
+        \\    "providers": {
+        \\      "custom:https://api.cloudflare.com/client/v4/accounts/xxx/ai/v1": {
+        \\        "base_url": "https://api.cloudflare.com/client/v4/accounts/xxx/ai/v1"
+        \\      }
+        \\    }
+        \\  },
+        \\  "agents": {
+        \\    "defaults": {
+        \\      "model": {
+        \\        "primary": "custom:https://api.cloudflare.com/client/v4/accounts/xxx/ai/v1/@cf/google/gemma-3-12b-it"
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqualStrings("custom:https://api.cloudflare.com/client/v4/accounts/xxx/ai/v1", cfg.default_provider);
+    try std.testing.expectEqualStrings("@cf/google/gemma-3-12b-it", cfg.default_model.?);
+}
+
 test "parse agents.defaults.model supports explicit provider field" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -4347,6 +4376,41 @@ test "parse agents.list primary model ref without provider field" {
     try std.testing.expectEqualStrings("coder", cfg.agents[0].name);
     try std.testing.expectEqualStrings("ollama", cfg.agents[0].provider);
     try std.testing.expectEqualStrings("qwen3.5:cloud", cfg.agents[0].model);
+}
+
+test "parse agents.list primary model ref matches configured cloudflare custom provider key" {
+    // Regression: issue #721 must also preserve Cloudflare-style refs for named agents.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{
+        \\  "models": {
+        \\    "providers": {
+        \\      "custom:https://api.cloudflare.com/client/v4/accounts/xxx/ai/v1": {
+        \\        "base_url": "https://api.cloudflare.com/client/v4/accounts/xxx/ai/v1"
+        \\      }
+        \\    }
+        \\  },
+        \\  "agents": {
+        \\    "list": [
+        \\      {
+        \\        "id": "coder",
+        \\        "model": {
+        \\          "primary": "custom:https://api.cloudflare.com/client/v4/accounts/xxx/ai/v1/@cf/google/gemma-3-12b-it"
+        \\        }
+        \\      }
+        \\    ]
+        \\  }
+        \\}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    defer freeNamedAgentSlice(allocator, cfg.agents);
+    try std.testing.expectEqual(@as(usize, 1), cfg.agents.len);
+    try std.testing.expectEqualStrings("coder", cfg.agents[0].name);
+    try std.testing.expectEqualStrings("custom:https://api.cloudflare.com/client/v4/accounts/xxx/ai/v1", cfg.agents[0].provider);
+    try std.testing.expectEqualStrings("@cf/google/gemma-3-12b-it", cfg.agents[0].model);
 }
 
 test "parse agents.list with workspace_path" {
