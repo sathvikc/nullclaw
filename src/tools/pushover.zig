@@ -386,7 +386,7 @@ test "getCredentials reads token and user_key from .env file" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.writeFile(.{ .sub_path = ".env", .data = 
+    try tmp_dir.dir.writeFile(.{ .sub_path = ".env", .data =
         \\PUSHOVER_TOKEN=test-token-abc
         \\PUSHOVER_USER_KEY=test-user-key-xyz
     });
@@ -410,7 +410,7 @@ test "getCredentials reads exported and quoted values" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.writeFile(.{ .sub_path = ".env", .data = 
+    try tmp_dir.dir.writeFile(.{ .sub_path = ".env", .data =
         \\export PUSHOVER_TOKEN="quoted-token"
         \\export PUSHOVER_USER_KEY='single-quoted-key'
     });
@@ -486,12 +486,9 @@ test "getCredentials prefers process environment over .env file" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.writeFile(.{
-        .sub_path = ".env",
-        .data =
+    try tmp_dir.dir.writeFile(.{ .sub_path = ".env", .data =
         \\PUSHOVER_TOKEN=file-token
         \\PUSHOVER_USER_KEY=file-user-key
-        ,
     });
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -515,12 +512,9 @@ test "getCredentials fills missing environment value from .env file" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.writeFile(.{
-        .sub_path = ".env",
-        .data =
+    try tmp_dir.dir.writeFile(.{ .sub_path = ".env", .data =
         \\PUSHOVER_TOKEN=file-token
         \\PUSHOVER_USER_KEY=file-user-key
-        ,
     });
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -542,14 +536,11 @@ test "getCredentials later .env entries override earlier ones" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.writeFile(.{
-        .sub_path = ".env",
-        .data =
+    try tmp_dir.dir.writeFile(.{ .sub_path = ".env", .data =
         \\PUSHOVER_TOKEN=first-token
         \\PUSHOVER_TOKEN=second-token
         \\PUSHOVER_USER_KEY=first-user-key
         \\PUSHOVER_USER_KEY=second-user-key
-        ,
     });
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;

@@ -1,13 +1,6 @@
 const std = @import("std");
 const platform = @import("platform.zig");
 
-fn getEnvVarOwnedOrNull(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
-    return std.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => null,
-        else => return err,
-    };
-}
-
 pub fn defaultConfigDirFromInputs(
     allocator: std.mem.Allocator,
     nullclaw_home: ?[]const u8,
@@ -55,7 +48,11 @@ pub fn defaultWorkspaceDirFromConfigDir(
 }
 
 pub fn defaultWorkspaceDir(allocator: std.mem.Allocator) ![]u8 {
-    if (try getEnvVarOwnedOrNull(allocator, "NULLCLAW_WORKSPACE")) |workspace_dir| return workspace_dir;
+    const nullclaw_workspace = std.process.getEnvVarOwned(allocator, "NULLCLAW_WORKSPACE") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    if (nullclaw_workspace) |workspace_dir| return workspace_dir;
 
     const config_dir = try defaultConfigDir(allocator);
     defer allocator.free(config_dir);
