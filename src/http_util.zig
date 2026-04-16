@@ -4,6 +4,7 @@
 //! Uses curl to avoid Zig 0.15 std.http.Client segfaults.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const Allocator = std.mem.Allocator;
 const AtomicBool = std.atomic.Value(bool);
 const net_security = @import("net_security.zig");
@@ -46,7 +47,7 @@ pub fn currentThreadInterruptFlag() ?*const AtomicBool {
 }
 
 const CancelWatcherCtx = struct {
-    child: *std.process.Child,
+    child: *std_compat.process.Child,
     cancel_flag: *const AtomicBool,
     done: *AtomicBool,
 };
@@ -55,13 +56,13 @@ fn cancelWatcherMain(ctx: *CancelWatcherCtx) void {
     while (!ctx.done.load(.acquire)) {
         if (ctx.cancel_flag.load(.acquire)) {
             if (comptime @import("builtin").os.tag == .windows) {
-                std.os.windows.TerminateProcess(ctx.child.id, 1) catch {};
+                _ = ctx.child.kill() catch {};
             } else {
                 std.posix.kill(ctx.child.id, std.posix.SIG.TERM) catch {};
             }
             break;
         }
-        std.Thread.sleep(20 * std.time.ns_per_ms);
+        std_compat.thread.sleep(20 * std.time.ns_per_ms);
     }
 }
 
@@ -131,6 +132,15 @@ pub fn buildSafeResolveEntryForRemoteUrl(
 
     if (!shouldUsePinnedResolve(host, connect_host)) return null;
     return try buildCurlResolveEntry(allocator, host, port, connect_host);
+}
+
+pub fn appendCurlResolveArgs(argv_buf: []([]const u8), argc: *usize, resolve_entry: ?[]const u8) void {
+    if (resolve_entry) |entry| {
+        argv_buf[argc.*] = "--resolve";
+        argc.* += 1;
+        argv_buf[argc.*] = entry;
+        argc.* += 1;
+    }
 }
 
 /// HTTP POST via curl subprocess with optional proxy and timeout.
@@ -239,12 +249,7 @@ fn curlRequestWithProxy(
         argc += 1;
     }
 
-    if (resolve_entry) |entry| {
-        argv_buf[argc] = "--resolve";
-        argc += 1;
-        argv_buf[argc] = entry;
-        argc += 1;
-    }
+    appendCurlResolveArgs(argv_buf[0..], &argc, resolve_entry);
 
     if (max_time) |mt| {
         argv_buf[argc] = "--max-time";
@@ -270,7 +275,7 @@ fn curlRequestWithProxy(
     argv_buf[argc] = url;
     argc += 1;
 
-    var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
     child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
@@ -317,7 +322,7 @@ fn curlRequestWithProxy(
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
     };
     switch (term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             logCurlExitFailure(method, code);
             allocator.free(stdout);
             return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else mapCurlExitCodeToError(code);
@@ -399,12 +404,7 @@ pub fn curlPostWithStatusAndTimeoutAndResolve(
         argc += 1;
     }
 
-    if (resolve_entry) |entry| {
-        argv_buf[argc] = "--resolve";
-        argc += 1;
-        argv_buf[argc] = entry;
-        argc += 1;
-    }
+    appendCurlResolveArgs(argv_buf[0..], &argc, resolve_entry);
 
     argv_buf[argc] = "-X";
     argc += 1;
@@ -434,7 +434,7 @@ pub fn curlPostWithStatusAndTimeoutAndResolve(
     argv_buf[argc] = url;
     argc += 1;
 
-    var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
     child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
@@ -481,7 +481,7 @@ pub fn curlPostWithStatusAndTimeoutAndResolve(
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
     };
     switch (term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             logCurlExitFailure("POST", code);
             return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else mapCurlExitCodeToError(code);
         },
@@ -538,12 +538,7 @@ pub fn curlPostWithStatusHeadersAndTimeoutAndResolve(
         argc += 1;
     }
 
-    if (resolve_entry) |entry| {
-        argv_buf[argc] = "--resolve";
-        argc += 1;
-        argv_buf[argc] = entry;
-        argc += 1;
-    }
+    appendCurlResolveArgs(argv_buf[0..], &argc, resolve_entry);
 
     argv_buf[argc] = "-X";
     argc += 1;
@@ -579,7 +574,7 @@ pub fn curlPostWithStatusHeadersAndTimeoutAndResolve(
     argv_buf[argc] = url;
     argc += 1;
 
-    var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
     child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
@@ -626,7 +621,7 @@ pub fn curlPostWithStatusHeadersAndTimeoutAndResolve(
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
     };
     switch (term) {
-        .Exited => |code| if (code != 0) return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed,
+        .exited => |code| if (code != 0) return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed,
         else => return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed,
     }
 
@@ -694,12 +689,7 @@ pub fn curlGetWithStatusAndTimeoutAndResolve(
         argc += 1;
     }
 
-    if (resolve_entry) |entry| {
-        argv_buf[argc] = "--resolve";
-        argc += 1;
-        argv_buf[argc] = entry;
-        argc += 1;
-    }
+    appendCurlResolveArgs(argv_buf[0..], &argc, resolve_entry);
 
     for (headers) |hdr| {
         if (argc + 2 > argv_buf.len) break;
@@ -716,7 +706,7 @@ pub fn curlGetWithStatusAndTimeoutAndResolve(
     argv_buf[argc] = url;
     argc += 1;
 
-    var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
 
@@ -746,7 +736,7 @@ pub fn curlGetWithStatusAndTimeoutAndResolve(
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
     };
     switch (term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             logCurlExitFailure("GET", code);
             return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else mapCurlExitCodeToError(code);
         },
@@ -832,7 +822,7 @@ fn curlGetWithProxyAndResolve(
     argv_buf[argc] = url;
     argc += 1;
 
-    var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
 
@@ -861,7 +851,7 @@ fn curlGetWithProxyAndResolve(
         return error.CurlWaitError;
     };
     switch (term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             logCurlExitFailure("GET", code);
             allocator.free(stdout);
             return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else mapCurlExitCodeToError(code);
@@ -923,7 +913,7 @@ pub fn curlGetMaxBytes(
 /// Returns null if no proxy is set.
 /// Caller owns returned memory.
 var proxy_override_value: ?[]u8 = null;
-var proxy_override_mutex: std.Thread.Mutex = .{};
+var proxy_override_mutex: std_compat.sync.Mutex = .{};
 
 pub const ProxyOverrideError = error{OutOfMemory};
 
@@ -962,7 +952,7 @@ pub fn getProxyFromEnv(allocator: Allocator) !?[]const u8 {
 
     const env_vars = [_][]const u8{ "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY" };
     for (env_vars) |var_name| {
-        if (std.process.getEnvVarOwned(allocator, var_name)) |val| {
+        if (std_compat.process.getEnvVarOwned(allocator, var_name)) |val| {
             errdefer allocator.free(val);
             const out = try normalizeProxyEnvValue(allocator, val);
             allocator.free(val);
@@ -1001,7 +991,7 @@ pub fn curlGetSSE(
     argv_buf[argc] = url;
     argc += 1;
 
-    var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
@@ -1035,7 +1025,7 @@ pub fn curlGetSSE(
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
     };
     switch (term) {
-        .Exited => |code| {
+        .exited => |code| {
             if (code != 0) {
                 // Exit code 28 = timeout. This is expected for SSE when no data arrives,
                 // but curl may have received some data before timing out - return it.
@@ -1114,6 +1104,22 @@ test "buildSafeResolveEntryForRemoteUrl rejects loopback integer alias" {
 
 test "buildSafeResolveEntryForRemoteUrl rejects malformed URL" {
     try std.testing.expectError(error.InvalidUrl, buildSafeResolveEntryForRemoteUrl(std.testing.allocator, "notaurl"));
+}
+
+test "appendCurlResolveArgs appends resolve flag and target" {
+    var argv_buf: [4][]const u8 = undefined;
+    var argc: usize = 0;
+    appendCurlResolveArgs(argv_buf[0..], &argc, "example.com:443:203.0.113.7");
+    try std.testing.expectEqual(@as(usize, 2), argc);
+    try std.testing.expectEqualStrings("--resolve", argv_buf[0]);
+    try std.testing.expectEqualStrings("example.com:443:203.0.113.7", argv_buf[1]);
+}
+
+test "appendCurlResolveArgs skips null entry" {
+    var argv_buf: [2][]const u8 = undefined;
+    var argc: usize = 0;
+    appendCurlResolveArgs(argv_buf[0..], &argc, null);
+    try std.testing.expectEqual(@as(usize, 0), argc);
 }
 
 test "curl post max bytes is increased for large provider responses" {

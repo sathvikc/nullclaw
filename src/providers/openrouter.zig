@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const root = @import("root.zig");
 const sse = @import("sse.zig");
 const error_classify = @import("error_classify.zig");
