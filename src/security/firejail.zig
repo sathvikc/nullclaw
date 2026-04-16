@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const Sandbox = @import("sandbox.zig").Sandbox;
 
@@ -48,14 +49,14 @@ pub const FirejailSandbox = struct {
     fn isAvailable(_: *anyopaque) bool {
         if (comptime builtin.os.tag != .linux) return false;
 
-        var child = std.process.Child.init(&.{ "firejail", "--version" }, std.heap.page_allocator);
+        var child = std_compat.process.Child.init(&.{ "firejail", "--version" }, std.heap.page_allocator);
         child.stderr_behavior = .Ignore;
         child.stdout_behavior = .Ignore;
         child.stdin_behavior = .Ignore;
         child.spawn() catch return false;
         const term = child.wait() catch return false;
         return switch (term) {
-            .Exited => |code| code == 0,
+            .exited => |code| code == 0,
             else => false,
         };
     }
