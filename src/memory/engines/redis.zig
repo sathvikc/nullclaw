@@ -576,6 +576,76 @@ pub const RedisMemory = struct {
         return entries.toOwnedSlice(allocator);
     }
 
+    fn implListPaged(ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory, session_id: ?[]const u8, limit: usize, offset: usize) anyerror![]MemoryEntry {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+
+        const set_key = if (category) |cat|
+            try self_.prefixedKey("cat", cat.toString())
+        else
+            try self_.prefixedSimple("keys");
+        defer self_.allocator.free(set_key);
+
+        var keys_resp = try self_.sendCommandAlloc(allocator, &.{ "SMEMBERS", set_key });
+        defer keys_resp.deinit(allocator);
+
+        const key_values = switch (keys_resp) {
+            .array => |maybe_arr| maybe_arr orelse return allocator.alloc(MemoryEntry, 0),
+            else => return allocator.alloc(MemoryEntry, 0),
+        };
+
+        var entries: std.ArrayList(MemoryEntry) = .empty;
+        errdefer {
+            for (entries.items) |*entry| entry.deinit(allocator);
+            entries.deinit(allocator);
+        }
+
+        var skipped: usize = 0;
+        for (key_values) |kv| {
+            const k = kv.asString() orelse continue;
+
+            const entry_key = try self_.prefixedKey("entry", k);
+            defer self_.allocator.free(entry_key);
+
+            var hash_resp = try self_.sendCommandAlloc(allocator, &.{ "HGETALL", entry_key });
+            defer hash_resp.deinit(allocator);
+
+            const fields = switch (hash_resp) {
+                .array => |maybe_arr| maybe_arr orelse continue,
+                else => continue,
+            };
+            if (fields.len == 0) continue;
+
+            var entry = try parseHashFields(allocator, k, fields);
+            errdefer entry.deinit(allocator);
+
+            if (session_id) |sid| {
+                if (entry.session_id) |e_sid| {
+                    if (!std.mem.eql(u8, e_sid, sid)) {
+                        entry.deinit(allocator);
+                        continue;
+                    }
+                } else {
+                    entry.deinit(allocator);
+                    continue;
+                }
+            }
+
+            if (skipped < offset) {
+                skipped += 1;
+                entry.deinit(allocator);
+                continue;
+            }
+            if (entries.items.len >= limit) {
+                entry.deinit(allocator);
+                break;
+            }
+
+            try entries.append(allocator, entry);
+        }
+
+        return entries.toOwnedSlice(allocator);
+    }
+
     fn implForget(ptr: *anyopaque, key: []const u8) anyerror!bool {
         const self_: *Self = @ptrCast(@alignCast(ptr));
 
@@ -666,6 +736,7 @@ pub const RedisMemory = struct {
         .recall = &implRecall,
         .get = &implGet,
         .list = &implList,
+        .listPaged = &implListPaged,
         .forget = &implForget,
         .count = &implCount,
         .healthCheck = &implHealthCheck,

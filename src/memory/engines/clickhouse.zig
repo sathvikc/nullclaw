@@ -870,6 +870,133 @@ const ClickHouseMemoryImpl = struct {
         return entries.toOwnedSlice(allocator);
     }
 
+    fn implListPaged(ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory, session_id: ?[]const u8, limit: usize, offset: usize) anyerror![]MemoryEntry {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+
+        var query: []u8 = undefined;
+        var params_buf: [5][2][]const u8 = undefined;
+        var param_count: usize = 0;
+        var limit_buf: [20]u8 = undefined;
+        const limit_str = try std.fmt.bufPrint(&limit_buf, "{d}", .{limit});
+        var offset_buf: [20]u8 = undefined;
+        const offset_str = try std.fmt.bufPrint(&offset_buf, "{d}", .{offset});
+
+        params_buf[param_count] = .{ "iid", self_.instance_id };
+        param_count += 1;
+        params_buf[param_count] = .{ "limit", limit_str };
+        param_count += 1;
+        params_buf[param_count] = .{ "offset", offset_str };
+        param_count += 1;
+
+        if (category) |cat| {
+            const cat_str = cat.toString();
+            if (session_id) |sid| {
+                query = try std.fmt.allocPrint(allocator,
+                    \\SELECT id, key, content, category, toString(updated_at), session_id
+                    \\FROM (
+                    \\    SELECT
+                    \\        argMax(id, tuple(version, id)) AS id,
+                    \\        key,
+                    \\        argMax(content, tuple(version, id)) AS content,
+                    \\        argMax(category, tuple(version, id)) AS category,
+                    \\        argMax(updated_at, tuple(version, id)) AS updated_at,
+                    \\        argMax(session_id, tuple(version, id)) AS session_id
+                    \\    FROM {s}.{s}
+                    \\    WHERE instance_id = {{iid:String}}
+                    \\    GROUP BY key
+                    \\)
+                    \\WHERE category = {{cat:String}} AND session_id = {{sid:String}}
+                    \\ORDER BY updated_at DESC, id DESC
+                    \\LIMIT {{limit:UInt64}} OFFSET {{offset:UInt64}}
+                , .{ self_.db_q, self_.table_q });
+                params_buf[param_count] = .{ "cat", cat_str };
+                param_count += 1;
+                params_buf[param_count] = .{ "sid", sid };
+                param_count += 1;
+            } else {
+                query = try std.fmt.allocPrint(allocator,
+                    \\SELECT id, key, content, category, toString(updated_at), session_id
+                    \\FROM (
+                    \\    SELECT
+                    \\        argMax(id, tuple(version, id)) AS id,
+                    \\        key,
+                    \\        argMax(content, tuple(version, id)) AS content,
+                    \\        argMax(category, tuple(version, id)) AS category,
+                    \\        argMax(updated_at, tuple(version, id)) AS updated_at,
+                    \\        argMax(session_id, tuple(version, id)) AS session_id
+                    \\    FROM {s}.{s}
+                    \\    WHERE instance_id = {{iid:String}}
+                    \\    GROUP BY key
+                    \\)
+                    \\WHERE category = {{cat:String}}
+                    \\ORDER BY updated_at DESC, id DESC
+                    \\LIMIT {{limit:UInt64}} OFFSET {{offset:UInt64}}
+                , .{ self_.db_q, self_.table_q });
+                params_buf[param_count] = .{ "cat", cat_str };
+                param_count += 1;
+            }
+        } else if (session_id) |sid| {
+            query = try std.fmt.allocPrint(allocator,
+                \\SELECT id, key, content, category, toString(updated_at), session_id
+                \\FROM (
+                \\    SELECT
+                \\        argMax(id, tuple(version, id)) AS id,
+                \\        key,
+                \\        argMax(content, tuple(version, id)) AS content,
+                \\        argMax(category, tuple(version, id)) AS category,
+                \\        argMax(updated_at, tuple(version, id)) AS updated_at,
+                \\        argMax(session_id, tuple(version, id)) AS session_id
+                \\    FROM {s}.{s}
+                \\    WHERE instance_id = {{iid:String}}
+                \\    GROUP BY key
+                \\)
+                \\WHERE session_id = {{sid:String}}
+                \\ORDER BY updated_at DESC, id DESC
+                \\LIMIT {{limit:UInt64}} OFFSET {{offset:UInt64}}
+            , .{ self_.db_q, self_.table_q });
+            params_buf[param_count] = .{ "sid", sid };
+            param_count += 1;
+        } else {
+            query = try std.fmt.allocPrint(allocator,
+                \\SELECT id, key, content, category, toString(updated_at), session_id
+                \\FROM (
+                \\    SELECT
+                \\        argMax(id, tuple(version, id)) AS id,
+                \\        key,
+                \\        argMax(content, tuple(version, id)) AS content,
+                \\        argMax(category, tuple(version, id)) AS category,
+                \\        argMax(updated_at, tuple(version, id)) AS updated_at,
+                \\        argMax(session_id, tuple(version, id)) AS session_id
+                \\    FROM {s}.{s}
+                \\    WHERE instance_id = {{iid:String}}
+                \\    GROUP BY key
+                \\)
+                \\ORDER BY updated_at DESC, id DESC
+                \\LIMIT {{limit:UInt64}} OFFSET {{offset:UInt64}}
+            , .{ self_.db_q, self_.table_q });
+        }
+        defer allocator.free(query);
+
+        const body = try self_.executeQuery(allocator, query, params_buf[0..param_count]);
+        defer allocator.free(body);
+
+        const rows = try parseTsvRows(allocator, body);
+        defer freeTsvRows(allocator, rows);
+
+        var entries: std.ArrayList(MemoryEntry) = .empty;
+        errdefer {
+            for (entries.items) |*entry| entry.deinit(allocator);
+            entries.deinit(allocator);
+        }
+
+        for (rows) |row| {
+            const entry = try buildEntry(allocator, row);
+            try entries.append(allocator, entry);
+        }
+
+        return entries.toOwnedSlice(allocator);
+    }
+
     fn implForget(ptr: *anyopaque, key: []const u8) anyerror!bool {
         const self_: *Self = @ptrCast(@alignCast(ptr));
 
@@ -947,6 +1074,7 @@ const ClickHouseMemoryImpl = struct {
         .recall = &implRecall,
         .get = &implGet,
         .list = &implList,
+        .listPaged = &implListPaged,
         .forget = &implForget,
         .count = &implCount,
         .healthCheck = &implHealthCheck,

@@ -420,6 +420,7 @@ pub const Memory = struct {
         get: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8) anyerror!?MemoryEntry,
         getScoped: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8) anyerror!?MemoryEntry = null,
         list: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory, session_id: ?[]const u8) anyerror![]MemoryEntry,
+        listPaged: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory, session_id: ?[]const u8, limit: usize, offset: usize) anyerror![]MemoryEntry = null,
         forget: *const fn (ptr: *anyopaque, key: []const u8) anyerror!bool,
         forgetScoped: ?*const fn (ptr: *anyopaque, key: []const u8, session_id: ?[]const u8) anyerror!bool = null,
         count: *const fn (ptr: *anyopaque) anyerror!usize,
@@ -472,6 +473,41 @@ pub const Memory = struct {
 
     pub fn list(self: Memory, allocator: std.mem.Allocator, category: ?MemoryCategory, session_id: ?[]const u8) ![]MemoryEntry {
         return self.vtable.list(self.ptr, allocator, category, session_id);
+    }
+
+    pub fn hasNativePagedList(self: Memory) bool {
+        return self.vtable.listPaged != null;
+    }
+
+    pub fn listPaged(self: Memory, allocator: std.mem.Allocator, category: ?MemoryCategory, session_id: ?[]const u8, limit: usize, offset: usize) ![]MemoryEntry {
+        if (self.vtable.listPaged) |func| {
+            return func(self.ptr, allocator, category, session_id, limit, offset);
+        }
+
+        const entries = try self.vtable.list(self.ptr, allocator, category, session_id);
+        errdefer freeEntries(allocator, entries);
+
+        if (offset >= entries.len or limit == 0) {
+            freeEntries(allocator, entries);
+            return allocator.alloc(MemoryEntry, 0);
+        }
+
+        const end = @min(entries.len, offset + limit);
+        const out_len = end - offset;
+        const paged = try allocator.alloc(MemoryEntry, out_len);
+        errdefer allocator.free(paged);
+
+        var write_idx: usize = 0;
+        for (entries, 0..) |*entry, idx| {
+            if (idx >= offset and idx < end) {
+                paged[write_idx] = entry.*;
+                write_idx += 1;
+            } else {
+                entry.deinit(allocator);
+            }
+        }
+        allocator.free(entries);
+        return paged;
     }
 
     pub fn forget(self: Memory, key: []const u8) !bool {
@@ -1602,6 +1638,157 @@ test "Memory forgetScoped fallback fails closed without native support" {
     TestMemory.forget_calls = 0;
     try std.testing.expectError(error.NotSupported, mem.forgetScoped(std.testing.allocator, "shared", "sess-a"));
     try std.testing.expectEqual(@as(usize, 0), TestMemory.forget_calls);
+}
+
+test "Memory listPaged fallback slices list output" {
+    const TestMemory = struct {
+        fn makeEntry(allocator: std.mem.Allocator, key: []const u8) !MemoryEntry {
+            return .{
+                .id = try allocator.dupe(u8, key),
+                .key = try allocator.dupe(u8, key),
+                .content = try allocator.dupe(u8, key),
+                .category = .core,
+                .timestamp = try allocator.dupe(u8, "now"),
+                .session_id = null,
+                .score = null,
+            };
+        }
+
+        fn implName(_: *anyopaque) []const u8 {
+            return "fallback";
+        }
+
+        fn implStore(_: *anyopaque, _: []const u8, _: []const u8, _: MemoryCategory, _: ?[]const u8) anyerror!void {}
+
+        fn implRecall(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: usize, _: ?[]const u8) anyerror![]MemoryEntry {
+            return allocator.alloc(MemoryEntry, 0);
+        }
+
+        fn implGet(_: *anyopaque, _: std.mem.Allocator, _: []const u8) anyerror!?MemoryEntry {
+            return null;
+        }
+
+        fn implList(_: *anyopaque, allocator: std.mem.Allocator, _: ?MemoryCategory, _: ?[]const u8) anyerror![]MemoryEntry {
+            var entries = try allocator.alloc(MemoryEntry, 4);
+            entries[0] = try makeEntry(allocator, "a");
+            entries[1] = try makeEntry(allocator, "b");
+            entries[2] = try makeEntry(allocator, "c");
+            entries[3] = try makeEntry(allocator, "d");
+            return entries;
+        }
+
+        fn implForget(_: *anyopaque, _: []const u8) anyerror!bool {
+            return true;
+        }
+
+        fn implCount(_: *anyopaque) anyerror!usize {
+            return 4;
+        }
+
+        fn implHealthCheck(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn implDeinit(_: *anyopaque) void {}
+
+        const vtable = Memory.VTable{
+            .name = &implName,
+            .store = &implStore,
+            .recall = &implRecall,
+            .get = &implGet,
+            .list = &implList,
+            .forget = &implForget,
+            .count = &implCount,
+            .healthCheck = &implHealthCheck,
+            .deinit = &implDeinit,
+        };
+    };
+
+    const mem = Memory{ .ptr = undefined, .vtable = &TestMemory.vtable };
+    const page = try mem.listPaged(std.testing.allocator, null, null, 2, 1);
+    defer freeEntries(std.testing.allocator, page);
+
+    try std.testing.expectEqual(@as(usize, 2), page.len);
+    try std.testing.expectEqualStrings("b", page[0].key);
+    try std.testing.expectEqualStrings("c", page[1].key);
+}
+
+test "Memory listPaged uses native fast path when available" {
+    const TestMemory = struct {
+        var fast_path_calls: usize = 0;
+
+        fn makeEntry(allocator: std.mem.Allocator, key: []const u8) !MemoryEntry {
+            return .{
+                .id = try allocator.dupe(u8, key),
+                .key = try allocator.dupe(u8, key),
+                .content = try allocator.dupe(u8, key),
+                .category = .core,
+                .timestamp = try allocator.dupe(u8, "now"),
+                .session_id = null,
+                .score = null,
+            };
+        }
+
+        fn implName(_: *anyopaque) []const u8 {
+            return "fast";
+        }
+
+        fn implStore(_: *anyopaque, _: []const u8, _: []const u8, _: MemoryCategory, _: ?[]const u8) anyerror!void {}
+
+        fn implRecall(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: usize, _: ?[]const u8) anyerror![]MemoryEntry {
+            return allocator.alloc(MemoryEntry, 0);
+        }
+
+        fn implGet(_: *anyopaque, _: std.mem.Allocator, _: []const u8) anyerror!?MemoryEntry {
+            return null;
+        }
+
+        fn implList(_: *anyopaque, allocator: std.mem.Allocator, _: ?MemoryCategory, _: ?[]const u8) anyerror![]MemoryEntry {
+            return allocator.alloc(MemoryEntry, 0);
+        }
+
+        fn implListPaged(_: *anyopaque, allocator: std.mem.Allocator, _: ?MemoryCategory, _: ?[]const u8, _: usize, _: usize) anyerror![]MemoryEntry {
+            fast_path_calls += 1;
+            var entries = try allocator.alloc(MemoryEntry, 1);
+            entries[0] = try makeEntry(allocator, "paged");
+            return entries;
+        }
+
+        fn implForget(_: *anyopaque, _: []const u8) anyerror!bool {
+            return true;
+        }
+
+        fn implCount(_: *anyopaque) anyerror!usize {
+            return 1;
+        }
+
+        fn implHealthCheck(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn implDeinit(_: *anyopaque) void {}
+
+        const vtable = Memory.VTable{
+            .name = &implName,
+            .store = &implStore,
+            .recall = &implRecall,
+            .get = &implGet,
+            .list = &implList,
+            .listPaged = &implListPaged,
+            .forget = &implForget,
+            .count = &implCount,
+            .healthCheck = &implHealthCheck,
+            .deinit = &implDeinit,
+        };
+    };
+
+    TestMemory.fast_path_calls = 0;
+    const mem = Memory{ .ptr = undefined, .vtable = &TestMemory.vtable };
+    const page = try mem.listPaged(std.testing.allocator, null, null, 1, 10);
+    defer freeEntries(std.testing.allocator, page);
+
+    try std.testing.expectEqual(@as(usize, 1), TestMemory.fast_path_calls);
+    try std.testing.expectEqualStrings("paged", page[0].key);
 }
 
 test "SessionStore delegates through vtable" {

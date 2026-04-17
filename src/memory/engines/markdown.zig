@@ -463,6 +463,42 @@ pub const MarkdownMemory = struct {
         return filtered.toOwnedSlice(allocator);
     }
 
+    fn implListPaged(ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory, _: ?[]const u8, limit: usize, offset: usize) anyerror![]MemoryEntry {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+
+        const all = try self_.readAllEntries(allocator);
+        defer allocator.free(all);
+
+        var paged: std.ArrayList(MemoryEntry) = .empty;
+        errdefer {
+            for (paged.items) |*e| e.deinit(allocator);
+            paged.deinit(allocator);
+        }
+
+        var skipped: usize = 0;
+        for (all) |*entry_ptr| {
+            const entry = entry_ptr.*;
+            if (category) |cat| {
+                if (!entry.category.eql(cat)) {
+                    entry_ptr.deinit(allocator);
+                    continue;
+                }
+            }
+            if (skipped < offset) {
+                skipped += 1;
+                entry_ptr.deinit(allocator);
+                continue;
+            }
+            if (paged.items.len < limit) {
+                try paged.append(allocator, entry);
+            } else {
+                entry_ptr.deinit(allocator);
+            }
+        }
+
+        return paged.toOwnedSlice(allocator);
+    }
+
     fn implForget(_: *anyopaque, _: []const u8) anyerror!bool {
         return false;
     }
@@ -502,6 +538,7 @@ pub const MarkdownMemory = struct {
         .get = &implGet,
         .getScoped = &implGetScoped,
         .list = &implList,
+        .listPaged = &implListPaged,
         .forget = &implForget,
         .forgetScoped = &implForgetScoped,
         .count = &implCount,

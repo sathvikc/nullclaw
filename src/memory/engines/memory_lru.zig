@@ -326,6 +326,41 @@ pub const InMemoryLruMemory = struct {
         return results.toOwnedSlice(allocator);
     }
 
+    fn implListPaged(ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory, session_id: ?[]const u8, limit: usize, offset: usize) anyerror![]MemoryEntry {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+
+        var results: std.ArrayList(MemoryEntry) = .empty;
+        errdefer {
+            for (results.items) |*e| e.deinit(allocator);
+            results.deinit(allocator);
+        }
+
+        var skipped: usize = 0;
+        var it = self_.entries.iterator();
+        while (it.next()) |kv| {
+            const e = kv.value_ptr.*;
+
+            if (category) |cat| {
+                if (!e.category.eql(cat)) continue;
+            }
+
+            if (session_id) |filter_sid| {
+                if (e.session_id) |esid| {
+                    if (!std.mem.eql(u8, esid, filter_sid)) continue;
+                } else continue;
+            }
+
+            if (skipped < offset) {
+                skipped += 1;
+                continue;
+            }
+            if (results.items.len >= limit) break;
+            try results.append(allocator, try cloneEntry(allocator, e));
+        }
+
+        return results.toOwnedSlice(allocator);
+    }
+
     fn implForget(ptr: *anyopaque, key: []const u8) anyerror!bool {
         const self_: *Self = @ptrCast(@alignCast(ptr));
         var keys_to_remove: std.ArrayListUnmanaged([]u8) = .empty;
@@ -384,6 +419,7 @@ pub const InMemoryLruMemory = struct {
         .get = &implGet,
         .getScoped = &implGetScoped,
         .list = &implList,
+        .listPaged = &implListPaged,
         .forget = &implForget,
         .forgetScoped = &implForgetScoped,
         .count = &implCount,

@@ -1627,7 +1627,7 @@ fn printMemoryUsage() void {
         \\                                Run runtime retrieval (keyword/hybrid)
         \\  get <key> [--session ID] [--json]
         \\                                Show a single memory entry by key
-        \\  list [--category C] [--limit N] [--session ID] [--include-internal] [--json]
+        \\  list [--category C] [--limit N] [--offset N] [--session ID] [--include-internal] [--json]
         \\                                List memory entries (default limit: 20)
         \\  store <key> <content> [--category C] [--session ID] [--json]
         \\                                Create or overwrite a memory entry
@@ -1976,6 +1976,93 @@ fn writeSkillDetailJson(
 
 fn memoryEntryVisible(include_internal: bool, entry: yc.memory.MemoryEntry) bool {
     return include_internal or !yc.memory.isInternalMemoryEntryKeyOrContent(entry.key, entry.content);
+}
+
+fn loadMemoryListPage(
+    allocator: std.mem.Allocator,
+    mem: yc.memory.Memory,
+    category: ?yc.memory.MemoryCategory,
+    session_id: ?[]const u8,
+    limit: usize,
+    offset: usize,
+    include_internal: bool,
+) ![]yc.memory.MemoryEntry {
+    if (include_internal) {
+        return mem.listPaged(allocator, category, session_id, limit, offset);
+    }
+
+    if (!mem.hasNativePagedList()) {
+        const entries = try mem.list(allocator, category, session_id);
+        errdefer yc.memory.freeEntries(allocator, entries);
+
+        var visible_seen: usize = 0;
+        var kept: std.ArrayListUnmanaged(yc.memory.MemoryEntry) = .empty;
+        errdefer {
+            for (kept.items) |*entry| entry.deinit(allocator);
+            kept.deinit(allocator);
+        }
+
+        for (entries) |*entry| {
+            if (!memoryEntryVisible(false, entry.*)) {
+                entry.deinit(allocator);
+                continue;
+            }
+            if (visible_seen < offset) {
+                visible_seen += 1;
+                entry.deinit(allocator);
+                continue;
+            }
+            if (kept.items.len < limit) {
+                try kept.append(allocator, entry.*);
+            } else {
+                entry.deinit(allocator);
+            }
+        }
+        allocator.free(entries);
+        return kept.toOwnedSlice(allocator);
+    }
+
+    var kept: std.ArrayListUnmanaged(yc.memory.MemoryEntry) = .empty;
+    errdefer {
+        for (kept.items) |*entry| entry.deinit(allocator);
+        kept.deinit(allocator);
+    }
+
+    const chunk_size = @max(limit, @as(usize, 64));
+    var raw_offset: usize = 0;
+    var visible_seen: usize = 0;
+
+    while (kept.items.len < limit) {
+        const page = try mem.listPaged(allocator, category, session_id, chunk_size, raw_offset);
+        if (page.len == 0) {
+            allocator.free(page);
+            break;
+        }
+
+        for (page) |*entry| {
+            if (!memoryEntryVisible(false, entry.*)) {
+                entry.deinit(allocator);
+                continue;
+            }
+            if (visible_seen < offset) {
+                visible_seen += 1;
+                entry.deinit(allocator);
+                continue;
+            }
+            if (kept.items.len < limit) {
+                try kept.append(allocator, entry.*);
+            } else {
+                entry.deinit(allocator);
+            }
+        }
+
+        raw_offset += page.len;
+        const short_page = page.len < chunk_size;
+        allocator.free(page);
+        if (short_page) break;
+    }
+
+    return kept.toOwnedSlice(allocator);
 }
 
 fn writeMemoryEntryJson(out: anytype, entry: yc.memory.MemoryEntry) !void {
@@ -2431,6 +2518,7 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
 
     if (std.mem.eql(u8, subcmd, "list")) {
         var limit: usize = 20;
+        var offset: usize = 0;
         var category_opt: ?yc.memory.MemoryCategory = null;
         var session_id: ?[]const u8 = null;
         var include_internal = false;
@@ -2440,7 +2528,7 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         while (i < sub_args.len) : (i += 1) {
             if (std.mem.eql(u8, sub_args[i], "--limit")) {
                 if (i + 1 >= sub_args.len) {
-                    std.debug.print("Usage: nullclaw memory list [--category C] [--limit N] [--session ID] [--include-internal] [--json]\n", .{});
+                    std.debug.print("Usage: nullclaw memory list [--category C] [--limit N] [--offset N] [--session ID] [--include-internal] [--json]\n", .{});
                     std_compat.process.exit(1);
                 }
                 i += 1;
@@ -2448,16 +2536,26 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
                     std.debug.print("Invalid --limit value: {s}\n", .{sub_args[i]});
                     std_compat.process.exit(1);
                 };
+            } else if (std.mem.eql(u8, sub_args[i], "--offset")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw memory list [--category C] [--limit N] [--offset N] [--session ID] [--include-internal] [--json]\n", .{});
+                    std_compat.process.exit(1);
+                }
+                i += 1;
+                offset = parseNonNegativeUsize(sub_args[i]) orelse {
+                    std.debug.print("Invalid --offset value: {s}\n", .{sub_args[i]});
+                    std_compat.process.exit(1);
+                };
             } else if (std.mem.eql(u8, sub_args[i], "--category")) {
                 if (i + 1 >= sub_args.len) {
-                    std.debug.print("Usage: nullclaw memory list [--category C] [--limit N] [--session ID] [--include-internal] [--json]\n", .{});
+                    std.debug.print("Usage: nullclaw memory list [--category C] [--limit N] [--offset N] [--session ID] [--include-internal] [--json]\n", .{});
                     std_compat.process.exit(1);
                 }
                 i += 1;
                 category_opt = yc.memory.MemoryCategory.fromString(sub_args[i]);
             } else if (std.mem.eql(u8, sub_args[i], "--session")) {
                 if (i + 1 >= sub_args.len) {
-                    std.debug.print("Usage: nullclaw memory list [--category C] [--limit N] [--session ID] [--include-internal] [--json]\n", .{});
+                    std.debug.print("Usage: nullclaw memory list [--category C] [--limit N] [--offset N] [--session ID] [--include-internal] [--json]\n", .{});
                     std_compat.process.exit(1);
                 }
                 i += 1;
@@ -2472,30 +2570,23 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             }
         }
 
-        const entries = mem_rt.memory.list(allocator, category_opt, session_id) catch |err| {
-            std.debug.print("memory list failed: {s}\n", .{@errorName(err)});
+        const entries = loadMemoryListPage(allocator, mem_rt.memory, category_opt, session_id, limit, offset, include_internal) catch |err| {
+            std.debug.print("memory paged list failed: {s}\n", .{@errorName(err)});
             std_compat.process.exit(1);
         };
         defer yc.memory.freeEntries(allocator, entries);
 
-        var visible_total: usize = 0;
-        for (entries) |entry| {
-            if (!memoryEntryVisible(include_internal, entry)) continue;
-            visible_total += 1;
-        }
-        const shown = @min(limit, visible_total);
+        const shown = entries.len;
 
         if (json_mode) {
-            writeMemoryListJson(entries, shown, include_internal);
+            writeMemoryListJson(entries, shown, true);
         } else {
-            std.debug.print("Memory entries: showing {d}/{d}\n", .{ shown, visible_total });
+            std.debug.print("Memory entries: showing {d} from offset {d}\n", .{ shown, offset });
             var written: usize = 0;
             for (entries) |e| {
-                if (!memoryEntryVisible(include_internal, e)) continue;
-                if (written >= shown) break;
                 const preview = util.previewUtf8(e.content, 120);
                 std.debug.print("  {d}. {s} [{s}] {s}\n     {s}{s}\n", .{
-                    written + 1,
+                    offset + written + 1,
                     e.key,
                     e.category.toString(),
                     e.timestamp,
@@ -5557,6 +5648,88 @@ test "writeMemoryEntryJson renders nullable session ids" {
         "{\"key\":\"fact\",\"category\":\"conversation\",\"timestamp\":\"2026-04-17T00:00:00Z\",\"content\":\"hello\",\"session_id\":null}",
         writer.buffered(),
     );
+}
+
+test "loadMemoryListPage skips internal entries before applying visible offset" {
+    const TestMemory = struct {
+        fn makeEntry(allocator: std.mem.Allocator, key: []const u8, content: []const u8) !yc.memory.MemoryEntry {
+            return .{
+                .id = try allocator.dupe(u8, key),
+                .key = try allocator.dupe(u8, key),
+                .category = .core,
+                .timestamp = try allocator.dupe(u8, "2026-04-17T00:00:00Z"),
+                .content = try allocator.dupe(u8, content),
+                .session_id = null,
+            };
+        }
+
+        fn implName(_: *anyopaque) []const u8 {
+            return "paged";
+        }
+
+        fn implStore(_: *anyopaque, _: []const u8, _: []const u8, _: yc.memory.MemoryCategory, _: ?[]const u8) anyerror!void {}
+
+        fn implRecall(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: usize, _: ?[]const u8) anyerror![]yc.memory.MemoryEntry {
+            return allocator.alloc(yc.memory.MemoryEntry, 0);
+        }
+
+        fn implGet(_: *anyopaque, _: std.mem.Allocator, _: []const u8) anyerror!?yc.memory.MemoryEntry {
+            return null;
+        }
+
+        fn implList(_: *anyopaque, allocator: std.mem.Allocator, _: ?yc.memory.MemoryCategory, _: ?[]const u8) anyerror![]yc.memory.MemoryEntry {
+            return allocator.alloc(yc.memory.MemoryEntry, 0);
+        }
+
+        fn implListPaged(_: *anyopaque, allocator: std.mem.Allocator, _: ?yc.memory.MemoryCategory, _: ?[]const u8, limit: usize, offset: usize) anyerror![]yc.memory.MemoryEntry {
+            const all = [_][2][]const u8{
+                .{ "__bootstrap.prompt.AGENTS.md", "bootstrap" },
+                .{ "visible-1", "first visible" },
+                .{ "visible-2", "second visible" },
+            };
+            if (offset >= all.len) return allocator.alloc(yc.memory.MemoryEntry, 0);
+            const end = @min(all.len, offset + limit);
+            var entries = try allocator.alloc(yc.memory.MemoryEntry, end - offset);
+            for (all[offset..end], 0..) |pair, idx| {
+                entries[idx] = try makeEntry(allocator, pair[0], pair[1]);
+            }
+            return entries;
+        }
+
+        fn implForget(_: *anyopaque, _: []const u8) anyerror!bool {
+            return false;
+        }
+
+        fn implCount(_: *anyopaque) anyerror!usize {
+            return 3;
+        }
+
+        fn implHealthCheck(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn implDeinit(_: *anyopaque) void {}
+
+        const vtable = yc.memory.Memory.VTable{
+            .name = &implName,
+            .store = &implStore,
+            .recall = &implRecall,
+            .get = &implGet,
+            .list = &implList,
+            .listPaged = &implListPaged,
+            .forget = &implForget,
+            .count = &implCount,
+            .healthCheck = &implHealthCheck,
+            .deinit = &implDeinit,
+        };
+    };
+
+    const mem = yc.memory.Memory{ .ptr = undefined, .vtable = &TestMemory.vtable };
+    const page = try loadMemoryListPage(std.testing.allocator, mem, null, null, 1, 1, false);
+    defer yc.memory.freeEntries(std.testing.allocator, page);
+
+    try std.testing.expectEqual(@as(usize, 1), page.len);
+    try std.testing.expectEqualStrings("visible-2", page[0].key);
 }
 
 test "appendMemoryStatsJson renders runtime memory stats payload" {
