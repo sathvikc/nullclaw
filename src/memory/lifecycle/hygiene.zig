@@ -49,7 +49,7 @@ pub const HygieneConfig = struct {
 /// Optional callback sink used to synchronize preserved chunks into vector storage.
 pub const PreserveSyncHook = struct {
     ptr: *anyopaque,
-    callback: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8, content: []const u8) void,
+    callback: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8, content: []const u8, session_id: ?[]const u8) void,
 };
 
 /// Run memory hygiene if the cadence window has elapsed.
@@ -237,7 +237,7 @@ fn preserveArchiveFile(
         defer allocator.free(wrapped);
         try mem.store(key, wrapped, ARCHIVE_CATEGORY, null);
         if (preserve_sync_hook) |hook| {
-            hook.callback(hook.ptr, allocator, key, wrapped);
+            hook.callback(hook.ptr, allocator, key, wrapped, null);
         }
     }
 }
@@ -247,6 +247,7 @@ fn preserveConversationEntry(
     mem: Memory,
     key_prefix: []const u8,
     content: []const u8,
+    session_id: ?[]const u8,
     preserve_sync_hook: ?PreserveSyncHook,
 ) !void {
     const chunks = try chunker.chunkMarkdown(allocator, content, ARCHIVE_CHUNK_MAX_TOKENS);
@@ -262,9 +263,9 @@ fn preserveConversationEntry(
             .{ key_prefix, idx + 1, chunks.len, chunk.content },
         );
         defer allocator.free(wrapped);
-        try mem.store(archive_key, wrapped, ARCHIVE_CATEGORY, null);
+        try mem.store(archive_key, wrapped, ARCHIVE_CATEGORY, session_id);
         if (preserve_sync_hook) |hook| {
-            hook.callback(hook.ptr, allocator, archive_key, wrapped);
+            hook.callback(hook.ptr, allocator, archive_key, wrapped, session_id);
         }
     }
 }
@@ -301,7 +302,7 @@ fn pruneConversationRowsWithPreserve(
             if (preserve_before_forget) {
                 const preserve_key_prefix = try std.fmt.allocPrint(allocator, "archive:conversation:{s}", .{entry.key});
                 defer allocator.free(preserve_key_prefix);
-                preserveConversationEntry(allocator, mem, preserve_key_prefix, entry.content, preserve_sync_hook) catch |err| {
+                preserveConversationEntry(allocator, mem, preserve_key_prefix, entry.content, entry.session_id, preserve_sync_hook) catch |err| {
                     log.warn("skipping prune for '{s}' because preservation failed: {}", .{ entry.key, err });
                     continue;
                 };
@@ -596,4 +597,38 @@ test "runIfDue preserves conversation rows before prune when enabled" {
         }
     }
     try std.testing.expect(found);
+}
+
+test "runIfDue preserves pruned conversation chunks under original session scope" {
+    if (!build_options.enable_sqlite) return;
+
+    var mem_impl = try sqlite_mod.SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem_impl.deinit();
+    const mem = mem_impl.memory();
+
+    try mem.store("autosave_user_1700000000000000000", "scoped conversation message", .conversation, "sess-a");
+
+    const report = runIfDue(std.testing.allocator, .{
+        .hygiene_enabled = true,
+        .archive_after_days = 0,
+        .purge_after_days = 0,
+        .conversation_retention_days = 1,
+        .preserve_before_purge = true,
+        .workspace_dir = "/tmp",
+    }, mem, null);
+
+    try std.testing.expectEqual(@as(u64, 1), report.pruned_conversation_rows);
+
+    const scoped_preserved = try mem.list(std.testing.allocator, .{ .custom = "archive" }, "sess-a");
+    defer root.freeEntries(std.testing.allocator, scoped_preserved);
+    try std.testing.expect(scoped_preserved.len > 0);
+
+    for (scoped_preserved) |entry| {
+        try std.testing.expect(entry.session_id != null);
+        try std.testing.expectEqualStrings("sess-a", entry.session_id.?);
+    }
+
+    const other_scope = try mem.list(std.testing.allocator, .{ .custom = "archive" }, "sess-b");
+    defer root.freeEntries(std.testing.allocator, other_scope);
+    try std.testing.expectEqual(@as(usize, 0), other_scope.len);
 }

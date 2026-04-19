@@ -877,13 +877,14 @@ fn syncPreservedChunkToVector(
     allocator: std.mem.Allocator,
     key: []const u8,
     content: []const u8,
+    session_id: ?[]const u8,
 ) void {
     const ctx: *HygienePreserveSyncCtx = @ptrCast(@alignCast(ctx_ptr));
     syncVectorUpsertWithComponents(
         allocator,
         key,
         content,
-        null,
+        session_id,
         ctx.outbox,
         ctx.embed_provider,
         ctx.vector_store,
