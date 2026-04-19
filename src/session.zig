@@ -1599,6 +1599,14 @@ pub const SessionManager = struct {
         return self.processMessageStreaming(session_key, content, conversation_context, null);
     }
 
+    fn lockSessionForTurn(session: *Session) void {
+        if (session.mutex.tryLock()) return;
+        if (session.turn_running.load(.acquire)) {
+            session.agent.requestInterrupt();
+        }
+        session.mutex.lock();
+    }
+
     /// Handle a slash command against the live session without invoking the LLM turn loop.
     /// Used for transport-driven local UIs such as Telegram callback menus.
     pub fn handleLocalSlashCommand(
@@ -1609,7 +1617,7 @@ pub const SessionManager = struct {
     ) !?[]const u8 {
         const session = try self.getOrCreate(session_key);
 
-        session.mutex.lock();
+        lockSessionForTurn(session);
         defer session.mutex.unlock();
         session.turn_running.store(true, .release);
         defer {
@@ -1689,7 +1697,7 @@ pub const SessionManager = struct {
 
         const session = try self.getOrCreate(session_key);
 
-        session.mutex.lock();
+        lockSessionForTurn(session);
         defer session.mutex.unlock();
         session.turn_running.store(true, .release);
         defer {
@@ -3563,6 +3571,50 @@ test "requestTurnInterrupt returns active tool snapshot when available" {
     try testing.expect(res.requested);
     try testing.expect(res.active_tool != null);
     try testing.expectEqualStrings("shell", res.active_tool.?);
+}
+
+test "lockSessionForTurn requests interrupt when turn is already running" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("interrupt:contention");
+    session.turn_running.store(true, .release);
+    defer session.turn_running.store(false, .release);
+    session.agent.clearInterruptRequest();
+
+    session.mutex.lock();
+    var session_unlocked = false;
+    defer if (!session_unlocked) session.mutex.unlock();
+
+    const Worker = struct {
+        const Ctx = struct {
+            session: *Session,
+        };
+
+        fn run(ctx: Ctx) void {
+            SessionManager.lockSessionForTurn(ctx.session);
+            ctx.session.mutex.unlock();
+        }
+    };
+
+    const ctx = Worker.Ctx{ .session = session };
+    var thread = try std.Thread.spawn(.{}, Worker.run, .{ctx});
+    var thread_joined = false;
+    defer if (!thread_joined) thread.join();
+
+    var attempts: usize = 0;
+    while (attempts < 100 and !session.agent.interrupt_requested.load(.acquire)) : (attempts += 1) {
+        std_compat.thread.sleep(2 * std.time.ns_per_ms);
+    }
+    // Regression (#832): a follow-up turn waiting on the same session lock must signal interruption.
+    try testing.expect(session.agent.interrupt_requested.load(.acquire));
+
+    session.mutex.unlock();
+    session_unlocked = true;
+    thread.join();
+    thread_joined = true;
 }
 
 // ---------------------------------------------------------------------------
