@@ -302,7 +302,7 @@ pub const Server = struct {
             switch (posix.errno(rc)) {
                 .SUCCESS => {
                     const accepted_fd: posix.fd_t = @intCast(rc);
-                    errdefer posix.system.close(accepted_fd);
+                    errdefer _ = posix.system.close(accepted_fd);
                     if (builtin.os.tag != .linux) try setCloseOnExec(accepted_fd);
                     break accepted_fd;
                 },
