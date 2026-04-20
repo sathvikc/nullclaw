@@ -47,8 +47,8 @@ pub const Stream = struct {
     pub const Handle = IoNet.Socket.Handle;
     pub const Reader = IoNet.Stream.Reader;
     pub const Writer = IoNet.Stream.Writer;
-    pub const ReadError = IoNet.Stream.Reader.Error || error{WouldBlock};
-    pub const WriteError = IoNet.Stream.Writer.Error;
+    pub const ReadError = IoNet.Stream.Reader.Error || error{ WouldBlock, Unexpected };
+    pub const WriteError = IoNet.Stream.Writer.Error || error{Unexpected};
 
     fn toInner(self: Stream) IoNet.Stream {
         return .{
@@ -72,25 +72,49 @@ pub const Stream = struct {
     }
 
     pub fn read(self: Stream, buffer: []u8) ReadError!usize {
-        var stream_reader = self.toInner().reader(shared.io(), &[_]u8{});
-        return stream_reader.interface.readSliceShort(buffer) catch |err| switch (err) {
-            error.ReadFailed => return stream_reader.err orelse error.Unexpected,
-        };
+        // Direct posix read — avoids creating a new stream_reader each call
+        // with empty internal buffer, which caused HTTP reads to hang
+        // silently (gateway accept loop appeared responsive but never
+        // returned data to higher-level request parsers).
+        if (comptime builtin.os.tag == .windows) {
+            var stream_reader = self.toInner().reader(shared.io(), &[_]u8{});
+            return stream_reader.interface.readSliceShort(buffer) catch |err| switch (err) {
+                error.ReadFailed => return stream_reader.err orelse error.Unexpected,
+            };
+        }
+        while (true) {
+            const rc = posix.system.read(self.handle, buffer.ptr, buffer.len);
+            switch (posix.errno(rc)) {
+                .SUCCESS => return @intCast(rc),
+                .INTR => continue,
+                .AGAIN => return error.WouldBlock,
+                else => |err| return posix.unexpectedErrno(err),
+            }
+        }
     }
 
     pub fn write(self: Stream, bytes: []const u8) WriteError!usize {
-        var stream_writer = self.toInner().writer(shared.io(), &[_]u8{});
-        stream_writer.interface.writeAll(bytes) catch |err| switch (err) {
-            error.WriteFailed => return stream_writer.err orelse error.Unexpected,
-        };
-        return bytes.len;
+        if (comptime builtin.os.tag == .windows) {
+            var stream_writer = self.toInner().writer(shared.io(), &[_]u8{});
+            stream_writer.interface.writeAll(bytes) catch |err| switch (err) {
+                error.WriteFailed => return stream_writer.err orelse error.Unexpected,
+            };
+            return bytes.len;
+        }
+        var total: usize = 0;
+        while (total < bytes.len) {
+            const rc = posix.system.write(self.handle, bytes.ptr + total, bytes.len - total);
+            switch (posix.errno(rc)) {
+                .SUCCESS => total += @intCast(rc),
+                .INTR => continue,
+                else => |err| return posix.unexpectedErrno(err),
+            }
+        }
+        return total;
     }
 
     pub fn writeAll(self: Stream, bytes: []const u8) WriteError!void {
-        var stream_writer = self.toInner().writer(shared.io(), &[_]u8{});
-        stream_writer.interface.writeAll(bytes) catch |err| switch (err) {
-            error.WriteFailed => return stream_writer.err orelse error.Unexpected,
-        };
+        _ = try self.write(bytes);
     }
 
     pub fn shutdown(self: Stream, how: IoNet.ShutdownHow) IoNet.ShutdownError!void {
