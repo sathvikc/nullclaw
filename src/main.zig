@@ -292,7 +292,9 @@ fn agentHelpRequested(args: []const []const u8) bool {
             std.mem.eql(u8, arg, "--session") or
             std.mem.eql(u8, arg, "--provider") or
             std.mem.eql(u8, arg, "--model") or
-            std.mem.eql(u8, arg, "--temperature"))
+            std.mem.eql(u8, arg, "--temperature") or
+            std.mem.eql(u8, arg, "--agent") or
+            std.mem.eql(u8, arg, "--workspace"))
         {
             if (i + 1 < args.len) i += 1;
         }
@@ -5171,6 +5173,16 @@ test "agentHelpRequested ignores message value that matches help flag" {
 
 test "agentHelpRequested ignores session value that matches short help flag" {
     const args = [_][]const u8{ "--session", "-h" };
+    try std.testing.expect(!agentHelpRequested(&args));
+}
+
+test "agentHelpRequested ignores workspace value that matches help flag" {
+    const args = [_][]const u8{ "--workspace", "--help" };
+    try std.testing.expect(!agentHelpRequested(&args));
+}
+
+test "agentHelpRequested ignores agent value that matches help flag" {
+    const args = [_][]const u8{ "--agent", "--help" };
     try std.testing.expect(!agentHelpRequested(&args));
 }
 
