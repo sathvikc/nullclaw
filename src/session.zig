@@ -2246,6 +2246,23 @@ const DeltaCollector = struct {
     }
 };
 
+const ProgressCollector = struct {
+    count: usize = 0,
+    last_text_buf: [64]u8 = undefined,
+    last_text_len: usize = 0,
+
+    fn onEvent(ctx_ptr: *anyopaque, hint: agent_mod.ProgressHint) void {
+        const self: *ProgressCollector = @ptrCast(@alignCast(ctx_ptr));
+        self.count += 1;
+        self.last_text_len = @min(hint.text.len, self.last_text_buf.len);
+        @memcpy(self.last_text_buf[0..self.last_text_len], hint.text[0..self.last_text_len]);
+    }
+
+    fn lastText(self: *const ProgressCollector) []const u8 {
+        return self.last_text_buf[0..self.last_text_len];
+    }
+};
+
 const ProbeTool = struct {
     pub const tool_name = "probe";
     pub const tool_description = "Test probe tool";
@@ -3628,6 +3645,47 @@ test "processMessageStreaming forwards provider deltas" {
 
     try testing.expectEqualStrings("streaming reply", resp);
     try testing.expectEqualStrings("streaming reply", collector.data.items);
+}
+
+test "processMessageStreaming forwards tool progress hints" {
+    var provider = SummaryFailureProvider{};
+    var probe_tool = ProbeTool{};
+    const tools = [_]Tool{probe_tool.tool()};
+    const cfg = testConfig();
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        provider.provider(),
+        &tools,
+        null,
+        noop.observer(),
+        null,
+        null,
+    );
+    defer sm.deinit();
+
+    const session_key = "progress:tool";
+    const session = try sm.getOrCreate(session_key);
+    session.agent.max_tool_iterations = 1;
+
+    var collector = ProgressCollector{};
+    const resp = try sm.processMessageStreaming(
+        session_key,
+        "run probe",
+        null,
+        null,
+        .{
+            .callback = ProgressCollector.onEvent,
+            .ctx = @ptrCast(&collector),
+        },
+    );
+    defer testing.allocator.free(resp);
+
+    // Regression: A2A streaming depends on this sink to observe tool-call starts.
+    try testing.expectEqual(@as(usize, 1), collector.count);
+    try testing.expectEqualStrings("probe", collector.lastText());
 }
 
 test "processMessage refreshes system prompt when conversation context is cleared" {

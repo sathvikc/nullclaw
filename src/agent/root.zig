@@ -57,7 +57,7 @@ pub fn estimate_text_tokens(text: []const u8) u32 {
 
 // ─── Progress hints ──────────────────────────────────────────────────────────
 
-/// Human-readable progress hint emitted during a turn (e.g. "Calling tool: shell").
+/// Progress hint emitted during a turn. For tool-call starts, text is the tool name.
 pub const ProgressHint = struct {
     text: []const u8,
 };
@@ -7467,6 +7467,8 @@ test "Agent streaming fields default to null" {
 
     try std.testing.expect(agent.stream_callback == null);
     try std.testing.expect(agent.stream_ctx == null);
+    try std.testing.expect(agent.progress_callback == null);
+    try std.testing.expect(agent.progress_ctx == null);
 }
 
 // ── Bug regression tests ─────────────────────────────────────────

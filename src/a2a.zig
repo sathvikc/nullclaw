@@ -542,8 +542,13 @@ pub const SseStreamCtx = struct {
     }
 };
 
+const StatusMessage = struct {
+    prefix: []const u8 = "",
+    text: []const u8,
+};
+
 /// Context for forwarding agent progress hints as intermediate SSE status-update events.
-pub const A2aProgressCtx = struct {
+const A2aProgressCtx = struct {
     sse_ctx: *SseStreamCtx,
 
     fn progressCallback(ctx: *anyopaque, hint: agent_mod.ProgressHint) void {
@@ -553,6 +558,7 @@ pub const A2aProgressCtx = struct {
             self.sse_ctx.request_id,
             self.sse_ctx.task_id,
             self.sse_ctx.context_id,
+            std_compat.time.timestamp(),
             hint.text,
         ) catch return;
         defer self.sse_ctx.allocator.free(data);
@@ -570,25 +576,19 @@ fn buildProgressHintEvent(
     request_id: []const u8,
     task_id: []const u8,
     context_id: []const u8,
+    updated_at: i64,
     tool_name: []const u8,
 ) ![]u8 {
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer buf.deinit(allocator);
-    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
-    const w = &buf_writer.writer;
-
-    try w.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
-    try w.writeAll(request_id);
-    try w.writeAll(",\"result\":{\"kind\":\"status-update\",\"taskId\":\"");
-    try gateway.jsonEscapeInto(w, task_id);
-    try w.writeAll("\",\"contextId\":\"");
-    try gateway.jsonEscapeInto(w, context_id);
-    try w.writeAll("\",\"status\":{\"state\":\"working\",\"message\":{\"role\":\"agent\",\"parts\":[{\"kind\":\"text\",\"text\":\"Calling tool: ");
-    try gateway.jsonEscapeInto(w, tool_name);
-    try w.writeAll("\"}]}},\"final\":false}}");
-
-    buf = buf_writer.toArrayList();
-    return buf.toOwnedSlice(allocator);
+    return buildStatusUpdateEvent(
+        allocator,
+        request_id,
+        task_id,
+        context_id,
+        .working,
+        updated_at,
+        .{ .prefix = "Calling tool: ", .text = tool_name },
+        false,
+    );
 }
 
 /// Handle a streaming JSON-RPC request by writing SSE events directly to the TCP stream.
@@ -647,7 +647,7 @@ pub fn handleStreamingRpc(
         defer if (current_task) |*snapshot| snapshot.deinit(allocator);
         const current_snapshot = current_task orelse return;
         if (current_snapshot.state == .canceled) {
-            const final_event = buildStatusUpdateEvent(allocator, request_id, current_snapshot.id, current_snapshot.context_id, current_snapshot.state, current_snapshot.updated_at, true) catch return;
+            const final_event = buildStatusUpdateEvent(allocator, request_id, current_snapshot.id, current_snapshot.context_id, current_snapshot.state, current_snapshot.updated_at, null, true) catch return;
             defer allocator.free(final_event);
             stream.writeAll("data: ") catch return;
             stream.writeAll(final_event) catch return;
@@ -675,7 +675,7 @@ pub fn handleStreamingRpc(
         defer if (failed_task) |*snapshot| snapshot.deinit(allocator);
         if (failed_task) |snapshot| {
             if (snapshot.state == .canceled) {
-                const final_event = buildStatusUpdateEvent(allocator, request_id, snapshot.id, snapshot.context_id, snapshot.state, snapshot.updated_at, true) catch return;
+                const final_event = buildStatusUpdateEvent(allocator, request_id, snapshot.id, snapshot.context_id, snapshot.state, snapshot.updated_at, null, true) catch return;
                 defer allocator.free(final_event);
                 sse_ctx.writeSseEvent(final_event);
             } else {
@@ -692,7 +692,7 @@ pub fn handleStreamingRpc(
     defer if (final_task) |*snapshot| snapshot.deinit(allocator);
     const final_snapshot = final_task orelse return;
 
-    const final_event = buildStatusUpdateEvent(allocator, request_id, final_snapshot.id, final_snapshot.context_id, final_snapshot.state, final_snapshot.updated_at, true) catch return;
+    const final_event = buildStatusUpdateEvent(allocator, request_id, final_snapshot.id, final_snapshot.context_id, final_snapshot.state, final_snapshot.updated_at, null, true) catch return;
     defer allocator.free(final_event);
     sse_ctx.writeSseEvent(final_event);
 }
@@ -1529,6 +1529,7 @@ fn buildResubscribeStatusEvent(
         context_id,
         state,
         updated_at,
+        null,
         isTerminalState(state),
     );
 }
@@ -1571,6 +1572,7 @@ fn buildStatusUpdateEvent(
     context_id: []const u8,
     state: TaskState,
     updated_at: i64,
+    message: ?StatusMessage,
     final: bool,
 ) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -1590,7 +1592,14 @@ fn buildStatusUpdateEvent(
     try w.writeAll(state.jsonName());
     try w.writeAll("\",\"timestamp\":\"");
     try w.writeAll(timestamp);
-    try w.writeAll("\"},\"final\":");
+    try w.writeAll("\"");
+    if (message) |msg| {
+        try w.writeAll(",\"message\":{\"role\":\"agent\",\"parts\":[{\"kind\":\"text\",\"text\":\"");
+        try gateway.jsonEscapeInto(w, msg.prefix);
+        try gateway.jsonEscapeInto(w, msg.text);
+        try w.writeAll("\"}]}");
+    }
+    try w.writeAll("},\"final\":");
     try w.writeAll(if (final) "true" else "false");
     try w.writeAll("}}");
 
@@ -2699,16 +2708,19 @@ test "handleJsonRpc returns error for CreateTaskPushNotificationConfig alias" {
 }
 
 test "buildProgressHintEvent emits working status-update with tool name" {
+    // Regression: tool progress hints should reuse the normal status-update envelope.
     const data = try buildProgressHintEvent(
         testing.allocator,
         "\"req-1\"",
         "task-abc",
         "ctx-xyz",
+        123,
         "shell",
     );
     defer testing.allocator.free(data);
 
     try testing.expect(std.mem.indexOf(u8, data, "\"state\":\"working\"") != null);
+    try testing.expect(std.mem.indexOf(u8, data, "\"timestamp\":\"1970-01-01T00:02:03Z\"") != null);
     try testing.expect(std.mem.indexOf(u8, data, "Calling tool: shell") != null);
     try testing.expect(std.mem.indexOf(u8, data, "\"final\":false") != null);
     try testing.expect(std.mem.indexOf(u8, data, "task-abc") != null);
@@ -2720,6 +2732,7 @@ test "buildProgressHintEvent escapes special chars in tool name" {
         "\"req-2\"",
         "task-1",
         "ctx-1",
+        123,
         "tool\"with\"quotes",
     );
     defer testing.allocator.free(data);

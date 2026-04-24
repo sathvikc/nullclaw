@@ -977,6 +977,17 @@ pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provide
     try stdout.flush();
 }
 
+fn printKeyWriteFailedHint(out: *std.Io.Writer, config_path: []const u8) !void {
+    try out.print(
+        "\n  Error: could not write encryption key to {s}.\n" ++
+            "  This usually means the config directory is not writable by the current user.\n" ++
+            "  In Docker: run `docker compose run --rm --user root agent chown -R 65534:65534 /nullclaw-data`\n" ++
+            "  then retry onboard. Alternatively, set `\"secrets\": {{\"encrypt\": false}}` in config.json\n" ++
+            "  to disable at-rest encryption (not recommended for production).\n",
+        .{std_compat.fs.path.dirname(config_path) orelse config_path},
+    );
+}
+
 /// Main entry point — called from main.zig as `onboard.run(allocator)`.
 pub fn run(allocator: std.mem.Allocator) !void {
     return runWizard(allocator);
@@ -2425,16 +2436,9 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     // Save config
     cfg.save() catch |err| {
         if (err == error.KeyWriteFailed) {
-            try out.print(
-                "\n  Error: could not write encryption key to {s}.\n" ++
-                    "  This usually means the config directory is not writable by the current user.\n" ++
-                    "  In Docker: run `docker compose run --rm --user root agent chown -R 65534:65534 /nullclaw-data`\n" ++
-                    "  then retry onboard. Alternatively, set `\"secrets\": {{\"encrypt\": false}}` in config.json\n" ++
-                    "  to disable at-rest encryption (not recommended for production).\n",
-                .{std_compat.fs.path.dirname(cfg.config_path) orelse cfg.config_path},
-            );
+            try printKeyWriteFailedHint(out, cfg.config_path);
             try out.flush();
-            return;
+            return err;
         }
         return err;
     };
@@ -5018,4 +5022,18 @@ test "parseModelIds sorts alphabetically when no free suffix is present" {
     try std.testing.expectEqualStrings("a-model", models[0]);
     try std.testing.expectEqualStrings("m-model", models[1]);
     try std.testing.expectEqualStrings("z-model", models[2]);
+}
+
+test "printKeyWriteFailedHint includes config dir and docker fix" {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &buf);
+
+    // Regression: KeyWriteFailed during onboard must leave an actionable recovery hint.
+    try printKeyWriteFailedHint(&buf_writer.writer, "/nullclaw-data/config.json");
+    buf = buf_writer.toArrayList();
+
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "could not write encryption key to /nullclaw-data") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "chown -R 65534:65534 /nullclaw-data") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"secrets\": {\"encrypt\": false}") != null);
 }
