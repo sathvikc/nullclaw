@@ -18,24 +18,36 @@ const splitPrimaryModelRef = config_mod.splitPrimaryModelRef;
 /// Parse a JSON array of strings into an allocated slice.
 pub fn parseStringArray(allocator: std.mem.Allocator, arr: std.json.Array) ![]const []const u8 {
     var list: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (list.items) |item| allocator.free(item);
+        list.deinit(allocator);
+    }
+
     try list.ensureTotalCapacity(allocator, @intCast(arr.items.len));
     for (arr.items) |item| {
         if (item == .string) {
-            try list.append(allocator, try allocator.dupe(u8, item.string));
+            const owned = try allocator.dupe(u8, item.string);
+            var item_owned = true;
+            errdefer if (item_owned) allocator.free(owned);
+
+            try list.append(allocator, owned);
+            item_owned = false;
         }
     }
     return try list.toOwnedSlice(allocator);
 }
 
+fn freeToolCustomization(allocator: std.mem.Allocator, item: types.ToolCustomization) void {
+    allocator.free(item.name);
+    if (item.system_prompt) |p| allocator.free(p);
+    for (item.triggers) |t| allocator.free(t);
+    allocator.free(item.triggers);
+}
+
 fn parseToolCustomizationArray(allocator: std.mem.Allocator, arr: std.json.Array) ![]const types.ToolCustomization {
     var list: std.ArrayListUnmanaged(types.ToolCustomization) = .empty;
     errdefer {
-        for (list.items) |item| {
-            allocator.free(item.name);
-            if (item.system_prompt) |p| allocator.free(p);
-            for (item.triggers) |t| allocator.free(t);
-            allocator.free(item.triggers);
-        }
+        for (list.items) |item| freeToolCustomization(allocator, item);
         list.deinit(allocator);
     }
 
@@ -48,6 +60,8 @@ fn parseToolCustomizationArray(allocator: std.mem.Allocator, arr: std.json.Array
         var cust = types.ToolCustomization{
             .name = try allocator.dupe(u8, name_val.string),
         };
+        var cust_owned = true;
+        errdefer if (cust_owned) freeToolCustomization(allocator, cust);
 
         if (item.object.get("system_prompt")) |v| {
             if (v == .string) cust.system_prompt = try allocator.dupe(u8, v.string);
@@ -63,6 +77,7 @@ fn parseToolCustomizationArray(allocator: std.mem.Allocator, arr: std.json.Array
         }
 
         try list.append(allocator, cust);
+        cust_owned = false;
     }
     return try list.toOwnedSlice(allocator);
 }
