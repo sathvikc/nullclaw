@@ -860,7 +860,7 @@ Implement a vtable interface, submit a PR:
 - New `Tunnel` -> `src/tunnel.zig`
 - New `Sandbox` backend -> `src/security/`
 - New `Peripheral` -> `src/peripherals.zig`
-- New `Skill` -> `~/.nullclaw/workspace/skills/<name>/`
+- New `Skill` -> `~/.nullclaw/workspace/skills/<name>/` or `~/.nullclaw/workspace/skills/<category>/<name>/`
 
 ## Chinese Docs (中文文档)
 

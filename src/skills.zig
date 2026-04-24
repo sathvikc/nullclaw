@@ -11,7 +11,9 @@ const skillforge = @import("skillforge.zig");
 
 // Skills — user-defined capabilities loaded from disk.
 //
-// Each skill lives in ~/.nullclaw/workspace/skills/<name>/ with:
+// Skills live under ~/.nullclaw/workspace/skills/, either directly as
+// skills/<name>/ or one level below a category directory as skills/<category>/<name>/.
+// Each skill directory uses:
 //   - SKILL.toml  — preferred manifest format (zeroclaw-compatible)
 //   - skill.json  — legacy manifest format (optional)
 //   - SKILL.md    — instruction text
@@ -709,7 +711,8 @@ fn checkBinaryExists(allocator: std.mem.Allocator, bin_name: []const u8) bool {
 
 // ── Listing ─────────────────────────────────────────────────────
 
-/// Scan workspace_dir/skills/ for subdirectories, loading each as a Skill.
+/// Scan workspace_dir/skills/ for direct skill directories and one level of
+/// category subdirectories, loading each discovered entry as a Skill.
 /// Returns owned slice; caller must free with freeSkills().
 pub fn listSkills(allocator: std.mem.Allocator, workspace_dir: []const u8, observer: ?observability.Observer) ![]Skill {
     const skills_dir_path = try std.fmt.allocPrint(allocator, "{s}/skills", .{workspace_dir});
@@ -738,9 +741,14 @@ pub fn listSkills(allocator: std.mem.Allocator, workspace_dir: []const u8, obser
 
         if (loadSkill(allocator, sub_path, observer)) |skill| {
             try skills_list.append(allocator, skill);
-        } else |_| {
-            // No valid manifest — treat as a category directory and scan one level deeper.
-            try scanCategoryDir(allocator, sub_path, observer, &skills_list);
+        } else |err| {
+            switch (err) {
+                // A directory with no manifest is a category candidate. A directory
+                // with a malformed manifest is a broken skill and must not expose
+                // arbitrary nested support directories as skills.
+                error.ManifestNotFound => try scanCategoryDir(allocator, sub_path, observer, &skills_list),
+                else => continue,
+            }
         }
     }
 
@@ -1722,6 +1730,62 @@ fn deriveSkillNameFromSourcePath(allocator: std.mem.Allocator, source_path: []co
     return try allocator.dupe(u8, base_name);
 }
 
+fn installSkillsFromRepositoryCategory(
+    allocator: std.mem.Allocator,
+    category_path: []const u8,
+    category_name: []const u8,
+    workspace_dir: []const u8,
+    detail_out: ?*?[]u8,
+) !usize {
+    var category_dir = if (std_compat.fs.path.isAbsolute(category_path))
+        std_compat.fs.openDirAbsolute(category_path, .{ .iterate = true }) catch
+            return error.ManifestNotFound
+    else
+        fs_compat.openDirPath(category_path, .{ .iterate = true }) catch
+            return error.ManifestNotFound;
+    defer category_dir.close();
+
+    var installed_count: usize = 0;
+    var failed_count: usize = 0;
+    var last_failed_error: ?anyerror = null;
+    var it = category_dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .directory) continue;
+
+        const nested_skill_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ category_path, entry.name });
+        defer allocator.free(nested_skill_path);
+        installSkillFromPath(allocator, nested_skill_path, workspace_dir) catch |err| switch (err) {
+            error.ManifestNotFound => continue,
+            error.SkillAlreadyExists => {
+                failed_count += 1;
+                last_failed_error = err;
+                std.log.warn("failed to install skill '{s}/{s}' from repository collection: {s}", .{ category_name, entry.name, @errorName(err) });
+                const msg = std.fmt.allocPrint(allocator, "failed to install skill from repository collection entry '{s}/{s}': {s}", .{ category_name, entry.name, @errorName(err) }) catch null;
+                if (msg) |m| {
+                    defer allocator.free(m);
+                    setInstallErrorDetail(allocator, detail_out, m);
+                }
+                continue;
+            },
+            else => {
+                const msg = std.fmt.allocPrint(allocator, "failed to install skill from repository collection entry '{s}/{s}': {s}", .{ category_name, entry.name, @errorName(err) }) catch null;
+                if (msg) |m| {
+                    defer allocator.free(m);
+                    setInstallErrorDetail(allocator, detail_out, m);
+                }
+                return err;
+            },
+        };
+        installed_count += 1;
+    }
+
+    if (installed_count == 0) {
+        if (last_failed_error) |err| return err;
+        if (failed_count == 0) return error.ManifestNotFound;
+    }
+    return installed_count;
+}
+
 fn installSkillsFromRepositoryCollection(
     allocator: std.mem.Allocator,
     repo_root: []const u8,
@@ -1749,7 +1813,19 @@ fn installSkillsFromRepositoryCollection(
         const skill_source_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ collection_path, entry.name });
         defer allocator.free(skill_source_path);
         installSkillFromPath(allocator, skill_source_path, workspace_dir) catch |err| switch (err) {
-            error.ManifestNotFound => continue,
+            error.ManifestNotFound => {
+                const nested_installed = installSkillsFromRepositoryCategory(allocator, skill_source_path, entry.name, workspace_dir, detail_out) catch |nested_err| switch (nested_err) {
+                    error.ManifestNotFound => continue,
+                    error.SkillAlreadyExists => {
+                        failed_count += 1;
+                        last_failed_error = nested_err;
+                        continue;
+                    },
+                    else => return nested_err,
+                };
+                installed_count += nested_installed;
+                continue;
+            },
             error.SkillAlreadyExists => {
                 failed_count += 1;
                 last_failed_error = err;
@@ -2113,23 +2189,32 @@ fn copyFilePath(src: []const u8, dst: []const u8) !void {
 
 // ── Removal ─────────────────────────────────────────────────────
 
-/// Remove a skill by deleting its directory from workspace_dir/skills/<name>/.
+/// Remove a skill by name from either a direct or one-level category directory.
 pub fn removeSkill(allocator: std.mem.Allocator, name: []const u8, workspace_dir: []const u8) !void {
-    // Sanitize name
-    for (name) |c| {
-        if (c == '/' or c == '\\' or c == 0) return error.UnsafeName;
-    }
-    if (name.len == 0 or std.mem.eql(u8, name, "..")) return error.UnsafeName;
+    try validateSkillName(name);
 
     const skill_path = try std.fmt.allocPrint(allocator, "{s}/skills/{s}", .{ workspace_dir, name });
     defer allocator.free(skill_path);
 
-    // Verify the skill directory actually exists before deleting
-    std_compat.fs.accessAbsolute(skill_path, .{}) catch return error.SkillNotFound;
+    if (pathExists(skill_path)) {
+        std_compat.fs.deleteTreeAbsolute(skill_path) catch |err| {
+            return err;
+        };
+        return;
+    }
 
-    std_compat.fs.deleteTreeAbsolute(skill_path) catch |err| {
-        return err;
-    };
+    const skills = try listSkills(allocator, workspace_dir, null);
+    defer freeSkills(allocator, skills);
+
+    for (skills) |skill| {
+        if (!std.mem.eql(u8, skill.name, name)) continue;
+        std_compat.fs.deleteTreeAbsolute(skill.path) catch |err| {
+            return err;
+        };
+        return;
+    }
+
+    return error.SkillNotFound;
 }
 
 // ── Community Skills Sync ────────────────────────────────────────
@@ -2850,20 +2935,24 @@ test "listSkills discovers skills nested inside a category directory" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // skills/coding/git-helpers/ — nested skill
+    // skills/coding/git-helpers/ — nested markdown-only skill
     try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/coding/git-helpers");
     {
-        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/coding/git-helpers/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/coding/git-helpers/SKILL.md", .{});
         defer f.close();
-        try f.writeAll("{\"name\": \"git-helpers\", \"version\": \"1.0.0\", \"description\": \"Git utilities\", \"author\": \"dev\"}");
+        try f.writeAll("# Git Helpers\nGit utilities.");
     }
 
-    // skills/coding/docker-ops/ — another nested skill in the same category
+    // skills/coding/docker-ops/ — nested TOML skill in the same category
     try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/coding/docker-ops");
     {
-        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/coding/docker-ops/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/coding/docker-ops/SKILL.toml", .{});
         defer f.close();
-        try f.writeAll("{\"name\": \"docker-ops\", \"version\": \"1.0.0\", \"description\": \"Docker tools\", \"author\": \"dev\"}");
+        try f.writeAll(
+            \\[skill]
+            \\name = "docker-ops"
+            \\description = "Docker tools"
+        );
     }
 
     // skills/flat-skill/ — flat skill still works alongside categories
@@ -2918,6 +3007,34 @@ test "listSkills skips category directory itself when it has no manifest" {
     // Only the nested skill is loaded — not the category dir itself
     try std.testing.expectEqual(@as(usize, 1), skills.len);
     try std.testing.expectEqualStrings("web-search", skills[0].name);
+}
+
+test "listSkills does not scan invalid skill manifests as categories" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/broken/nested");
+    {
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/broken/skill.json", .{});
+        defer f.close();
+        try f.writeAll("{");
+    }
+    {
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/broken/nested/skill.json", .{});
+        defer f.close();
+        try f.writeAll("{\"name\": \"nested\"}");
+    }
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+
+    const skills = try listSkills(allocator, base, null);
+    defer freeSkills(allocator, skills);
+
+    // Regression: a malformed top-level skill must stay skipped instead of
+    // turning its support subdirectories into discovered skills.
+    try std.testing.expectEqual(@as(usize, 0), skills.len);
 }
 
 test "listSkills discovers markdown-only skill directories" {
@@ -3969,6 +4086,68 @@ test "installSkillFromGit installs all skills from repository skills directory" 
     try std.testing.expect(pathExists(installed_skill_md));
 }
 
+test "installSkillFromGit installs nested repository skills directory entries" {
+    const allocator = std.testing.allocator;
+    if (!checkBinaryExists(allocator, "git")) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("workspace");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("repo/skills/coding/git-helpers");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("repo/skills/coding/docker-ops");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("repo/skills/flat-skill");
+
+    {
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("repo/skills/coding/git-helpers/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("# Git Helpers\nGit utilities.");
+    }
+    {
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("repo/skills/coding/docker-ops/SKILL.toml", .{});
+        defer f.close();
+        try f.writeAll(
+            \\[skill]
+            \\name = "docker-ops"
+            \\description = "Docker tools"
+        );
+    }
+    {
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("repo/skills/flat-skill/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("# Flat Skill\nTop-level skill.");
+    }
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const workspace = try std_compat.fs.path.join(allocator, &.{ base, "workspace" });
+    defer allocator.free(workspace);
+    const repo = try std_compat.fs.path.join(allocator, &.{ base, "repo" });
+    defer allocator.free(repo);
+
+    try runCommand(allocator, &.{ "git", "-C", repo, "init" });
+    try runCommand(allocator, &.{ "git", "-C", repo, "add", "skills" });
+    try runCommand(allocator, &.{ "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init" });
+
+    try installSkillFromGit(allocator, repo, workspace, null);
+
+    const skills = try listSkills(allocator, workspace, null);
+    defer freeSkills(allocator, skills);
+    try std.testing.expectEqual(@as(usize, 3), skills.len);
+
+    var found_git = false;
+    var found_docker = false;
+    var found_flat = false;
+    for (skills) |s| {
+        if (std.mem.eql(u8, s.name, "git-helpers")) found_git = true;
+        if (std.mem.eql(u8, s.name, "docker-ops")) found_docker = true;
+        if (std.mem.eql(u8, s.name, "flat-skill")) found_flat = true;
+    }
+    try std.testing.expect(found_git);
+    try std.testing.expect(found_docker);
+    try std.testing.expect(found_flat);
+}
+
 test "installSkillFromGit installs SKILL.toml entry from repository skills directory" {
     const allocator = std.testing.allocator;
     if (!checkBinaryExists(allocator, "git")) return error.SkipZigTest;
@@ -4219,6 +4398,28 @@ test "removeSkill nonexistent returns SkillNotFound" {
     defer allocator.free(workspace);
 
     try std.testing.expectError(error.SkillNotFound, removeSkill(allocator, "nonexistent", workspace));
+}
+
+test "removeSkill removes nested skill by discovered name" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/coding/web-search");
+    {
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/coding/web-search/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("# Web Search\nSearch the web.");
+    }
+
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+
+    try removeSkill(allocator, "web-search", workspace);
+
+    const skills = try listSkills(allocator, workspace, null);
+    defer freeSkills(allocator, skills);
+    try std.testing.expectEqual(@as(usize, 0), skills.len);
 }
 
 test "removeSkill rejects unsafe names" {

@@ -391,7 +391,7 @@ pub fn evaluateCandidate(candidate: SkillCandidate, min_score: f64) EvalResult {
 // ── Integration ─────────────────────────────────────────────────
 
 /// Integrate a skill: clone repo to skills_dir/NAME/,
-/// verify structure (expects skill.json, root.zig, or build.zig).
+/// verify structure (agent skill manifests, root.zig, or build.zig).
 pub fn integrate(allocator: std.mem.Allocator, candidate: SkillCandidate, skills_dir: []const u8) !IntegrationResult {
     const safe_name = try sanitizePathComponent(candidate.result_name);
 
@@ -452,19 +452,14 @@ pub fn integrate(allocator: std.mem.Allocator, candidate: SkillCandidate, skills
         },
     }
 
-    // Verify the cloned repo has expected structure
-    const has_skill_json = hasFile(target_path, "skill.json");
-    const has_build_zig = hasFile(target_path, "build.zig");
-    const has_root_zig = hasFile(target_path, "root.zig");
-
-    if (!has_skill_json and !has_build_zig and !has_root_zig) {
+    if (!hasSupportedSkillStructure(target_path)) {
         // Remove the cloned directory since it lacks expected structure
         std_compat.fs.deleteTreeAbsolute(target_path) catch {};
         return IntegrationResult{
             .skill_name = safe_name,
             .install_path = skills_dir,
             .success = false,
-            .error_message = "Cloned repo lacks skill.json, build.zig, or root.zig",
+            .error_message = "Cloned repo lacks SKILL.md, SKILL.toml, skill.json, build.zig, or root.zig",
         };
     }
 
@@ -481,6 +476,14 @@ fn hasFile(dir_path: []const u8, filename: []const u8) bool {
     const full = std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir_path, filename }) catch return false;
     std_compat.fs.accessAbsolute(full, .{}) catch return false;
     return true;
+}
+
+fn hasSupportedSkillStructure(dir_path: []const u8) bool {
+    return hasFile(dir_path, "SKILL.md") or
+        hasFile(dir_path, "SKILL.toml") or
+        hasFile(dir_path, "skill.json") or
+        hasFile(dir_path, "build.zig") or
+        hasFile(dir_path, "root.zig");
 }
 
 pub const IntegrationResult = struct {
@@ -835,6 +838,42 @@ test "default config values" {
     try std.testing.expect(cfg.auto_integrate);
     try std.testing.expectEqual(@as(u64, 24), cfg.scan_interval_hours);
     try std.testing.expect(@abs(cfg.min_score - 0.7) < 0.001);
+}
+
+test "hasSupportedSkillStructure accepts agent skill manifests" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("md");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("toml");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("empty");
+    {
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("md/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("# Skill");
+    }
+    {
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("toml/SKILL.toml", .{});
+        defer f.close();
+        try f.writeAll(
+            \\[skill]
+            \\name = "toml"
+        );
+    }
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const md_path = try std_compat.fs.path.join(allocator, &.{ base, "md" });
+    defer allocator.free(md_path);
+    const toml_path = try std_compat.fs.path.join(allocator, &.{ base, "toml" });
+    defer allocator.free(toml_path);
+    const empty_path = try std_compat.fs.path.join(allocator, &.{ base, "empty" });
+    defer allocator.free(empty_path);
+
+    try std.testing.expect(hasSupportedSkillStructure(md_path));
+    try std.testing.expect(hasSupportedSkillStructure(toml_path));
+    try std.testing.expect(!hasSupportedSkillStructure(empty_path));
 }
 
 test "forge disabled returns empty report" {
