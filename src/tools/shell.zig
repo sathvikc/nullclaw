@@ -143,9 +143,9 @@ pub const ShellTool = struct {
     // This is part of the vtable ownership pattern: the tool creator owns the storage.
     sandbox_storage: SandboxStorage = .{},
     pub const tool_name = "shell";
-    pub const tool_description = "Execute a shell command in the workspace directory";
+    pub const tool_description = "Run a shell command in the workspace directory";
     pub const tool_params =
-        \\{"type":"object","properties":{"command":{"type":"string","description":"The shell command to execute"},"cwd":{"type":"string","description":"Working directory (absolute path within allowed paths; defaults to workspace)"}},"required":["command"]}
+        \\{"type":"object","properties":{"command":{"type":"string","description":"The shell command to run"},"cwd":{"type":"string","description":"Working directory (absolute path within allowed paths; defaults to workspace)"}},"required":["command"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -177,6 +177,7 @@ pub const ShellTool = struct {
                         break :blk ToolResult.fail("Command not allowed by security policy");
                     },
                     error.HighRiskBlocked => ToolResult.fail("High-risk command blocked by security policy"),
+                    error.MediumRiskBlocked => ToolResult.fail("Medium-risk command blocked by security policy"),
                     error.ApprovalRequired => blk: {
                         const msg = try std.fmt.allocPrint(allocator, "Command requires approval (medium/high risk): {s}", .{command});
                         break :blk ToolResult{ .success = false, .output = "", .error_msg = msg };
@@ -649,6 +650,8 @@ test "shell ApprovalRequired error includes command name" {
         .workspace_dir = "/tmp",
         .require_approval_for_medium_risk = true,
         .block_high_risk_commands = false,
+        // touch is medium-risk; set false so the approval gate is reachable
+        .block_medium_risk_commands = false,
         .tracker = &tracker,
         .allowed_commands = &allowed,
     };
@@ -676,6 +679,8 @@ test "shell ApprovalRequired propagates oom for error message allocation" {
         .workspace_dir = "/tmp",
         .require_approval_for_medium_risk = true,
         .block_high_risk_commands = false,
+        // touch is medium-risk; set false so the approval gate is reachable
+        .block_medium_risk_commands = false,
         .tracker = &tracker,
         .allowed_commands = &allowed,
     };

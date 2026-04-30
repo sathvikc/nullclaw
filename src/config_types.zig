@@ -223,6 +223,10 @@ pub const AutonomyConfig = struct {
     max_actions_per_hour: u32 = 20,
     require_approval_for_medium_risk: bool = true,
     block_high_risk_commands: bool = true,
+    /// When true, block medium-risk commands (curl, wget, nc, scp, ftp, telnet).
+    /// Medium-risk commands have network access or file transfer capability
+    /// but are not inherently destructive like high-risk commands.
+    block_medium_risk_commands: bool = true,
     allowed_commands: []const []const u8 = &.{},
     /// When true, skip the single-`&` shell-operator check so that bare
     /// `&` in URLs (e.g. `curl https://...?a=1&b=2`) is permitted.

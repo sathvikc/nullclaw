@@ -736,6 +736,10 @@ Max 说明：
 - `level`: 推荐先用 `supervised`。
 - `workspace_only`: 建议保持 `true`，限制文件访问范围。
 - `max_actions_per_hour`: 建议保守设置，避免高频自动动作。
+- `block_high_risk_commands`（默认：`true`）：屏蔽破坏性命令，如 `rm`、`sudo`、`mkfs`、`dd`、`shutdown`、`ssh`。
+- `block_medium_risk_commands`（默认：`true`）：屏蔽网络/传输类命令，如 `curl`、`wget`、`nc`、`scp`、`ftp`、`telnet`。设为 `false` 可允许这些命令，同时仍屏蔽高风险命令。
+- `require_approval_for_medium_risk`（默认：`true`）：当 `block_medium_risk_commands` 为 `false` 时，在 `supervised` 模式下执行中风险命令前需要明确批准。
+- `allowed_commands`：允许的命令基础名称列表。仅在 full 自主模式下可使用 `["*"]` 通配符。高风险与中风险的运行时拦截无论此列表如何设置都会生效。
 
 ### `security`
 
@@ -760,6 +764,7 @@ Max 说明：
     "allowed_commands": ["*"],
     "allowed_paths": ["*"],
     "require_approval_for_medium_risk": false,
+    "block_medium_risk_commands": false,
     "block_high_risk_commands": false
   }
 }

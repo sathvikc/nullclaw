@@ -2351,29 +2351,34 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
             cfg.autonomy.level = .supervised;
             cfg.autonomy.require_approval_for_medium_risk = true;
             cfg.autonomy.block_high_risk_commands = true;
+            cfg.autonomy.block_medium_risk_commands = true;
         },
         1 => {
             // "autonomous": fully acts, but still blocks high-risk commands.
             cfg.autonomy.level = .full;
             cfg.autonomy.require_approval_for_medium_risk = false;
             cfg.autonomy.block_high_risk_commands = true;
+            cfg.autonomy.block_medium_risk_commands = true;
         },
         2 => {
             // "fully_autonomous": fully acts and does not hard-block high-risk commands.
             cfg.autonomy.level = .full;
             cfg.autonomy.require_approval_for_medium_risk = false;
             cfg.autonomy.block_high_risk_commands = false;
+            cfg.autonomy.block_medium_risk_commands = false;
         },
         3 => {
             // "yolo": bypasses all command-level policy checks.
             cfg.autonomy.level = .yolo;
             cfg.autonomy.require_approval_for_medium_risk = false;
             cfg.autonomy.block_high_risk_commands = false;
+            cfg.autonomy.block_medium_risk_commands = false;
         },
         else => {
             cfg.autonomy.level = .supervised;
             cfg.autonomy.require_approval_for_medium_risk = true;
             cfg.autonomy.block_high_risk_commands = true;
+            cfg.autonomy.block_medium_risk_commands = true;
         },
     }
     try out.print("  -> {s}\n\n", .{autonomy_options[autonomy_idx]});

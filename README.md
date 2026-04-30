@@ -619,7 +619,8 @@ Use this when you want full web-search provider control plus unrestricted shell 
     "allowed_commands": ["*"],
     "allowed_paths": ["*"],
     "require_approval_for_medium_risk": false,
-    "block_high_risk_commands": false
+    "block_high_risk_commands": false,
+    "block_medium_risk_commands": false
   }
 }
 ```

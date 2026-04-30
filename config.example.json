@@ -216,7 +216,10 @@
     "level": "supervised",
     "workspace_only": true,
     "max_actions_per_hour": 20,
-    "allow_raw_url_chars": false
+    "allow_raw_url_chars": false,
+    "block_high_risk_commands": true,
+    "block_medium_risk_commands": true,
+    "require_approval_for_medium_risk": true
   },
 
   "gateway": {

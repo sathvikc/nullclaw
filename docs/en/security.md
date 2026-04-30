@@ -115,6 +115,8 @@ These settings significantly widen trust boundaries and should be used only in c
 - `autonomy.level = "yolo"`
 - `allowed_commands = ["*"]`
 - `allowed_paths = ["*"]`
+- `block_high_risk_commands = false` — enables destructive commands (`rm`, `sudo`, `dd`, `mkfs`, etc.)
+- `block_medium_risk_commands = false` — enables network/transfer commands (`curl`, `wget`, `nc`, `scp`, etc.)
 - `gateway.allow_public_bind = true`
 
 ## Next Steps
