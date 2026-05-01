@@ -1376,6 +1376,12 @@ pub const Config = struct {
         try writePrettyJsonInline(self.allocator, w, self.tools.path_env_vars, "    ");
         try w.print(",\n    \"tool_customizations\": ", .{});
         try writePrettyJsonInline(self.allocator, w, self.tools.tool_customizations, "    ");
+        try w.print(",\n    \"tool_customizations_file\": ", .{});
+        try writePrettyJsonInline(self.allocator, w, self.tools.tool_customizations_file, "    ");
+        try w.print(",\n    \"trigger_modifiers\": ", .{});
+        try writePrettyJsonInline(self.allocator, w, self.tools.trigger_modifiers, "    ");
+        try w.print(",\n    \"trigger_punctuation\": ", .{});
+        try writePrettyJsonInline(self.allocator, w, self.tools.trigger_punctuation, "    ");
         // tools.media.audio
         {
             const am = self.audio_media;
@@ -3914,30 +3920,74 @@ test "json parse tools.path_env_vars" {
     allocator.free(cfg.tools.path_env_vars);
 }
 
-test "json parse tools.tool_customizations" {
-    const allocator = std.testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
+fn freeToolCustomizationsForTest(allocator: std.mem.Allocator, items: []const config_types.ToolCustomization) void {
+    for (items) |item| {
+        allocator.free(item.name);
+        if (item.system_prompt) |system_prompt| allocator.free(system_prompt);
+        for (item.triggers) |trigger| allocator.free(trigger);
+        allocator.free(item.triggers);
+    }
+    allocator.free(items);
+}
 
+test "json parse tools.tool_customizations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     const json =
-        \\{"tools": {"tool_customizations": [
-        \\  {"name": "shell", "system_prompt": "Run commands only when necessary.", "triggers": ["run", "execute"], "priority": 300, "enabled": true},
-        \\  {"name": "calculator", "triggers": ["math"], "priority": -5, "enabled": false},
-        \\  {"system_prompt": "missing name is ignored"}
-        \\]}}
+        \\{"tools": {
+        \\  "tool_customizations": [
+        \\    {"name": "shell", "system_prompt": "Use safe shell", "triggers": ["run", "exec"], "priority": 300, "enabled": false},
+        \\    {"name": "browser", "triggers": ["open"], "priority": -1},
+        \\    {"system_prompt": "missing name"},
+        \\    "ignored"
+        \\  ],
+        \\  "tool_customizations_file": "tool-customizations.json",
+        \\  "trigger_modifiers": ["please", "now"],
+        \\  "trigger_punctuation": "!?;"
+        \\}}
     ;
-    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = arena.allocator() };
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
 
     try std.testing.expectEqual(@as(usize, 2), cfg.tools.tool_customizations.len);
     try std.testing.expectEqualStrings("shell", cfg.tools.tool_customizations[0].name);
-    try std.testing.expectEqualStrings("Run commands only when necessary.", cfg.tools.tool_customizations[0].system_prompt.?);
+    try std.testing.expectEqualStrings("Use safe shell", cfg.tools.tool_customizations[0].system_prompt.?);
+    try std.testing.expectEqual(@as(usize, 2), cfg.tools.tool_customizations[0].triggers.len);
     try std.testing.expectEqualStrings("run", cfg.tools.tool_customizations[0].triggers[0]);
+    try std.testing.expectEqualStrings("exec", cfg.tools.tool_customizations[0].triggers[1]);
     try std.testing.expectEqual(@as(u8, 255), cfg.tools.tool_customizations[0].priority);
-    try std.testing.expect(cfg.tools.tool_customizations[0].enabled);
-    try std.testing.expectEqualStrings("calculator", cfg.tools.tool_customizations[1].name);
+    try std.testing.expect(!cfg.tools.tool_customizations[0].enabled);
+    try std.testing.expectEqualStrings("browser", cfg.tools.tool_customizations[1].name);
     try std.testing.expectEqual(@as(u8, 0), cfg.tools.tool_customizations[1].priority);
-    try std.testing.expect(!cfg.tools.tool_customizations[1].enabled);
+    try std.testing.expect(cfg.tools.tool_customizations[1].enabled);
+    try std.testing.expectEqualStrings("tool-customizations.json", cfg.tools.tool_customizations_file.?);
+    try std.testing.expectEqual(@as(usize, 2), cfg.tools.trigger_modifiers.len);
+    try std.testing.expectEqualStrings("please", cfg.tools.trigger_modifiers[0]);
+    try std.testing.expectEqualStrings("now", cfg.tools.trigger_modifiers[1]);
+    try std.testing.expectEqualStrings("!?;", cfg.tools.trigger_punctuation);
+}
+
+fn parseToolCustomizationsForAllocationTest(allocator: std.mem.Allocator, json: []const u8) !void {
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    try cfg.parseJson(json);
+    freeToolCustomizationsForTest(allocator, cfg.tools.tool_customizations);
+}
+
+test "json parse tools.tool_customizations frees partial allocations on out-of-memory" {
+    const json =
+        \\{"tools": {"tool_customizations": [
+        \\  {"name": "shell", "system_prompt": "Use safe shell", "triggers": ["run", "exec"], "priority": 200, "enabled": false},
+        \\  {"name": "browser", "triggers": ["open", "visit"], "priority": 10}
+        \\]}}
+    ;
+    // Regression: nested tool customization fields must not leak when parsing
+    // fails after partially allocating a customization entry.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseToolCustomizationsForAllocationTest, .{json});
 }
 
 test "save roundtrip preserves tools.path_env_vars" {
@@ -3976,8 +4026,7 @@ test "save roundtrip preserves tools.path_env_vars" {
     try std.testing.expectEqualStrings("PYTHONHOME", loaded.tools.path_env_vars[1]);
 }
 
-test "save roundtrip preserves tools.tool_customizations" {
-    // Regression: custom tool config parsed from JSON must survive save/load.
+test "save roundtrip preserves tools customization schema" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3987,22 +4036,28 @@ test "save roundtrip preserves tools.tool_customizations" {
     const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
     defer allocator.free(config_path);
 
-    const triggers: []const []const u8 = &.{ "read", "inspect" };
-    const customizations: []const ToolCustomization = &.{
-        .{
-            .name = "file_read",
-            .system_prompt = "Read files before answering.",
-            .triggers = triggers,
-            .priority = 9,
-            .enabled = true,
-        },
-    };
     var cfg = Config{
         .workspace_dir = base,
         .config_path = config_path,
         .allocator = allocator,
     };
-    cfg.tools.tool_customizations = customizations;
+    cfg.tools.tool_customizations = &.{
+        .{
+            .name = "shell",
+            .system_prompt = "Use safe shell",
+            .triggers = &.{ "run", "exec" },
+            .priority = 7,
+            .enabled = false,
+        },
+        .{
+            .name = "browser",
+            .triggers = &.{"open"},
+            .priority = 3,
+        },
+    };
+    cfg.tools.tool_customizations_file = "tool-customizations.json";
+    cfg.tools.trigger_modifiers = &.{ "please", "now" };
+    cfg.tools.trigger_punctuation = "!?;";
     try cfg.save();
 
     const file = try std_compat.fs.openFileAbsolute(config_path, .{});
@@ -4018,11 +4073,17 @@ test "save roundtrip preserves tools.tool_customizations" {
         .allocator = arena.allocator(),
     };
     try loaded.parseJson(content);
-    try std.testing.expectEqual(@as(usize, 1), loaded.tools.tool_customizations.len);
-    try std.testing.expectEqualStrings("file_read", loaded.tools.tool_customizations[0].name);
-    try std.testing.expectEqualStrings("Read files before answering.", loaded.tools.tool_customizations[0].system_prompt.?);
-    try std.testing.expectEqualStrings("inspect", loaded.tools.tool_customizations[0].triggers[1]);
-    try std.testing.expectEqual(@as(u8, 9), loaded.tools.tool_customizations[0].priority);
+
+    try std.testing.expectEqual(@as(usize, 2), loaded.tools.tool_customizations.len);
+    try std.testing.expectEqualStrings("shell", loaded.tools.tool_customizations[0].name);
+    try std.testing.expectEqualStrings("Use safe shell", loaded.tools.tool_customizations[0].system_prompt.?);
+    try std.testing.expectEqualStrings("run", loaded.tools.tool_customizations[0].triggers[0]);
+    try std.testing.expectEqual(@as(u8, 7), loaded.tools.tool_customizations[0].priority);
+    try std.testing.expect(!loaded.tools.tool_customizations[0].enabled);
+    try std.testing.expectEqualStrings("browser", loaded.tools.tool_customizations[1].name);
+    try std.testing.expectEqualStrings("tool-customizations.json", loaded.tools.tool_customizations_file.?);
+    try std.testing.expectEqualStrings("please", loaded.tools.trigger_modifiers[0]);
+    try std.testing.expectEqualStrings("!?;", loaded.tools.trigger_punctuation);
 }
 
 test "json parse autonomy allow_raw_url_chars" {

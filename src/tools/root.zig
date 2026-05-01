@@ -9,8 +9,8 @@ const builtin = @import("builtin");
 const memory_mod = @import("../memory/root.zig");
 const Memory = memory_mod.Memory;
 const bootstrap_mod = @import("../bootstrap/root.zig");
-const mcp_mod = @import("../mcp.zig");
 const config_types = @import("../config_types.zig");
+const mcp_mod = @import("../mcp.zig");
 const SandboxBackend = @import("../security/sandbox.zig").SandboxBackend;
 const createSandbox = @import("../security/sandbox.zig").createSandbox;
 const ConfigSandboxBackend = @import("../config.zig").SandboxBackend;
@@ -212,6 +212,38 @@ pub const Tool = struct {
     }
 };
 
+fn findToolCustomization(customizations: []const config_types.ToolCustomization, tool_name: []const u8) ?config_types.ToolCustomization {
+    for (customizations) |cust| {
+        if (std.mem.eql(u8, tool_name, cust.name)) return cust;
+    }
+    return null;
+}
+
+fn applyToolCustomizations(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList(Tool),
+    customizations: []const config_types.ToolCustomization,
+) void {
+    if (customizations.len == 0) return;
+
+    var write_idx: usize = 0;
+    for (list.items) |*tool_item| {
+        if (findToolCustomization(customizations, tool_item.name())) |cust| {
+            if (!cust.enabled) {
+                tool_item.deinit(allocator);
+                continue;
+            }
+            if (cust.system_prompt) |prompt| {
+                tool_item.custom_description = prompt;
+            }
+        }
+
+        list.items[write_idx] = tool_item.*;
+        write_idx += 1;
+    }
+    list.shrinkRetainingCapacity(write_idx);
+}
+
 /// Generate a Tool.VTable from a tool struct type at comptime.
 ///
 /// The type T must declare:
@@ -249,36 +281,6 @@ pub fn ToolVTable(comptime T: type) Tool.VTable {
             }
         }.f,
     };
-}
-
-fn applyToolCustomizations(
-    allocator: std.mem.Allocator,
-    list: *std.ArrayList(Tool),
-    customizations: []const config_types.ToolCustomization,
-) void {
-    if (customizations.len == 0) return;
-
-    var write_idx: usize = 0;
-    for (list.items) |*t| {
-        var keep = true;
-        for (customizations) |cust| {
-            if (!std.mem.eql(u8, t.name(), cust.name)) continue;
-            if (!cust.enabled) {
-                keep = false;
-                t.deinit(allocator);
-                break;
-            }
-            if (cust.system_prompt) |prompt| {
-                t.custom_description = prompt;
-            }
-            break;
-        }
-        if (keep) {
-            list.items[write_idx] = t.*;
-            write_idx += 1;
-        }
-    }
-    list.shrinkRetainingCapacity(write_idx);
 }
 
 /// Comptime check that a type correctly implements the Tool interface.
@@ -942,49 +944,30 @@ test "all tools excludes extras when disabled" {
     try std.testing.expectEqual(@as(usize, 18), tools.len);
 }
 
-test "all tools applies customization overrides" {
-    const customizations: []const config_types.ToolCustomization = &.{
-        .{ .name = "shell", .system_prompt = "Use shell only for deterministic local commands." },
-        .{ .name = "calculator", .enabled = false },
+test "all tools apply configured descriptions and enabled filters" {
+    const customizations = [_]config_types.ToolCustomization{
+        .{ .name = "shell", .enabled = false },
+        .{ .name = "file_read", .system_prompt = "Read only small files" },
     };
 
     const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{
-        .tools_config = .{ .tool_customizations = customizations },
+        .tools_config = .{ .tool_customizations = &customizations },
     });
     defer deinitTools(std.testing.allocator, tools);
 
     var saw_shell = false;
-    for (tools) |t| {
-        try std.testing.expect(!std.mem.eql(u8, t.name(), "calculator"));
-        if (std.mem.eql(u8, t.name(), "shell")) {
-            try std.testing.expectEqualStrings("Use shell only for deterministic local commands.", t.description());
-            saw_shell = true;
-        }
-    }
-    try std.testing.expect(saw_shell);
-}
-
-test "subagent tools applies customization overrides" {
-    // Regression: delegated agent tools must honor the same overrides as top-level tools.
-    const customizations: []const config_types.ToolCustomization = &.{
-        .{ .name = "file_read", .system_prompt = "Read only the files needed for the delegated task." },
-        .{ .name = "git", .enabled = false },
-    };
-
-    const tools = try subagentTools(std.testing.allocator, "/tmp/yc_test", .{
-        .tools_config = .{ .tool_customizations = customizations },
-    });
-    defer deinitTools(std.testing.allocator, tools);
-
     var saw_file_read = false;
     for (tools) |t| {
-        try std.testing.expect(!std.mem.eql(u8, t.name(), "git"));
+        if (std.mem.eql(u8, t.name(), "shell")) saw_shell = true;
         if (std.mem.eql(u8, t.name(), "file_read")) {
-            try std.testing.expectEqualStrings("Read only the files needed for the delegated task.", t.description());
             saw_file_read = true;
+            try std.testing.expectEqualStrings("Read only small files", t.description());
         }
     }
+
+    try std.testing.expect(!saw_shell);
     try std.testing.expect(saw_file_read);
+    try std.testing.expectEqual(@as(usize, 17), tools.len);
 }
 
 test "all tools wires shell sandbox by default" {
@@ -1318,6 +1301,34 @@ test "subagent tools wire http allowlist, response limit, and timeout" {
     }
 
     try std.testing.expect(saw_http);
+}
+
+test "subagent tools apply configured descriptions and enabled filters" {
+    // Regression: subagentTools receives ToolsConfig and must honor tool customizations
+    // the same way allTools does.
+    const customizations = [_]config_types.ToolCustomization{
+        .{ .name = "git_operations", .enabled = false },
+        .{ .name = "shell", .system_prompt = "Use shell only for deterministic commands" },
+    };
+
+    const tools = try subagentTools(std.testing.allocator, "/tmp/yc_test", .{
+        .tools_config = .{ .tool_customizations = &customizations },
+    });
+    defer deinitTools(std.testing.allocator, tools);
+
+    var saw_git = false;
+    var saw_shell = false;
+    for (tools) |t| {
+        if (std.mem.eql(u8, t.name(), "git_operations")) saw_git = true;
+        if (std.mem.eql(u8, t.name(), "shell")) {
+            saw_shell = true;
+            try std.testing.expectEqualStrings("Use shell only for deterministic commands", t.description());
+        }
+    }
+
+    try std.testing.expect(!saw_git);
+    try std.testing.expect(saw_shell);
+    try std.testing.expectEqual(@as(usize, 8), tools.len);
 }
 
 test "bindMemoryTools matches by vtable, not by colliding tool name" {
