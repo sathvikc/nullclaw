@@ -29,7 +29,7 @@
     "pairing_request": {
       "direction": "ui_to_core",
       "payload": {
-        "pairing_code": "string required (one-time code)",
+        "pairing_code": "string required for relay; optional on local loopback transport",
         "client_pub": "string optional base64url X25519 public key",
         "client_public_key": "string optional alias for client_pub"
       }

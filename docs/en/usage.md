@@ -81,6 +81,11 @@ nullclaw service start
 nullclaw service status
 ```
 
+Advanced secret delivery:
+
+- The generated service launcher also checks for an executable `~/.nullclaw/service-env` helper before starting `nullclaw gateway`.
+- Use that helper to inject secrets from `dotenvx`, `sops`, or another local secret loader without editing the installed service unit/script.
+
 After significant config changes, restart service:
 
 ```bash

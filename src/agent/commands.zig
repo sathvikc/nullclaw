@@ -3136,6 +3136,83 @@ test "handleSubagentsCommand help documents both agent flag forms" {
     try std.testing.expect(std.mem.indexOf(u8, response, "--agent=<name>") != null);
 }
 
+test "refreshSubagentToolContext uses conversation origin route" {
+    var spawn_tool = spawn_tool_mod.SpawnTool{};
+    const tools = [_]Tool{spawn_tool.tool()};
+    var harness = struct {
+        allocator: std.mem.Allocator,
+        tools: []const Tool,
+        memory_session_id: ?[]const u8 = "agent:main:discord:direct:user-42",
+        conversation_context: ?struct {
+            channel: ?[]const u8 = null,
+            account_id: ?[]const u8 = null,
+            delivery_chat_id: ?[]const u8 = null,
+            peer_id: ?[]const u8 = null,
+        } = .{
+            .channel = "discord",
+            .account_id = "discord-main",
+            .delivery_chat_id = "dm-channel-42",
+            .peer_id = "user-42",
+        },
+    }{
+        .allocator = std.testing.allocator,
+        .tools = tools[0..],
+    };
+
+    refreshSubagentToolContext(&harness);
+
+    try std.testing.expectEqualStrings("discord", spawn_tool.default_channel.?);
+    try std.testing.expectEqualStrings("discord-main", spawn_tool.default_account_id.?);
+    try std.testing.expectEqualStrings("dm-channel-42", spawn_tool.default_chat_id.?);
+    try std.testing.expectEqualStrings("agent:main:discord:direct:user-42", spawn_tool.default_session_key.?);
+}
+
+test "handleSubagentsCommand spawn stores conversation origin route" {
+    const cfg = config_module.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var manager = subagent_mod.SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    manager.task_runner = testSubagentRunnerEcho;
+    defer manager.deinit();
+
+    var spawn_tool = spawn_tool_mod.SpawnTool{ .manager = &manager };
+    const tools = [_]Tool{spawn_tool.tool()};
+    var harness = struct {
+        allocator: std.mem.Allocator,
+        tools: []const Tool,
+        memory_session_id: ?[]const u8 = "agent:main:discord:direct:user-42",
+        conversation_context: ?struct {
+            channel: ?[]const u8 = null,
+            account_id: ?[]const u8 = null,
+            delivery_chat_id: ?[]const u8 = null,
+            peer_id: ?[]const u8 = null,
+        } = .{
+            .channel = "discord",
+            .account_id = "discord-main",
+            .delivery_chat_id = "dm-channel-42",
+            .peer_id = "user-42",
+        },
+    }{
+        .allocator = std.testing.allocator,
+        .tools = tools[0..],
+    };
+
+    // Regression: #849 also applies to slash-command subagent spawns, not only
+    // LLM tool-call spawns.
+    const response = try handleSubagentsCommand(&harness, "spawn check route");
+    defer std.testing.allocator.free(response);
+
+    manager.mutex.lock();
+    defer manager.mutex.unlock();
+    const state = manager.tasks.get(1) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("discord", state.origin_channel);
+    try std.testing.expectEqualStrings("discord-main", state.origin_account_id.?);
+    try std.testing.expectEqualStrings("dm-channel-42", state.origin_chat_id);
+    try std.testing.expectEqualStrings("agent:main:discord:direct:user-42", state.session_key.?);
+}
+
 fn parseTaskId(raw: []const u8) ?u64 {
     if (raw.len == 0) return null;
     return std.fmt.parseInt(u64, raw, 10) catch null;
@@ -3154,10 +3231,45 @@ fn findSubagentManager(self: anytype) ?*subagent_mod.SubagentManager {
     return spawn_tool.manager;
 }
 
+const SubagentOriginRoute = struct {
+    channel: []const u8,
+    account_id: ?[]const u8,
+    chat_id: []const u8,
+    session_key: []const u8,
+};
+
+fn resolveSubagentOriginRoute(self: anytype) SubagentOriginRoute {
+    var route_channel: []const u8 = "agent";
+    var route_chat_id: []const u8 = self.memory_session_id orelse "agent";
+    var route_account_id: ?[]const u8 = null;
+
+    if (@hasField(@TypeOf(self.*), "conversation_context")) {
+        if (self.conversation_context) |ctx| {
+            if (ctx.channel) |channel| route_channel = channel;
+            route_account_id = ctx.account_id;
+            if (ctx.delivery_chat_id) |delivery_chat_id| {
+                route_chat_id = delivery_chat_id;
+            } else if (ctx.peer_id) |peer_id| {
+                route_chat_id = peer_id;
+            }
+        }
+    }
+
+    return .{
+        .channel = route_channel,
+        .account_id = route_account_id,
+        .chat_id = route_chat_id,
+        .session_key = self.memory_session_id orelse route_chat_id,
+    };
+}
+
 pub fn refreshSubagentToolContext(self: anytype) void {
     const spawn_tool = findSpawnTool(self) orelse return;
-    spawn_tool.default_channel = "agent";
-    spawn_tool.default_chat_id = self.memory_session_id orelse "agent";
+    const route = resolveSubagentOriginRoute(self);
+    spawn_tool.default_channel = route.channel;
+    spawn_tool.default_account_id = route.account_id;
+    spawn_tool.default_chat_id = route.chat_id;
+    spawn_tool.default_session_key = route.session_key;
 }
 
 fn findShellTool(self: anytype) ?Tool {
@@ -4031,6 +4143,9 @@ fn freeSubagentTaskState(manager: *subagent_mod.SubagentManager, state: *subagen
     }
     if (state.result) |r| manager.allocator.free(r);
     if (state.error_msg) |e| manager.allocator.free(e);
+    manager.allocator.free(state.origin_channel);
+    manager.allocator.free(state.origin_chat_id);
+    if (state.origin_account_id) |aid| manager.allocator.free(aid);
     if (state.session_key) |sk| manager.allocator.free(sk);
     manager.allocator.free(state.label);
     manager.allocator.destroy(state);
@@ -4092,8 +4207,8 @@ fn spawnSubagentTask(self: anytype, task: []const u8, label: []const u8, agent_n
     const manager = findSubagentManager(self) orelse
         return try self.allocator.dupe(u8, "Spawn tool is not enabled.");
 
-    const origin_chat = self.memory_session_id orelse "agent";
-    const task_id = manager.spawnWithAgent(trimmed_task, label, "agent", origin_chat, agent_name) catch |err| {
+    const route = resolveSubagentOriginRoute(self);
+    const task_id = manager.spawnWithAgent(trimmed_task, label, route.channel, route.chat_id, route.account_id, route.session_key, agent_name) catch |err| {
         return switch (err) {
             error.TooManyConcurrentSubagents => try self.allocator.dupe(u8, "Too many concurrent subagents. Wait for a task to finish."),
             error.UnknownAgent => if (agent_name) |name|
@@ -4286,6 +4401,48 @@ fn handleSubagentsCommand(self: anytype, arg: []const u8) ![]const u8 {
     }
 
     return try self.allocator.dupe(u8, "Unknown /subagents action. Use /subagents help.");
+}
+
+test "handleKillCommand frees completed subagent origin route" {
+    const cfg = config_module.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var manager = subagent_mod.SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer manager.deinit();
+
+    var spawn_tool = spawn_tool_mod.SpawnTool{ .manager = &manager };
+    const tools = [_]Tool{spawn_tool.tool()};
+    var harness = struct {
+        allocator: std.mem.Allocator,
+        tools: []const Tool,
+        memory_session_id: ?[]const u8 = "session:42",
+    }{
+        .allocator = std.testing.allocator,
+        .tools = tools[0..],
+    };
+
+    const state = try std.testing.allocator.create(subagent_mod.TaskState);
+    state.* = .{
+        .status = .completed,
+        .label = try std.testing.allocator.dupe(u8, "done-task"),
+        .origin_channel = try std.testing.allocator.dupe(u8, "telegram"),
+        .origin_chat_id = try std.testing.allocator.dupe(u8, "chat-42"),
+        .origin_account_id = try std.testing.allocator.dupe(u8, "primary"),
+        .session_key = try std.testing.allocator.dupe(u8, "session:42"),
+        .result = try std.testing.allocator.dupe(u8, "done"),
+        .started_at = std_compat.time.milliTimestamp(),
+        .completed_at = std_compat.time.milliTimestamp(),
+    };
+    try manager.tasks.put(std.testing.allocator, 1, state);
+
+    // Regression: #849 made origin route fields owned by TaskState; /kill must
+    // free them when it removes completed tasks.
+    const response = try handleKillCommand(&harness, "1");
+    defer std.testing.allocator.free(response);
+    try std.testing.expectEqual(@as(usize, 0), manager.tasks.count());
+    try std.testing.expect(std.mem.indexOf(u8, response, "removed") != null);
 }
 
 fn handleSteerCommand(self: anytype, arg: []const u8) ![]const u8 {

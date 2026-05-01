@@ -197,6 +197,10 @@ nullclaw channel start signal
 nullclaw service install
 nullclaw service status
 
+# Optional secret injection hook for service mode:
+# if ~/.nullclaw/service-env is executable, the installed service launcher runs it
+# before starting `nullclaw gateway` (for example via dotenvx or sops)
+
 # Migrate memory from OpenClaw
 nullclaw migrate openclaw --dry-run
 nullclaw migrate openclaw
@@ -664,6 +668,7 @@ Use `channels.web` for browser UI events (WebChannel v1):
   - `"token"` (local transport only): include `auth_token` in each `user_message` payload (`access_token` is also accepted for compatibility).
 - `auth_token` hardens the WebSocket upgrade and becomes required when binding non-loopback addresses.
 - Unauthenticated WebSocket upgrade is loopback-only. Pairing-first local UX works on `127.0.0.1`, but a public/LAN bind must authenticate the `/ws` upgrade on the first hop with `?token=<auth_token>` or `Authorization: Bearer <auth_token>`.
+- Local loopback pairing no longer depends on a fixed shared code. `pairing_request` may omit `payload.pairing_code`, and legacy loopback clients that still send `123456` remain compatible.
 - `/ws` is the WebSocket endpoint. `/pair` belongs to the HTTP gateway API and is not part of the web channel handshake.
 - Remote/headless host: if you bind `"listen": "0.0.0.0"`, prefer a stable configured token plus `message_auth_mode: "token"` behind TLS/reverse proxy, or keep loopback bind and expose it through SSH tunnel/proxy.
 - UI/extension should live in a separate repository and connect via this WebSocket endpoint.
@@ -740,7 +745,8 @@ Enable in `~/.nullclaw/config.json`:
 
 ```bash
 # 1. Get a bearer token
-TOKEN=$(curl -s -X POST -H "X-Pairing-Code: 123456" http://localhost:3000/pair | jq -r .token)
+# Set PAIRING_CODE to the one-time code for this gateway session.
+TOKEN=$(curl -s -X POST -H "X-Pairing-Code: $PAIRING_CODE" http://localhost:3000/pair | jq -r .token)
 
 # 2. Discover the agent
 curl http://localhost:3000/.well-known/agent-card.json

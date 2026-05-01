@@ -47,6 +47,7 @@ const ToolExecutionResult = dispatcher.ToolExecutionResult;
 
 /// Maximum agentic tool-use iterations per user message.
 const DEFAULT_MAX_TOOL_ITERATIONS: u32 = 25;
+const MAX_MID_TURN_INJECTION_FOLLOWUPS: u32 = 8;
 
 /// Maximum non-system messages before trimming.
 const DEFAULT_MAX_HISTORY: u32 = 50;
@@ -74,6 +75,10 @@ pub const ProgressSink = struct {
         self.callback(self.ctx, hint);
     }
 };
+
+/// Callback invoked at each tool-loop boundary to drain a pending mid-turn injection.
+/// Returns an owned slice allocated with the provided allocator, or null if empty.
+pub const DrainCallback = *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!?[]u8;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Agent
@@ -171,7 +176,7 @@ pub const Agent = struct {
         }
     };
 
-    const QueueMode = enum {
+    pub const QueueMode = enum {
         off,
         serial,
         latest,
@@ -360,6 +365,12 @@ pub const Agent = struct {
     progress_callback: ?ProgressCallback = null,
     /// Context pointer passed to progress_callback.
     progress_ctx: ?*anyopaque = null,
+    /// Optional mid-turn injection drain. When set, called at each tool-loop boundary
+    /// to pull a pending user message and fold it into the active turn.
+    /// Returns an owned slice (allocated with the agent allocator) or null if empty.
+    drain_injection_cb: ?DrainCallback = null,
+    /// Context pointer passed to drain_injection_cb.
+    drain_injection_ctx: ?*anyopaque = null,
     /// Optional callback invoked for each LLM response usage record.
     usage_record_callback: ?UsageRecordCallback = null,
     /// Context pointer passed to usage_record_callback.
@@ -427,6 +438,15 @@ pub const Agent = struct {
             msg.deinit(self.allocator);
             return err;
         };
+    }
+
+    fn drainPendingInjection(self: *Agent) !?[]u8 {
+        if (self.drain_injection_cb) |drain_cb| {
+            if (self.drain_injection_ctx) |drain_ctx| {
+                return try drain_cb(drain_ctx, self.allocator);
+            }
+        }
+        return null;
     }
 
     /// Initialize agent from a loaded Config.
@@ -1959,13 +1979,19 @@ pub const Agent = struct {
         defer iter_arena.deinit();
 
         var iteration: u32 = 0;
+        var injection_followups: u32 = 0;
         var forced_follow_through_count: u32 = 0;
         var empty_response_retry_count: u32 = 0;
         var seen_tool_call_results: std.AutoHashMapUnmanaged(u64, CachedToolCallResult) = .empty;
         defer deinitSeenToolCallResults(self.allocator, &seen_tool_call_results);
-        while (iteration < self.max_tool_iterations) : (iteration += 1) {
+        while (iteration < self.max_tool_iterations +| injection_followups) : (iteration += 1) {
             if (self.isInterruptRequested()) {
                 return self.interruptedReply();
+            }
+
+            // Drain any mid-turn injection at each tool boundary.
+            if (try self.drainPendingInjection()) |injected| {
+                try self.appendOwnedHistoryMessage(.{ .role = .user, .content = injected });
             }
 
             _ = iter_arena.reset(.retain_capacity);
@@ -2365,6 +2391,23 @@ pub const Agent = struct {
                     self.freeResponseFields(&response);
                     forced_follow_through_count += 1;
                     continue;
+                }
+
+                // If an inbound message arrived while the final model response
+                // was being produced, fold it into this active turn instead of
+                // leaving it buffered until an unrelated future message.
+                if (injection_followups < MAX_MID_TURN_INJECTION_FOLLOWUPS) {
+                    if (try self.drainPendingInjection()) |injected| {
+                        try self.appendOwnedHistoryMessage(.{
+                            .role = .assistant,
+                            .content = try self.allocator.dupe(u8, display_text),
+                        });
+                        try self.appendOwnedHistoryMessage(.{ .role = .user, .content = injected });
+                        self.trimHistory();
+                        self.freeResponseFields(&response);
+                        injection_followups += 1;
+                        continue;
+                    }
                 }
 
                 // No tool calls — final response

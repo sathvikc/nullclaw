@@ -26,6 +26,7 @@ const json_util = @import("json_util.zig");
 const util = @import("util.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
 const gemini_cli_mod = @import("providers/gemini_cli.zig");
+const log = std.log.scoped(.onboard);
 
 // ── Constants ────────────────────────────────────────────────────
 
@@ -59,6 +60,16 @@ const WorkspaceOnboardingState = struct {
 };
 
 const WORKSPACE_AGENTS_TEMPLATE = @embedFile("workspace_templates/AGENTS.md");
+
+fn logModelCatalogFailure(source: []const u8, provider: []const u8, detail: []const u8) void {
+    if (builtin.is_test) return;
+    log.warn("model catalog failure source={s} provider={s}: {s}", .{ source, provider, detail });
+}
+
+fn logModelCatalogFailureErr(source: []const u8, provider: []const u8, err: anyerror) void {
+    if (builtin.is_test) return;
+    log.warn("model catalog failure source={s} provider={s}: {}", .{ source, provider, err });
+}
 const WORKSPACE_SOUL_TEMPLATE = @embedFile("workspace_templates/SOUL.md");
 const WORKSPACE_TOOLS_TEMPLATE = @embedFile("workspace_templates/TOOLS.md");
 const WORKSPACE_CONFIG_TEMPLATE = @embedFile("workspace_templates/CONFIG.md");
@@ -211,6 +222,7 @@ fn printProviderNextSteps(
         try out.writeAll("    2. Interactive chat:  nullclaw agent\n");
         try out.writeAll("       Then type:         Hello!\n");
         try out.writeAll("    3. Gateway:           nullclaw gateway\n");
+        try printOpenRouterFreeTierHint(out, canonical);
         return;
     }
 
@@ -244,6 +256,12 @@ fn printProviderNextSteps(
     try out.writeAll("       Then type:         Hello!\n");
     try out.writeAll("    2. Gateway:           nullclaw gateway\n");
     try out.writeAll("    3. Status:            nullclaw status\n");
+    try printOpenRouterFreeTierHint(out, canonical);
+}
+
+fn printOpenRouterFreeTierHint(out: *std.Io.Writer, canonical_provider: []const u8) !void {
+    if (!std.mem.eql(u8, canonical_provider, "openrouter")) return;
+    try out.writeAll("       Note: free-tier OpenRouter keys may need a `:free` model; paid defaults can return rate-limit errors.\n");
 }
 
 /// Resolve a provider name used in quick setup.
@@ -530,15 +548,19 @@ pub fn fetchModelsFromApi(allocator: std.mem.Allocator, provider: []const u8, ap
         if (dynamic.len > 0) return dynamic;
     }
 
-    if (fetchModelsFromNativeApi(allocator, canonical, api_key) catch null) |models| {
-        return models;
+    if (fetchModelsFromNativeApi(allocator, canonical, api_key)) |maybe_models| {
+        if (maybe_models) |models| return models;
+    } else |err| {
+        logModelCatalogFailureErr("native", canonical, err);
     }
 
     // Tests must stay deterministic and offline; production can consult the
     // public models.dev catalog as a secondary source.
     if (!builtin.is_test and shouldUseModelsDevCatalog(canonical, api_key)) {
-        if (fetchModelsFromModelsDev(allocator, canonical) catch null) |models| {
-            return models;
+        if (fetchModelsFromModelsDev(allocator, canonical)) |maybe_models| {
+            if (maybe_models) |models| return models;
+        } else |err| {
+            logModelCatalogFailureErr("models.dev", canonical, err);
         }
     }
 
@@ -592,7 +614,7 @@ fn fetchModelsFromNativeApi(allocator: std.mem.Allocator, canonical: []const u8,
         headers = &headers_buf;
     }
 
-    return try fetchAndParseModels(allocator, url, headers, prefix_filter);
+    return try fetchAndParseModels(allocator, canonical, url, headers, prefix_filter);
 }
 
 fn modelsDevProviderKey(provider: []const u8) ?[]const u8 {
@@ -620,7 +642,10 @@ fn modelsCacheProviderKey(allocator: std.mem.Allocator, provider: []const u8, ap
 fn fetchModelsFromModelsDev(allocator: std.mem.Allocator, provider: []const u8) !?[][]const u8 {
     const provider_key = modelsDevProviderKey(provider) orelse return null;
 
-    const response = http_util.curlGet(allocator, MODELS_DEV_URL, &.{}, "10") catch return error.FetchFailed;
+    const response = http_util.curlGet(allocator, MODELS_DEV_URL, &.{}, "10") catch |err| {
+        logModelCatalogFailureErr(MODELS_DEV_URL, provider, err);
+        return error.FetchFailed;
+    };
     defer allocator.free(response);
 
     return try parseModelsDevModelIds(allocator, response, provider, provider_key);
@@ -629,18 +654,36 @@ fn fetchModelsFromModelsDev(allocator: std.mem.Allocator, provider: []const u8) 
 fn parseModelsDevModelIds(
     allocator: std.mem.Allocator,
     json_response: []const u8,
-    _: []const u8,
+    provider: []const u8,
     provider_key: []const u8,
 ) ![][]const u8 {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_response, .{}) catch return error.FetchFailed;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_response, .{}) catch |err| {
+        logModelCatalogFailureErr(MODELS_DEV_URL, provider, err);
+        return error.FetchFailed;
+    };
     defer parsed.deinit();
 
-    if (parsed.value != .object) return error.FetchFailed;
-    const provider_val = parsed.value.object.get(provider_key) orelse return error.FetchFailed;
-    if (provider_val != .object) return error.FetchFailed;
+    if (parsed.value != .object) {
+        logModelCatalogFailure(MODELS_DEV_URL, provider, "top-level JSON is not an object");
+        return error.FetchFailed;
+    }
+    const provider_val = parsed.value.object.get(provider_key) orelse {
+        logModelCatalogFailure(MODELS_DEV_URL, provider, "provider entry missing from models.dev payload");
+        return error.FetchFailed;
+    };
+    if (provider_val != .object) {
+        logModelCatalogFailure(MODELS_DEV_URL, provider, "provider entry is not an object");
+        return error.FetchFailed;
+    }
 
-    const models_val = provider_val.object.get("models") orelse return error.FetchFailed;
-    if (models_val != .object) return error.FetchFailed;
+    const models_val = provider_val.object.get("models") orelse {
+        logModelCatalogFailure(MODELS_DEV_URL, provider, "provider models entry missing from models.dev payload");
+        return error.FetchFailed;
+    };
+    if (models_val != .object) {
+        logModelCatalogFailure(MODELS_DEV_URL, provider, "provider models entry is not an object");
+        return error.FetchFailed;
+    }
 
     var result: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer {
@@ -654,7 +697,10 @@ fn parseModelsDevModelIds(
         try result.append(allocator, try allocator.dupe(u8, entry.key_ptr.*));
     }
 
-    if (result.items.len == 0) return error.FetchFailed;
+    if (result.items.len == 0) {
+        logModelCatalogFailure(MODELS_DEV_URL, provider, "no chat-capable models found");
+        return error.FetchFailed;
+    }
     sortModelIds(result.items);
     return result.toOwnedSlice(allocator);
 }
@@ -686,20 +732,38 @@ fn jsonStringArrayContains(value: std.json.Value, needle: []const u8) bool {
     return false;
 }
 
-fn fetchAndParseModels(allocator: std.mem.Allocator, url: []const u8, headers: []const []const u8, prefix_filter: ?[]const u8) ![][]const u8 {
-    const response = http_util.curlGet(allocator, url, headers, "10") catch return error.FetchFailed;
+fn fetchAndParseModels(allocator: std.mem.Allocator, provider: []const u8, url: []const u8, headers: []const []const u8, prefix_filter: ?[]const u8) ![][]const u8 {
+    const response = http_util.curlGet(allocator, url, headers, "10") catch |err| {
+        logModelCatalogFailureErr(url, provider, err);
+        return error.FetchFailed;
+    };
     defer allocator.free(response);
 
-    if (response.len == 0) return error.FetchFailed;
+    if (response.len == 0) {
+        logModelCatalogFailure(url, provider, "empty response body");
+        return error.FetchFailed;
+    }
 
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{}) catch return error.FetchFailed;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{}) catch |err| {
+        logModelCatalogFailureErr(url, provider, err);
+        return error.FetchFailed;
+    };
     defer parsed.deinit();
 
     const root = parsed.value;
-    if (root != .object) return error.FetchFailed;
+    if (root != .object) {
+        logModelCatalogFailure(url, provider, "top-level JSON is not an object");
+        return error.FetchFailed;
+    }
 
-    const data = root.object.get("data") orelse return error.FetchFailed;
-    if (data != .array) return error.FetchFailed;
+    const data = root.object.get("data") orelse {
+        logModelCatalogFailure(url, provider, "missing data array");
+        return error.FetchFailed;
+    };
+    if (data != .array) {
+        logModelCatalogFailure(url, provider, "data field is not an array");
+        return error.FetchFailed;
+    }
 
     var result: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer {
@@ -718,7 +782,10 @@ fn fetchAndParseModels(allocator: std.mem.Allocator, url: []const u8, headers: [
         try result.append(allocator, try allocator.dupe(u8, id_val.string));
     }
 
-    if (result.items.len == 0) return error.FetchFailed;
+    if (result.items.len == 0) {
+        logModelCatalogFailure(url, provider, "no models matched the provider response");
+        return error.FetchFailed;
+    }
     sortModelIds(result.items);
     return result.toOwnedSlice(allocator);
 }
@@ -1279,6 +1346,7 @@ pub const autonomy_options = [_][]const u8{ "supervised", "autonomous", "fully_a
 pub const wizard_memory_backend_order = [_][]const u8{
     "hybrid",
     "sqlite",
+    "kg",
     "markdown",
     "memory",
     "none",
@@ -1306,6 +1374,7 @@ fn selectableBackendsForWizard(allocator: std.mem.Allocator) ![]const *const mem
 pub fn memoryProfileForBackend(backend: []const u8) []const u8 {
     if (std.mem.eql(u8, backend, "hybrid")) return "hybrid_keyword";
     if (std.mem.eql(u8, backend, "sqlite")) return "local_keyword";
+    if (std.mem.eql(u8, backend, "kg")) return "local_keyword";
     if (std.mem.eql(u8, backend, "markdown")) return "markdown_only";
     if (std.mem.eql(u8, backend, "postgres")) return "postgres_keyword";
     if (std.mem.eql(u8, backend, "none")) return "minimal_none";
@@ -3371,6 +3440,7 @@ test "selectableBackendsForWizard prioritizes hybrid and keeps api last" {
 test "memoryProfileForBackend maps common backends" {
     try std.testing.expectEqualStrings("hybrid_keyword", memoryProfileForBackend("hybrid"));
     try std.testing.expectEqualStrings("local_keyword", memoryProfileForBackend("sqlite"));
+    try std.testing.expectEqualStrings("local_keyword", memoryProfileForBackend("kg"));
     try std.testing.expectEqualStrings("markdown_only", memoryProfileForBackend("markdown"));
     try std.testing.expectEqualStrings("postgres_keyword", memoryProfileForBackend("postgres"));
     try std.testing.expectEqualStrings("minimal_none", memoryProfileForBackend("none"));
@@ -4168,6 +4238,17 @@ test "printProviderNextSteps includes env hint before interactive chat" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "nullclaw agent -m") == null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Interactive chat:  nullclaw agent") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Gateway:           nullclaw gateway") != null);
+}
+
+test "printProviderNextSteps warns about OpenRouter free-tier defaults" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+
+    try printProviderNextSteps(&aw.writer, "openrouter", "OPENROUTER_API_KEY", true, true);
+
+    const rendered = aw.writer.buffer[0..aw.writer.end];
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "`:free` model") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "rate-limit errors") != null);
 }
 
 test "printProviderNextSteps keeps openai-codex auth flow and interactive chat" {

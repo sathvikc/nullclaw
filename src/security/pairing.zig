@@ -208,6 +208,12 @@ pub const PairingGuard = struct {
     pub fn isAuthenticated(self: *const PairingGuard, token: []const u8) bool {
         if (!self.require_pairing_flag) return true;
 
+        return self.matchesStoredToken(token);
+    }
+
+    /// Check whether a bearer token matches one of the stored token hashes,
+    /// regardless of whether interactive pairing is enabled.
+    pub fn matchesStoredToken(self: *const PairingGuard, token: []const u8) bool {
         var hash_buf: [64]u8 = undefined;
         const hashed = hashToken(token, &hash_buf);
         const now = std_compat.time.timestamp();

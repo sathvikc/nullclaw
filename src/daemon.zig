@@ -225,6 +225,9 @@ fn logGatewayFailure(err: anyerror, port: u16) void {
         error.AddressInUse => {
             log.err("Gateway failed to start: port {d} is already in use. Is another nullclaw instance running?", .{port});
         },
+        error.PublicBindRequiresTunnel => {
+            log.err("Gateway failed to start: public bind requires an active tunnel or gateway.allow_public_bind=true.", .{});
+        },
         else => {
             log.err("Gateway failed to start: {}", .{err});
         },
@@ -235,7 +238,7 @@ fn logGatewayFailure(err: anyerror, port: u16) void {
 /// Gateway thread entry point.
 fn gatewayThread(allocator: std.mem.Allocator, config: *const Config, host: []const u8, port: u16, state: *DaemonState, event_bus: *bus_mod.Bus) void {
     const gateway = @import("gateway.zig");
-    gateway.run(allocator, host, port, config, event_bus) catch |err| {
+    gateway.run(allocator, host, port, config, event_bus, state.tunnel_url) catch |err| {
         logGatewayFailure(err, port);
         recordGatewayFailure(err, state);
         return;
@@ -1203,6 +1206,13 @@ fn processInboundMessage(
     defer if (routed_session_key) |key| allocator.free(key);
     const session_key = routed_session_key orelse msg.session_key;
 
+    const outbound_channel = resolveOutboundChannel(registry, msg.channel, outbound_account_id);
+    if (outbound_channel) |channel| {
+        markInboundMessageRead(channel, buildInboundMessageRef(msg, parsed_meta.fields));
+    }
+
+    if (runtime.session_mgr.routeInbound(session_key, msg.content) == .skip) return;
+
     const typing_recipient = sendInboundProcessingIndicator(
         allocator,
         registry,
@@ -1219,10 +1229,6 @@ fn processInboundMessage(
         typing_recipient,
     );
 
-    const outbound_channel = resolveOutboundChannel(registry, msg.channel, outbound_account_id);
-    if (outbound_channel) |channel| {
-        markInboundMessageRead(channel, buildInboundMessageRef(msg, parsed_meta.fields));
-    }
     const use_tracked_draft_outbound = if (outbound_channel) |channel|
         !channel.supportsStreamingOutbound() and dispatch.supportsDraftStreaming(channel)
     else

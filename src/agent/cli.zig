@@ -68,6 +68,22 @@ fn persistCliTurn(agent: *const Agent, content: []const u8, response: []const u8
     }, session_key, content, response);
 }
 
+fn printPendingSubagentNotices(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    manager: *subagent_mod.SubagentManager,
+    session_key: ?[]const u8,
+) !void {
+    const notices = try manager.takeCompletionNoticesForSession(allocator, session_key);
+    defer subagent_mod.SubagentManager.freeCompletionNotices(allocator, notices);
+    for (notices) |notice| {
+        try writer.print("\n{s}\n\n", .{notice.content});
+    }
+    if (notices.len > 0) {
+        try writer.flush();
+    }
+}
+
 fn cliStreamSinkCallback(ctx_ptr: *anyopaque, event: streaming.Event) void {
     if (event.stage != .chunk or event.text.len == 0) return;
     const stream_ctx: *CliStreamCtx = @ptrCast(@alignCast(ctx_ptr));
@@ -664,6 +680,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     defer if (pending_line) |line| allocator.free(line);
 
     while (true) {
+        printPendingSubagentNotices(allocator, w, &subagent_manager, agent.memory_session_id) catch {};
+
         var owned_line: ?[]u8 = null;
         defer if (owned_line) |line| allocator.free(line);
 

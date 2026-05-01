@@ -6,14 +6,16 @@ const JsonObjectMap = root.JsonObjectMap;
 const SubagentManager = @import("../subagent.zig").SubagentManager;
 
 /// Spawn tool — launches a background subagent to work on a task asynchronously.
-/// Returns a task ID immediately. Results are delivered as system messages.
+/// Returns a task ID immediately. Results are delivered as follow-up messages.
 pub const SpawnTool = struct {
     manager: ?*SubagentManager = null,
     default_channel: ?[]const u8 = null,
+    default_account_id: ?[]const u8 = null,
     default_chat_id: ?[]const u8 = null,
+    default_session_key: ?[]const u8 = null,
 
     pub const tool_name = "spawn";
-    pub const tool_description = "Spawn a background subagent to work on a task asynchronously. Returns a task ID immediately. Results are delivered as system messages when complete.";
+    pub const tool_description = "Spawn a background subagent to work on a task asynchronously. Returns a task ID immediately. Results are delivered as follow-up messages when complete.";
     pub const tool_params =
         \\{"type":"object","properties":{"task":{"type":"string","minLength":1,"description":"The task/prompt for the subagent"},"label":{"type":"string","description":"Optional human-readable label for tracking"},"agent":{"type":"string","description":"Optional named agent profile from agents.list for provider/model override"}},"required":["task"]}
     ;
@@ -49,9 +51,11 @@ pub const SpawnTool = struct {
             return ToolResult.fail("Spawn tool not connected to SubagentManager");
 
         const channel = self.default_channel orelse "system";
+        const account_id = self.default_account_id;
         const chat_id = self.default_chat_id orelse "agent";
+        const session_key = self.default_session_key orelse chat_id;
 
-        const task_id = manager.spawnWithAgent(trimmed_task, label, channel, chat_id, agent_name) catch |err| {
+        const task_id = manager.spawnWithAgent(trimmed_task, label, channel, chat_id, account_id, session_key, agent_name) catch |err| {
             return switch (err) {
                 error.TooManyConcurrentSubagents => ToolResult.fail("Too many concurrent subagents. Wait for some to complete."),
                 error.UnknownAgent => ToolResult.fail("Unknown named agent profile"),
@@ -61,7 +65,7 @@ pub const SpawnTool = struct {
 
         const msg = std.fmt.allocPrint(
             allocator,
-            "Subagent '{s}' spawned with task_id={d}. Results will be delivered as system messages.",
+            "Subagent '{s}' spawned with task_id={d}. Results will be delivered as follow-up messages.",
             .{ label, task_id },
         ) catch return ToolResult.ok("Subagent spawned");
 

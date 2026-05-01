@@ -14,6 +14,7 @@ const SqliteMemory = if (build_options.enable_sqlite) @import("sqlite.zig").Sqli
 const NoneMemory = @import("none.zig").NoneMemory;
 const MarkdownMemory = @import("markdown.zig").MarkdownMemory;
 const InMemoryLruMemory = @import("memory_lru.zig").InMemoryLruMemory;
+const KgMemory = if (build_options.enable_memory_kg) @import("kg.zig").KgMemory else struct {};
 
 // ── Contract: common invariants ─────────────────────────────────────
 
@@ -304,6 +305,29 @@ test "contract: memory_lru crud" {
 
 test "contract: memory_lru session_id" {
     var mem = InMemoryLruMemory.init(std.testing.allocator, 100);
+    defer mem.deinit();
+    try contractSessionId(mem.memory());
+}
+
+// ── KgMemory tests ──────────────────────────────────────────────────
+
+test "contract: kg basics" {
+    if (!build_options.enable_memory_kg) return;
+    var mem = try KgMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    try contractBasics(mem.memory());
+}
+
+test "contract: kg crud" {
+    if (!build_options.enable_memory_kg) return;
+    var mem = try KgMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    try contractCrud(mem.memory());
+}
+
+test "contract: kg session_id" {
+    if (!build_options.enable_memory_kg) return;
+    var mem = try KgMemory.init(std.testing.allocator, ":memory:");
     defer mem.deinit();
     try contractSessionId(mem.memory());
 }

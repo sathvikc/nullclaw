@@ -43,6 +43,7 @@ pub const provider_probe = @import("provider_probe.zig");
 pub const channel_probe = @import("channel_probe.zig");
 pub const from_json = @import("from_json.zig");
 pub const inbound_debounce = @import("inbound_debounce.zig");
+pub const inbound_router = @import("inbound_router.zig");
 
 // Phase 2: Agent core
 pub const agent = @import("agent.zig");
