@@ -1152,6 +1152,46 @@ fn shouldRunInboundIdleEviction(dispatch_count: u32) bool {
     return dispatch_count != 0 and (dispatch_count % EVICT_IDLE_DISPATCH_INTERVAL) == 0;
 }
 
+fn inboundDispatchShardIndex(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    msg: *const bus_mod.InboundMessage,
+    worker_count: usize,
+) usize {
+    if (worker_count == 0) return 0;
+
+    var parsed_meta = parseInboundMetadata(allocator, msg.metadata_json);
+    defer parsed_meta.deinit();
+
+    const routed_session_key = resolveInboundMainSessionKeyWithMetadata(
+        allocator,
+        config,
+        msg,
+        parsed_meta.fields,
+    ) orelse resolveInboundRouteSessionKeyWithMetadata(
+        allocator,
+        config,
+        msg,
+        parsed_meta.fields,
+    );
+    defer if (routed_session_key) |key| allocator.free(key);
+
+    const session_key = routed_session_key orelse msg.session_key;
+    const shard_count: u64 = @intCast(worker_count);
+    return @intCast(std.hash.Wyhash.hash(0, session_key) % shard_count);
+}
+
+fn publishInboundToWorkerQueue(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    worker_queues: []InboundDispatchQueue,
+    msg: bus_mod.InboundMessage,
+) error{Closed}!void {
+    std.debug.assert(worker_queues.len > 0);
+    const shard_index = inboundDispatchShardIndex(allocator, config, &msg, worker_queues.len);
+    try worker_queues[shard_index].publish(msg);
+}
+
 fn pollDebouncedInbound(
     _: std.mem.Allocator,
     event_bus: *bus_mod.Bus,
@@ -1378,14 +1418,15 @@ fn inboundDispatcherThread(
     defer debouncer.deinit();
     var ready_messages: std.ArrayListUnmanaged(bus_mod.InboundMessage) = .empty;
 
-    var worker_queue = InboundDispatchQueue.init();
+    var worker_queues: [INBOUND_DISPATCH_WORKER_COUNT]InboundDispatchQueue = undefined;
     var worker_ctxs: [INBOUND_DISPATCH_WORKER_COUNT]InboundWorkerCtx = undefined;
     var worker_threads: [INBOUND_DISPATCH_WORKER_COUNT]?std.Thread = .{null} ** INBOUND_DISPATCH_WORKER_COUNT;
     var worker_count: usize = 0;
     while (worker_count < INBOUND_DISPATCH_WORKER_COUNT) : (worker_count += 1) {
+        worker_queues[worker_count] = InboundDispatchQueue.init();
         worker_ctxs[worker_count] = .{
             .allocator = allocator,
-            .queue = &worker_queue,
+            .queue = &worker_queues[worker_count],
             .event_bus = event_bus,
             .registry = registry,
             .runtime = runtime,
@@ -1401,7 +1442,9 @@ fn inboundDispatcherThread(
         };
     }
     defer {
-        worker_queue.close();
+        for (worker_queues[0..worker_count]) |*queue| {
+            queue.close();
+        }
         var i: usize = 0;
         while (i < worker_count) : (i += 1) {
             if (worker_threads[i]) |thread| thread.join();
@@ -1431,7 +1474,7 @@ fn inboundDispatcherThread(
         while (ready_messages.items.len > 0) {
             var msg = ready_messages.orderedRemove(0);
             if (worker_count > 0) {
-                worker_queue.publish(msg) catch |err| {
+                publishInboundToWorkerQueue(allocator, runtime.config, worker_queues[0..worker_count], msg) catch |err| {
                     msg.deinit(allocator);
                     if (err == error.Closed) break;
                     continue;
@@ -1447,7 +1490,7 @@ fn inboundDispatcherThread(
     while (ready_messages.items.len > 0) {
         var msg = ready_messages.orderedRemove(0);
         if (worker_count > 0) {
-            worker_queue.publish(msg) catch {
+            publishInboundToWorkerQueue(allocator, runtime.config, worker_queues[0..worker_count], msg) catch {
                 msg.deinit(allocator);
             };
         } else {
@@ -1880,6 +1923,55 @@ test "shouldRunInboundIdleEviction only triggers at configured interval" {
     try std.testing.expect(shouldRunInboundIdleEviction(EVICT_IDLE_DISPATCH_INTERVAL));
     try std.testing.expect(shouldRunInboundIdleEviction(EVICT_IDLE_DISPATCH_INTERVAL * 2));
     try std.testing.expect(!shouldRunInboundIdleEviction(EVICT_IDLE_DISPATCH_INTERVAL + 1));
+}
+
+test "inboundDispatchShardIndex keeps routed session on same worker" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "tg-ops",
+            .match = .{
+                .channel = "telegram",
+                .account_id = "backup",
+                .peer = .{ .kind = .group, .id = "-100123:thread:77" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+        .channels = .{
+            .telegram = &[_]@import("config_types.zig").TelegramConfig{
+                .{ .account_id = "backup", .bot_token = "token" },
+            },
+        },
+    };
+    const first = bus_mod.InboundMessage{
+        .channel = "telegram",
+        .sender_id = "system:cron",
+        .chat_id = "chat-42",
+        .content = "first",
+        .session_key = "raw:first",
+        .metadata_json = "{\"account_id\":\"backup\",\"peer_kind\":\"group\",\"peer_id\":\"-100123\",\"thread_id\":\"77\"}",
+    };
+    const second = bus_mod.InboundMessage{
+        .channel = "telegram",
+        .sender_id = "system:cron",
+        .chat_id = "chat-42",
+        .content = "second",
+        .session_key = "raw:second",
+        .metadata_json = "{\"account_id\":\"backup\",\"peer_kind\":\"group\",\"peer_id\":\"-100123\",\"thread_id\":\"77\"}",
+    };
+
+    const worker_count = INBOUND_DISPATCH_WORKER_COUNT;
+    const shard_count: u64 = @intCast(worker_count);
+    const expected_shard: usize = @intCast(std.hash.Wyhash.hash(0, "agent:tg-ops:main") % shard_count);
+
+    // Regression (#855): same resolved session must stay on one FIFO worker queue.
+    try std.testing.expectEqual(expected_shard, inboundDispatchShardIndex(allocator, &config, &first, worker_count));
+    try std.testing.expectEqual(expected_shard, inboundDispatchShardIndex(allocator, &config, &second, worker_count));
 }
 
 test "hasSupervisedChannels false for defaults" {

@@ -1652,10 +1652,6 @@ pub const SessionManager = struct {
     }
 
     fn lockSessionForTurn(session: *Session) void {
-        if (session.mutex.tryLock()) return;
-        if (session.turn_running.load(.acquire)) {
-            session.agent.requestInterrupt();
-        }
         session.mutex.lock();
     }
 
@@ -3960,7 +3956,7 @@ test "requestTurnInterrupt returns active tool snapshot when available" {
     try testing.expectEqualStrings("shell", res.active_tool.?);
 }
 
-test "lockSessionForTurn requests interrupt when turn is already running" {
+test "lockSessionForTurn waits without interrupting active serial turn" {
     var mock = MockProvider{ .response = "ok" };
     const cfg = testConfig();
     var sm = testSessionManager(testing.allocator, &mock, &cfg);
@@ -3978,25 +3974,34 @@ test "lockSessionForTurn requests interrupt when turn is already running" {
     const Worker = struct {
         const Ctx = struct {
             session: *Session,
+            started: *std.atomic.Value(bool),
         };
 
         fn run(ctx: Ctx) void {
+            ctx.started.store(true, .release);
             SessionManager.lockSessionForTurn(ctx.session);
             ctx.session.mutex.unlock();
         }
     };
 
-    const ctx = Worker.Ctx{ .session = session };
+    var worker_started = std.atomic.Value(bool).init(false);
+    const ctx = Worker.Ctx{ .session = session, .started = &worker_started };
     var thread = try std.Thread.spawn(.{}, Worker.run, .{ctx});
     var thread_joined = false;
     defer if (!thread_joined) thread.join();
 
     var attempts: usize = 0;
-    while (attempts < 100 and !session.agent.interrupt_requested.load(.acquire)) : (attempts += 1) {
+    while (attempts < 100 and !worker_started.load(.acquire)) : (attempts += 1) {
         std_compat.thread.sleep(2 * std.time.ns_per_ms);
     }
-    // Regression (#832): a follow-up turn waiting on the same session lock must signal interruption.
-    try testing.expect(session.agent.interrupt_requested.load(.acquire));
+    try testing.expect(worker_started.load(.acquire));
+
+    attempts = 0;
+    while (attempts < 20) : (attempts += 1) {
+        std_compat.thread.sleep(2 * std.time.ns_per_ms);
+    }
+    // Regression (#832): serial queued turns must wait behind active turns without hard-stopping them.
+    try testing.expect(!session.agent.interrupt_requested.load(.acquire));
 
     session.mutex.unlock();
     session_unlocked = true;
