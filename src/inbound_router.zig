@@ -9,7 +9,7 @@
 //!       .process           => session_mgr.processMessageStreaming(...),
 //!       .inject            => session_mgr.injectMidTurn(session_key, text),
 //!       .replace_injection => session_mgr.injectMidTurn(session_key, text),  // same effect
-//!       .queue             => queue_for_later_processing,
+//!       .queue             => session_mgr.processMessageStreaming(...),      // waits on session lock
 //!       .drop              => {},
 //!   }
 

@@ -1214,6 +1214,13 @@ fn inboundDispatcherThread(
             defer if (routed_session_key) |key| allocator.free(key);
             const session_key = routed_session_key orelse msg.session_key;
 
+            const outbound_channel = resolveOutboundChannel(registry, msg.channel, outbound_account_id);
+            if (outbound_channel) |channel| {
+                markInboundMessageRead(channel, buildInboundMessageRef(&msg, parsed_meta.fields));
+            }
+
+            if (runtime.session_mgr.routeInbound(session_key, msg.content) == .skip) continue;
+
             const typing_recipient = sendInboundProcessingIndicator(
                 allocator,
                 registry,
@@ -1230,10 +1237,6 @@ fn inboundDispatcherThread(
                 typing_recipient,
             );
 
-            const outbound_channel = resolveOutboundChannel(registry, msg.channel, outbound_account_id);
-            if (outbound_channel) |channel| {
-                markInboundMessageRead(channel, buildInboundMessageRef(&msg, parsed_meta.fields));
-            }
             const use_tracked_draft_outbound = if (outbound_channel) |channel|
                 !channel.supportsStreamingOutbound() and dispatch.supportsDraftStreaming(channel)
             else

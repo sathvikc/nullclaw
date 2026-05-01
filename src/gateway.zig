@@ -3190,7 +3190,7 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                     std.mem.eql(u8, peer_kind, "group"),
                     if (std.mem.eql(u8, peer_kind, "group")) cid_str else null,
                 );
-                const reply: ?[]const u8 = sm.processMessage(sk, msg_text.?, conversation_context) catch |err| blk: {
+                const reply: ?[]const u8 = sm.processInboundMessage(sk, msg_text.?, conversation_context) catch |err| blk: {
                     if (tg_bot_token.len > 0) {
                         sendTelegramReply(ctx.req_allocator, tg_bot_token, chat_id.?, thread_id, userFacingAgentError(err)) catch {};
                     }
@@ -3337,7 +3337,7 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
                     wa_is_group,
                     wa_group_id,
                 );
-                const reply: ?[]const u8 = sm.processMessage(wa_session_key, mt, conversation_context) catch |err| blk: {
+                const reply: ?[]const u8 = sm.processInboundMessage(wa_session_key, mt, conversation_context) catch |err| blk: {
                     ctx.response_body = userFacingAgentErrorJson(err);
                     break :blk null;
                 };
@@ -3401,7 +3401,7 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
                     wa_is_group,
                     wa_group_id,
                 );
-                const reply: ?[]const u8 = sm.processMessage(wa_session_key, mt, conversation_context) catch |err| blk: {
+                const reply: ?[]const u8 = sm.processInboundMessage(wa_session_key, mt, conversation_context) catch |err| blk: {
                     ctx.response_body = userFacingAgentErrorJson(err);
                     break :blk null;
                 };
@@ -3612,7 +3612,7 @@ fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
                         !interactive_target.is_dm,
                         if (!interactive_target.is_dm) interactive_target.channel_id else null,
                     );
-                    const reply: ?[]const u8 = sm.processMessage(session_key, selection.submit_text, conversation_context) catch |err| blk: {
+                    const reply: ?[]const u8 = sm.processInboundMessage(session_key, selection.submit_text, conversation_context) catch |err| blk: {
                         var outbound_ch = channels.slack.SlackChannel.initFromConfig(ctx.req_allocator, slack_cfg.*);
                         outbound_ch.sendMessage(selection.target, userFacingAgentError(err)) catch {};
                         break :blk null;
@@ -3754,7 +3754,7 @@ fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
             !is_dm,
             if (!is_dm) channel_id else null,
         );
-        const reply: ?[]const u8 = sm.processMessage(sk, text, conversation_context) catch |err| blk: {
+        const reply: ?[]const u8 = sm.processInboundMessage(sk, text, conversation_context) catch |err| blk: {
             var outbound_ch = channels.slack.SlackChannel.initFromConfig(ctx.req_allocator, slack_cfg.*);
             outbound_ch.sendMessage(channel_id, userFacingAgentError(err)) catch {};
             break :blk null;
@@ -3891,7 +3891,7 @@ fn handleLineWebhookRoute(ctx: *WebhookHandlerContext) void {
                         !std.mem.eql(u8, line_peer.kind, "direct"),
                         if (!std.mem.eql(u8, line_peer.kind, "direct")) line_peer.id else null,
                     );
-                    const reply: ?[]const u8 = sm.processMessage(sk, text, conversation_context) catch |err| blk: {
+                    const reply: ?[]const u8 = sm.processInboundMessage(sk, text, conversation_context) catch |err| blk: {
                         if (evt.reply_token) |rt| {
                             var line_ch = channels.line.LineChannel.init(ctx.req_allocator, .{
                                 .access_token = line_access_token,
@@ -4020,7 +4020,7 @@ fn handleLarkWebhookRoute(ctx: *WebhookHandlerContext) void {
                 msg.is_group,
                 if (msg.is_group) msg.sender else null,
             );
-            const reply: ?[]const u8 = sm.processMessage(sk, msg.content, conversation_context) catch |err| blk: {
+            const reply: ?[]const u8 = sm.processInboundMessage(sk, msg.content, conversation_context) catch |err| blk: {
                 lark_ch.sendMessage(msg.sender, userFacingAgentError(err)) catch {};
                 break :blk null;
             };
@@ -4266,7 +4266,7 @@ fn handleWeChatWebhookRoute(ctx: *WebhookHandlerContext) void {
             ctx.config_opt,
             wechat_account_id,
         );
-        const reply: ?[]const u8 = sm.processMessage(session_key, inbound.content, null) catch null;
+        const reply: ?[]const u8 = sm.processInboundMessage(session_key, inbound.content, null) catch null;
         if (reply) |r| {
             defer ctx.root_allocator.free(r);
             const now_secs = std_compat.time.timestamp();
@@ -4462,7 +4462,7 @@ fn handleWeComWebhookRoute(ctx: *WebhookHandlerContext) void {
     }
 
     if (ctx.session_mgr_opt) |sm| {
-        const reply: ?[]const u8 = sm.processMessage(session_key, inbound.content, null) catch |err| blk: {
+        const reply: ?[]const u8 = sm.processInboundMessage(session_key, inbound.content, null) catch |err| blk: {
             if (wecom_cfg_opt) |wecom_cfg| {
                 var wecom_ch = channels.wecom.WeComChannel.initFromConfig(ctx.req_allocator, wecom_cfg.*);
                 wecom_ch.sendMessageAuto("", userFacingAgentError(err)) catch {};
@@ -4585,7 +4585,7 @@ fn handleQqWebhookRoute(ctx: *WebhookHandlerContext) void {
                 .is_group = if (peer) |resolved| resolved.kind != .direct else null,
                 .group_id = if (peer) |resolved| if (resolved.kind == .direct) null else resolved.id else null,
             });
-            const reply: ?[]const u8 = sm.processMessage(session_key, inbound.content, conversation_context) catch |err| blk: {
+            const reply: ?[]const u8 = sm.processInboundMessage(session_key, inbound.content, conversation_context) catch |err| blk: {
                 qq_channel.sendMessage(inbound.chat_id, userFacingAgentError(err)) catch {};
                 break :blk null;
             };
@@ -4702,7 +4702,7 @@ fn handleMaxWebhookRoute(ctx: *WebhookHandlerContext) void {
                 inbound.is_group,
                 if (inbound.is_group) reply_target else null,
             );
-            const reply: ?[]const u8 = sm.processMessage(sk, inbound.content, conversation_context) catch |err| blk: {
+            const reply: ?[]const u8 = sm.processInboundMessage(sk, inbound.content, conversation_context) catch |err| blk: {
                 max_ch.sendMessage(reply_target, userFacingAgentError(err)) catch {};
                 break :blk null;
             };
@@ -4906,7 +4906,7 @@ fn handleTeamsWebhookRoute(ctx: *WebhookHandlerContext) void {
     if (ctx.state.event_bus) |eb| {
         _ = publishToBus(eb, ctx.state.allocator, "teams", from_id, chat_id, text, sk, metadata);
     } else if (ctx.session_mgr_opt) |sm| {
-        const reply: ?[]const u8 = sm.processMessage(sk, text, conversation_context) catch blk: {
+        const reply: ?[]const u8 = sm.processInboundMessage(sk, text, conversation_context) catch blk: {
             break :blk null;
         };
         if (reply) |r| {
@@ -5658,7 +5658,7 @@ pub fn run(
                                 response_body = "{\"status\":\"received\"}";
                             } else if (session_mgr_opt) |*sm| {
                                 const start_seq = gateway_thread_observer.currentSeq();
-                                const reply: ?[]const u8 = sm.processMessage(routing.session_key, msg_text, routing.conversation_context) catch |err| blk: {
+                                const reply: ?[]const u8 = sm.processInboundMessage(routing.session_key, msg_text, routing.conversation_context) catch |err| blk: {
                                     response_body = userFacingAgentErrorJson(err);
                                     break :blk null;
                                 };
