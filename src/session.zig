@@ -201,11 +201,22 @@ pub const Session = struct {
         self.injection_pending = duped;
     }
 
-    /// Returns true if there is a pending injection (lock-free snapshot).
+    /// Returns true if there is a pending injection.
     pub fn hasInjection(self: *Session) bool {
         self.injection_mu.lock();
         defer self.injection_mu.unlock();
         return self.injection_pending != null;
+    }
+
+    fn drainInjection(self: *Session, owner_allocator: Allocator, target_allocator: Allocator) ?[]u8 {
+        self.injection_mu.lock();
+        defer self.injection_mu.unlock();
+
+        const pending = self.injection_pending orelse return null;
+        const drained = target_allocator.dupe(u8, pending) catch return null;
+        owner_allocator.free(pending);
+        self.injection_pending = null;
+        return drained;
     }
 };
 
@@ -1763,14 +1774,7 @@ pub const SessionManager = struct {
 
             fn callback(ctx: *anyopaque, agent_alloc: std.mem.Allocator) ?[]u8 {
                 const dc: *@This() = @ptrCast(@alignCast(ctx));
-                dc.session.injection_mu.lock();
-                defer dc.session.injection_mu.unlock();
-                const pending = dc.session.injection_pending orelse return null;
-                defer {
-                    dc.sm_allocator.free(pending);
-                    dc.session.injection_pending = null;
-                }
-                return agent_alloc.dupe(u8, pending) catch null;
+                return dc.session.drainInjection(dc.sm_allocator, agent_alloc);
             }
         };
         var drain_ctx = DrainCtx{ .session = session, .sm_allocator = self.allocator };
@@ -2180,6 +2184,73 @@ const MockProvider = struct {
     }
 
     fn mockDeinit(_: *anyopaque) void {}
+};
+
+const CaptureMessagesProvider = struct {
+    response: []const u8 = "ok",
+    chat_calls: usize = 0,
+    user_count: usize = 0,
+    user_lens: [4]usize = [_]usize{0} ** 4,
+    user_bufs: [4][128]u8 = undefined,
+
+    const vtable = Provider.VTable{
+        .chatWithSystem = chatWithSystem,
+        .chat = chat,
+        .supportsNativeTools = supportsNativeTools,
+        .getName = getName,
+        .deinit = deinitFn,
+    };
+
+    fn provider(self: *CaptureMessagesProvider) Provider {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    fn chatWithSystem(
+        ptr: *anyopaque,
+        allocator: Allocator,
+        _: ?[]const u8,
+        _: []const u8,
+        _: []const u8,
+        _: f64,
+    ) anyerror![]const u8 {
+        const self: *CaptureMessagesProvider = @ptrCast(@alignCast(ptr));
+        return allocator.dupe(u8, self.response);
+    }
+
+    fn chat(
+        ptr: *anyopaque,
+        allocator: Allocator,
+        request: providers.ChatRequest,
+        _: []const u8,
+        _: f64,
+    ) anyerror!providers.ChatResponse {
+        const self: *CaptureMessagesProvider = @ptrCast(@alignCast(ptr));
+        self.chat_calls += 1;
+        self.user_count = 0;
+        for (request.messages) |message| {
+            if (message.role != .user or self.user_count >= self.user_bufs.len) continue;
+            const idx = self.user_count;
+            const len = @min(message.content.len, self.user_bufs[idx].len);
+            @memcpy(self.user_bufs[idx][0..len], message.content[0..len]);
+            self.user_lens[idx] = len;
+            self.user_count += 1;
+        }
+        return .{ .content = try allocator.dupe(u8, self.response) };
+    }
+
+    fn userMessage(self: *const CaptureMessagesProvider, idx: usize) []const u8 {
+        return self.user_bufs[idx][0..self.user_lens[idx]];
+    }
+
+    fn supportsNativeTools(_: *anyopaque) bool {
+        return false;
+    }
+
+    fn getName(_: *anyopaque) []const u8 {
+        return "capture_messages";
+    }
+
+    fn deinitFn(_: *anyopaque) void {}
 };
 
 const CapturePromptProvider = struct {
@@ -3764,6 +3835,89 @@ test "processMessageStreaming forwards tool progress hints" {
     // Regression: A2A streaming depends on this sink to observe tool-call starts.
     try testing.expectEqual(@as(usize, 1), collector.count);
     try testing.expectEqualStrings("probe", collector.lastText());
+}
+
+test "routeInput observes pending mid-turn injection" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session_key = "route:injection";
+    const session = try sm.getOrCreate(session_key);
+    session.agent.queue_mode = .latest;
+    session.turn_running.store(true, .release);
+    defer session.turn_running.store(false, .release);
+
+    try sm.injectMidTurn(session_key, "first");
+    try sm.injectMidTurn(session_key, "second");
+
+    const input = sm.routeInput(session_key);
+    try testing.expect(input.turn_running);
+    try testing.expectEqual(agent_mod.Agent.QueueMode.latest, input.queue_mode);
+    try testing.expect(input.has_pending_injection);
+    try testing.expectEqual(inbound_router.RoutingDecision.replace_injection, inbound_router.route(input));
+
+    const drained = session.drainInjection(testing.allocator, testing.allocator) orelse return error.TestExpectedEqual;
+    defer testing.allocator.free(drained);
+    try testing.expectEqualStrings("second", drained);
+    try testing.expect(!session.hasInjection());
+}
+
+test "drainInjection preserves pending message when target allocation fails" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("inject:oom");
+    try session.injectMidTurn(testing.allocator, "keep me");
+
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    failing.fail_index = failing.alloc_index;
+
+    // Regression: a transient allocation failure in the agent allocator must not
+    // drop the pending injection before a later tool-loop boundary can retry it.
+    try testing.expect(session.drainInjection(testing.allocator, failing.allocator()) == null);
+    try testing.expect(session.hasInjection());
+
+    const drained = session.drainInjection(testing.allocator, testing.allocator) orelse return error.TestExpectedEqual;
+    defer testing.allocator.free(drained);
+    try testing.expectEqualStrings("keep me", drained);
+    try testing.expect(!session.hasInjection());
+}
+
+test "processMessageStreaming drains pending mid-turn injection into provider messages" {
+    var provider = CaptureMessagesProvider{};
+    const cfg = testConfig();
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        provider.provider(),
+        &.{},
+        null,
+        noop.observer(),
+        null,
+        null,
+    );
+    defer sm.deinit();
+
+    const session_key = "inject:provider";
+    _ = try sm.getOrCreate(session_key);
+    try sm.injectMidTurn(session_key, "mid turn");
+
+    const resp = try sm.processMessage(session_key, "initial", null);
+    defer testing.allocator.free(resp);
+
+    // Regression: pending injections must be folded into the active provider
+    // request as user history, not left stranded in the session buffer.
+    try testing.expectEqual(@as(usize, 1), provider.chat_calls);
+    try testing.expectEqual(@as(usize, 2), provider.user_count);
+    try testing.expectEqualStrings("initial", provider.userMessage(0));
+    try testing.expectEqualStrings("mid turn", provider.userMessage(1));
+    const session = try sm.getOrCreate(session_key);
+    try testing.expect(!session.hasInjection());
 }
 
 test "processMessage refreshes system prompt when conversation context is cleared" {
