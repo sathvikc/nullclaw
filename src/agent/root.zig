@@ -951,6 +951,51 @@ pub const Agent = struct {
         return false;
     }
 
+    fn isToolTriggerSeparator(self: *const Agent, c: u8) bool {
+        return std.ascii.isWhitespace(c) or std.mem.indexOfScalar(u8, self.tools_config.trigger_punctuation, c) != null;
+    }
+
+    fn nextToolTriggerWord(self: *const Agent, text: []const u8, idx: *usize) ?[]const u8 {
+        while (idx.* < text.len and self.isToolTriggerSeparator(text[idx.*])) : (idx.* += 1) {}
+        if (idx.* >= text.len) return null;
+
+        const start = idx.*;
+        while (idx.* < text.len and !self.isToolTriggerSeparator(text[idx.*])) : (idx.* += 1) {}
+        return text[start..idx.*];
+    }
+
+    fn isToolTriggerModifier(self: *const Agent, word: []const u8) bool {
+        for (self.tools_config.trigger_modifiers) |modifier| {
+            if (std.ascii.eqlIgnoreCase(word, modifier)) return true;
+        }
+        return false;
+    }
+
+    fn nextUserToolTriggerWord(self: *const Agent, text: []const u8, idx: *usize) ?[]const u8 {
+        while (self.nextToolTriggerWord(text, idx)) |word| {
+            if (!self.isToolTriggerModifier(word)) return word;
+        }
+        return null;
+    }
+
+    fn normalizedToolTriggerEquals(self: *const Agent, user_message: []const u8, trigger: []const u8) bool {
+        var user_idx: usize = 0;
+        var trigger_idx: usize = 0;
+
+        while (self.nextToolTriggerWord(trigger, &trigger_idx)) |trigger_word| {
+            const user_word = self.nextUserToolTriggerWord(user_message, &user_idx) orelse return false;
+            if (!std.ascii.eqlIgnoreCase(user_word, trigger_word)) return false;
+        }
+
+        return self.nextUserToolTriggerWord(user_message, &user_idx) == null;
+    }
+
+    fn toolTriggerMatchesMessage(self: *const Agent, user_message: []const u8, trigger: []const u8) bool {
+        if (containsAsciiIgnoreCase(user_message, trigger)) return true;
+        if (self.tools_config.trigger_modifiers.len == 0 and self.tools_config.trigger_punctuation.len == 0) return false;
+        return self.normalizedToolTriggerEquals(user_message, trigger);
+    }
+
     fn hasModelRouteHint(self: *const Agent, hint: []const u8) bool {
         for (self.model_routes) |route| {
             if (std.mem.eql(u8, route.hint, hint)) return true;
@@ -1557,7 +1602,70 @@ pub const Agent = struct {
         return std.mem.endsWith(u8, name, suffix);
     }
 
-    /// Filter `self.tool_specs` for the current turn based on `tool_filter_groups`.
+    fn toolPriorityScoreForMessage(self: *const Agent, tool_name: []const u8, user_message: []const u8) u16 {
+        var best_score: u16 = 0;
+        for (self.tools_config.tool_customizations) |custom| {
+            if (!custom.enabled or custom.triggers.len == 0) continue;
+            if (!std.mem.eql(u8, custom.name, tool_name)) continue;
+
+            for (custom.triggers) |kw| {
+                if (!self.toolTriggerMatchesMessage(user_message, kw)) continue;
+                const score = @as(u16, custom.priority) + 1;
+                if (score > best_score) best_score = score;
+                break;
+            }
+        }
+        return best_score;
+    }
+
+    fn priorityToolForMessage(self: *const Agent, user_message: []const u8) ?[]const u8 {
+        var best_score: u16 = 0;
+        var best_name: ?[]const u8 = null;
+        for (self.tool_specs) |spec| {
+            const score = self.toolPriorityScoreForMessage(spec.name, user_message);
+            if (score > best_score) {
+                best_score = score;
+                best_name = spec.name;
+            }
+        }
+        return best_name;
+    }
+
+    fn prioritizeToolSpecsForTurn(
+        self: *const Agent,
+        arena: std.mem.Allocator,
+        specs: []const ToolSpec,
+        user_message: []const u8,
+    ) ![]const ToolSpec {
+        if (self.tools_config.tool_customizations.len == 0 or specs.len < 2) return specs;
+
+        var has_triggered_tool = false;
+        for (specs) |spec| {
+            if (self.toolPriorityScoreForMessage(spec.name, user_message) > 0) {
+                has_triggered_tool = true;
+                break;
+            }
+        }
+        if (!has_triggered_tool) return specs;
+
+        const prioritized = try arena.dupe(ToolSpec, specs);
+        var i: usize = 1;
+        while (i < prioritized.len) : (i += 1) {
+            const current = prioritized[i];
+            const current_score = self.toolPriorityScoreForMessage(current.name, user_message);
+            var j = i;
+            while (j > 0) {
+                const previous_score = self.toolPriorityScoreForMessage(prioritized[j - 1].name, user_message);
+                if (previous_score >= current_score) break;
+                prioritized[j] = prioritized[j - 1];
+                j -= 1;
+            }
+            prioritized[j] = current;
+        }
+        return prioritized;
+    }
+
+    /// Filter and prioritize `self.tool_specs` for the current turn.
     ///
     /// Returns a slice allocated from `arena` containing only the specs that should
     /// be included for this turn.  The returned slice borrows pointers from
@@ -1569,12 +1677,16 @@ pub const Agent = struct {
     ///   - `always` groups unconditionally include matching MCP tools.
     ///   - `dynamic` groups include matching MCP tools when the user message contains
     ///     at least one of the group's keywords (case-insensitive substring match).
+    ///   - Matching `tools.tool_customizations.triggers` move configured tools earlier
+    ///     in the turn's schema, sorted by priority while preserving ties.
     fn filterToolSpecsForTurn(
         self: *const Agent,
         arena: std.mem.Allocator,
         user_message: []const u8,
     ) ![]const ToolSpec {
-        if (self.tool_filter_groups.len == 0) return self.tool_specs;
+        if (self.tool_filter_groups.len == 0) {
+            return self.prioritizeToolSpecsForTurn(arena, self.tool_specs, user_message);
+        }
 
         var result: std.ArrayListUnmanaged(ToolSpec) = .empty;
 
@@ -1619,27 +1731,7 @@ pub const Agent = struct {
             if (include) try result.append(arena, spec);
         }
 
-        return result.toOwnedSlice(arena);
-    }
-
-    fn priorityToolNameForMessage(
-        tools_config: config_types.ToolsConfig,
-        user_message: []const u8,
-    ) ?[]const u8 {
-        var highest_priority: u8 = 0;
-        var priority_tool: ?[]const u8 = null;
-        for (tools_config.tool_customizations) |custom| {
-            if (!custom.enabled or custom.triggers.len == 0) continue;
-            for (custom.triggers) |kw| {
-                if (containsAsciiIgnoreCase(user_message, kw)) {
-                    if (priority_tool == null or custom.priority >= highest_priority) {
-                        highest_priority = custom.priority;
-                        priority_tool = custom.name;
-                    }
-                }
-            }
-        }
-        return priority_tool;
+        return self.prioritizeToolSpecsForTurn(arena, try result.toOwnedSlice(arena), user_message);
     }
 
     /// Execute a single conversation turn: send messages to LLM, parse tool calls,
@@ -1649,7 +1741,7 @@ pub const Agent = struct {
         commands.refreshSubagentToolContext(self);
 
         const turn_input = commands.planTurnInput(user_message);
-        var effective_user_message: []const u8 = blk: {
+        const effective_user_message = blk: {
             if (turn_input.invoke_local_handler) {
                 const slash_response = (try self.handleSlashCommand(user_message)) orelse return error.SlashCommandDispatchMismatch;
                 if (turn_input.llm_user_message) |llm_user_message| {
@@ -1661,14 +1753,7 @@ pub const Agent = struct {
             }
             break :blk turn_input.llm_user_message orelse user_message;
         };
-        var effective_user_message_owned = false;
-        defer if (effective_user_message_owned) self.allocator.free(effective_user_message);
-
-        // Tool triggers bias the LLM toward a matching configured tool without changing tool availability.
-        if (priorityToolNameForMessage(self.tools_config, effective_user_message)) |tool_name| {
-            effective_user_message = try std.fmt.allocPrint(self.allocator, "[PRIORITY: Please call the {s} tool immediately] {s}", .{ tool_name, effective_user_message });
-            effective_user_message_owned = true;
-        }
+        const priority_tool = self.priorityToolForMessage(effective_user_message);
 
         const turn_route_selection = self.routeSelectionForTurn(effective_user_message);
         if (turn_route_selection) |selection| {
@@ -1864,7 +1949,7 @@ pub const Agent = struct {
             const arena = iter_arena.allocator();
 
             // Build messages slice for provider (arena-owned; freed at end of iteration)
-            const messages = try self.buildProviderMessages(arena, turn_model_name);
+            const messages = try self.buildProviderMessagesForTurn(arena, turn_model_name, priority_tool);
 
             const timer_start = std_compat.time.milliTimestamp();
             const is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
@@ -1914,7 +1999,7 @@ pub const Agent = struct {
                             log.info("Auto-disabling vision for model {s}", .{turn_model_name});
                         }
                         try self.markVisionDisabled(turn_model_name);
-                        const retry_msgs = try self.buildProviderMessages(arena, turn_model_name);
+                        const retry_msgs = try self.buildProviderMessagesForTurn(arena, turn_model_name, priority_tool);
                         const retry_max_tokens = self.effectiveMaxTokensForTurn(
                             retry_msgs,
                             if (native_tools_enabled) turn_tool_specs else null,
@@ -1988,7 +2073,7 @@ pub const Agent = struct {
                             log.info("Auto-disabling vision for model {s}", .{turn_model_name});
                         }
                         try self.markVisionDisabled(turn_model_name);
-                        const retry_msgs = try self.buildProviderMessages(arena, turn_model_name);
+                        const retry_msgs = try self.buildProviderMessagesForTurn(arena, turn_model_name, priority_tool);
                         const retry_max_tokens = self.effectiveMaxTokensForTurn(
                             retry_msgs,
                             if (native_tools_enabled) turn_tool_specs else null,
@@ -2027,7 +2112,7 @@ pub const Agent = struct {
                         self.forceCompressHistory())
                     {
                         self.context_was_compacted = true;
-                        const recovery_msgs = self.buildProviderMessages(arena, turn_model_name) catch |prep_err| return prep_err;
+                        const recovery_msgs = self.buildProviderMessagesForTurn(arena, turn_model_name, priority_tool) catch |prep_err| return prep_err;
                         const recovery_max_tokens = self.effectiveMaxTokensForTurn(
                             recovery_msgs,
                             if (native_tools_enabled) turn_tool_specs else null,
@@ -2090,7 +2175,7 @@ pub const Agent = struct {
                         // force-compress and retry once more
                         if (self.history.items.len > compaction.CONTEXT_RECOVERY_MIN_HISTORY and self.forceCompressHistory()) {
                             self.context_was_compacted = true;
-                            const recovery_msgs = self.buildProviderMessages(arena, turn_model_name) catch |prep_err| return prep_err;
+                            const recovery_msgs = self.buildProviderMessagesForTurn(arena, turn_model_name, priority_tool) catch |prep_err| return prep_err;
                             const recovery_max_tokens = self.effectiveMaxTokensForTurn(
                                 recovery_msgs,
                                 if (native_tools_enabled) turn_tool_specs else null,
@@ -3218,6 +3303,33 @@ pub const Agent = struct {
             .skip_dir_check = self.multimodal_unrestricted,
             .allow_remote_fetch = self.multimodal_unrestricted,
         });
+    }
+
+    fn buildProviderMessagesForTurn(
+        self: *Agent,
+        arena: std.mem.Allocator,
+        model_name: []const u8,
+        priority_tool: ?[]const u8,
+    ) ![]ChatMessage {
+        const messages = try self.buildProviderMessages(arena, model_name);
+        const tool_name = priority_tool orelse return messages;
+
+        var i = messages.len;
+        while (i > 0) {
+            i -= 1;
+            if (messages[i].role != .user) continue;
+            if (messages[i].content_parts != null) return messages;
+
+            const with_hint = try arena.dupe(ChatMessage, messages);
+            with_hint[i].content = try std.fmt.allocPrint(
+                arena,
+                "[PRIORITY: Please call the {s} tool immediately] {s}",
+                .{ tool_name, messages[i].content },
+            );
+            return with_hint;
+        }
+
+        return messages;
     }
 
     fn appendMultimodalAllowedDir(
@@ -9851,6 +9963,83 @@ test "filterToolSpecsForTurn dynamic group keyword match is case-insensitive" {
     agent.tool_specs = try allocator.alloc(ToolSpec, 0);
 }
 
+test "filterToolSpecsForTurn prioritizes triggered custom tools" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    allocator.free(agent.tool_specs);
+    agent.tool_specs = &.{
+        .{ .name = "shell", .description = "run shell", .parameters_json = "{}" },
+        .{ .name = "file_read", .description = "read files", .parameters_json = "{}" },
+        .{ .name = "calculator", .description = "math", .parameters_json = "{}" },
+    };
+    agent.tools_config = .{
+        .tool_customizations = &.{
+            .{ .name = "calculator", .triggers = &.{"calc"}, .priority = 1 },
+            .{ .name = "file_read", .triggers = &.{"read"}, .priority = 10 },
+        },
+    };
+
+    const result = try agent.filterToolSpecsForTurn(arena, "read this file and calc the total");
+    try std.testing.expectEqual(@as(usize, 3), result.len);
+    try std.testing.expectEqualStrings("file_read", result[0].name);
+    try std.testing.expectEqualStrings("calculator", result[1].name);
+    try std.testing.expectEqualStrings("shell", result[2].name);
+    agent.tool_specs = try allocator.alloc(ToolSpec, 0);
+}
+
+test "filterToolSpecsForTurn applies trigger modifiers and punctuation" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    allocator.free(agent.tool_specs);
+    agent.tool_specs = &.{
+        .{ .name = "shell", .description = "run shell", .parameters_json = "{}" },
+        .{ .name = "file_read", .description = "read files", .parameters_json = "{}" },
+    };
+    agent.tools_config = .{
+        .trigger_modifiers = &.{ "please", "now" },
+        .trigger_punctuation = "-!",
+        .tool_customizations = &.{
+            .{ .name = "file_read", .triggers = &.{"read file"}, .priority = 5 },
+        },
+    };
+
+    const result = try agent.filterToolSpecsForTurn(arena, "please read-file now!");
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+    try std.testing.expectEqualStrings("file_read", result[0].name);
+    try std.testing.expectEqualStrings("shell", result[1].name);
+    agent.tool_specs = try allocator.alloc(ToolSpec, 0);
+}
+
+test "buildProviderMessagesForTurn adds priority hint without mutating history" {
+    // Regression: priority hints must not be persisted as user text in history/memory/cache.
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "please read this file"),
+    });
+
+    const messages = try agent.buildProviderMessagesForTurn(arena, agent.model_name, "file_read");
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expect(std.mem.indexOf(u8, messages[0].content, "[PRIORITY: Please call the file_read tool immediately]") != null);
+    try std.testing.expectEqualStrings("please read this file", agent.history.items[0].content);
+}
+
 test "globMatch handles prefix wildcard" {
     try std.testing.expect(Agent.globMatch("mcp_vikunja_*", "mcp_vikunja_list_tasks"));
     try std.testing.expect(Agent.globMatch("mcp_vikunja_*", "mcp_vikunja_create_task"));
@@ -9858,31 +10047,4 @@ test "globMatch handles prefix wildcard" {
     try std.testing.expect(Agent.globMatch("*", "anything"));
     try std.testing.expect(Agent.globMatch("shell", "shell"));
     try std.testing.expect(!Agent.globMatch("shell", "shell_extra"));
-}
-
-test "priorityToolNameForMessage selects highest enabled trigger match" {
-    const customizations: []const config_types.ToolCustomization = &.{
-        .{
-            .name = "shell",
-            .triggers = &.{"run"},
-            .priority = 2,
-        },
-        .{
-            .name = "file_read",
-            .triggers = &.{"inspect"},
-            .priority = 9,
-        },
-        .{
-            .name = "git",
-            .triggers = &.{"status"},
-            .priority = 255,
-            .enabled = false,
-        },
-    };
-    const tools_config = config_types.ToolsConfig{ .tool_customizations = customizations };
-
-    // Regression: disabled matches must not override enabled trigger hints.
-    const selected = Agent.priorityToolNameForMessage(tools_config, "please RUN and inspect the workspace status") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings("file_read", selected);
-    try std.testing.expect(Agent.priorityToolNameForMessage(tools_config, "plain chat") == null);
 }

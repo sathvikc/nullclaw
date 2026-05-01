@@ -395,6 +395,10 @@ pub const ToolsConfig = struct {
     tool_customizations: []const ToolCustomization = &.{},
     /// Optional path to external JSON file containing tool customizations.
     tool_customizations_file: ?[]const u8 = null,
+    /// Custom modifiers to remove from user input when checking for exact trigger matches.
+    trigger_modifiers: []const []const u8 = &.{},
+    /// Custom punctuation characters to remove when checking for exact trigger matches.
+    trigger_punctuation: []const u8 = "",
 };
 
 pub const ModelRouteCostClass = enum {

@@ -1,5 +1,6 @@
 const std = @import("std");
 const std_compat = @import("compat");
+const builtin = @import("builtin");
 const agent_routing = @import("agent_routing.zig");
 const config_paths = @import("config_paths.zig");
 const fs_compat = @import("fs_compat.zig");
@@ -469,23 +470,26 @@ pub const Config = struct {
             // Config file doesn't exist yet — use defaults
         }
 
-        // Load external tool customizations if specified
-        if (cfg.tools.tool_customizations_file) |custom_file| {
-            const full_path = if (std_compat.fs.path.isAbsolute(custom_file))
-                try allocator.dupe(u8, custom_file)
+        if (cfg.tools.tool_customizations_file) |customizations_file| {
+            const customizations_path = if (std_compat.fs.path.isAbsolute(customizations_file))
+                try allocator.dupe(u8, customizations_file)
             else
-                try std_compat.fs.path.join(allocator, &.{ config_dir, custom_file });
-            defer allocator.free(full_path);
+                try std_compat.fs.path.join(allocator, &.{ config_dir, customizations_file });
+            defer allocator.free(customizations_path);
 
-            if (std_compat.fs.openFileAbsolute(full_path, .{})) |ext_file| {
-                defer ext_file.close();
-                if (ext_file.readToEndAlloc(allocator, 1024 * 128)) |ext_content| {
-                    defer allocator.free(ext_content);
-                    config_parse.mergeToolCustomizations(&cfg, ext_content) catch |err| {
+            if (std_compat.fs.openFileAbsolute(customizations_path, .{})) |file| {
+                defer file.close();
+                if (file.readToEndAlloc(allocator, 128 * 1024)) |content| {
+                    defer allocator.free(content);
+                    config_parse.mergeToolCustomizations(&cfg, content) catch |err| {
                         std.debug.print("Warning: failed to parse tool_customizations_file: {s}\n", .{@errorName(err)});
                     };
-                } else |_| {}
-            } else |_| {}
+                } else |err| {
+                    std.debug.print("Warning: failed to read tool_customizations_file: {s}\n", .{@errorName(err)});
+                }
+            } else |_| {
+                // Missing optional customization files keep inline configuration usable.
+            }
         }
 
         // Use workspace_dir_override if set, otherwise use default
@@ -1392,14 +1396,14 @@ pub const Config = struct {
         try w.print("    \"web_fetch_max_chars\": {d},\n", .{self.tools.web_fetch_max_chars});
         try w.print("    \"path_env_vars\": ", .{});
         try writePrettyJsonInline(self.allocator, w, self.tools.path_env_vars, "    ");
-        if (self.tools.tool_customizations.len > 0) {
-            try w.print(",\n    \"tool_customizations\": ", .{});
-            try writePrettyJsonInline(self.allocator, w, self.tools.tool_customizations, "    ");
-        }
-        if (self.tools.tool_customizations_file) |path| {
-            try w.print(",\n    \"tool_customizations_file\": ", .{});
-            try writePrettyJsonInline(self.allocator, w, path, "    ");
-        }
+        try w.print(",\n    \"tool_customizations\": ", .{});
+        try writePrettyJsonInline(self.allocator, w, self.tools.tool_customizations, "    ");
+        try w.print(",\n    \"tool_customizations_file\": ", .{});
+        try writePrettyJsonInline(self.allocator, w, self.tools.tool_customizations_file, "    ");
+        try w.print(",\n    \"trigger_modifiers\": ", .{});
+        try writePrettyJsonInline(self.allocator, w, self.tools.trigger_modifiers, "    ");
+        try w.print(",\n    \"trigger_punctuation\": ", .{});
+        try writePrettyJsonInline(self.allocator, w, self.tools.trigger_punctuation, "    ");
         // tools.media.audio
         {
             const am = self.audio_media;
@@ -3938,6 +3942,83 @@ test "json parse tools.path_env_vars" {
     allocator.free(cfg.tools.path_env_vars);
 }
 
+fn freeToolCustomizationsForTest(allocator: std.mem.Allocator, items: []const config_types.ToolCustomization) void {
+    for (items) |item| {
+        allocator.free(item.name);
+        if (item.system_prompt) |system_prompt| allocator.free(system_prompt);
+        for (item.triggers) |trigger| allocator.free(trigger);
+        allocator.free(item.triggers);
+    }
+    allocator.free(items);
+}
+
+fn findToolCustomizationForTest(items: []const config_types.ToolCustomization, name: []const u8) ?config_types.ToolCustomization {
+    for (items) |item| {
+        if (std.mem.eql(u8, item.name, name)) return item;
+    }
+    return null;
+}
+
+test "json parse tools.tool_customizations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{"tools": {
+        \\  "tool_customizations": [
+        \\    {"name": "shell", "system_prompt": "Use safe shell", "triggers": ["run", "exec"], "priority": 300, "enabled": false},
+        \\    {"name": "browser", "triggers": ["open"], "priority": -1},
+        \\    {"system_prompt": "missing name"},
+        \\    "ignored"
+        \\  ],
+        \\  "tool_customizations_file": "tool-customizations.json",
+        \\  "trigger_modifiers": ["please", "now"],
+        \\  "trigger_punctuation": "!?;"
+        \\}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+
+    try std.testing.expectEqual(@as(usize, 2), cfg.tools.tool_customizations.len);
+    try std.testing.expectEqualStrings("shell", cfg.tools.tool_customizations[0].name);
+    try std.testing.expectEqualStrings("Use safe shell", cfg.tools.tool_customizations[0].system_prompt.?);
+    try std.testing.expectEqual(@as(usize, 2), cfg.tools.tool_customizations[0].triggers.len);
+    try std.testing.expectEqualStrings("run", cfg.tools.tool_customizations[0].triggers[0]);
+    try std.testing.expectEqualStrings("exec", cfg.tools.tool_customizations[0].triggers[1]);
+    try std.testing.expectEqual(@as(u8, 255), cfg.tools.tool_customizations[0].priority);
+    try std.testing.expect(!cfg.tools.tool_customizations[0].enabled);
+    try std.testing.expectEqualStrings("browser", cfg.tools.tool_customizations[1].name);
+    try std.testing.expectEqual(@as(u8, 0), cfg.tools.tool_customizations[1].priority);
+    try std.testing.expect(cfg.tools.tool_customizations[1].enabled);
+    try std.testing.expectEqualStrings("tool-customizations.json", cfg.tools.tool_customizations_file.?);
+    try std.testing.expectEqual(@as(usize, 2), cfg.tools.trigger_modifiers.len);
+    try std.testing.expectEqualStrings("please", cfg.tools.trigger_modifiers[0]);
+    try std.testing.expectEqualStrings("now", cfg.tools.trigger_modifiers[1]);
+    try std.testing.expectEqualStrings("!?;", cfg.tools.trigger_punctuation);
+}
+
+fn parseToolCustomizationsForAllocationTest(allocator: std.mem.Allocator, json: []const u8) !void {
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    try cfg.parseJson(json);
+    freeToolCustomizationsForTest(allocator, cfg.tools.tool_customizations);
+}
+
+test "json parse tools.tool_customizations frees partial allocations on out-of-memory" {
+    const json =
+        \\{"tools": {"tool_customizations": [
+        \\  {"name": "shell", "system_prompt": "Use safe shell", "triggers": ["run", "exec"], "priority": 200, "enabled": false},
+        \\  {"name": "browser", "triggers": ["open", "visit"], "priority": 10}
+        \\]}}
+    ;
+    // Regression: nested tool customization fields must not leak when parsing
+    // fails after partially allocating a customization entry.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseToolCustomizationsForAllocationTest, .{json});
+}
+
 test "save roundtrip preserves tools.path_env_vars" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3974,7 +4055,7 @@ test "save roundtrip preserves tools.path_env_vars" {
     try std.testing.expectEqualStrings("PYTHONHOME", loaded.tools.path_env_vars[1]);
 }
 
-test "save roundtrip preserves tools tool_customizations" {
+test "save roundtrip preserves tools customization schema" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3992,13 +4073,20 @@ test "save roundtrip preserves tools tool_customizations" {
     cfg.tools.tool_customizations = &.{
         .{
             .name = "shell",
-            .system_prompt = "Prefer shell for deterministic local checks.",
-            .triggers = &.{ "run", "execute" },
-            .priority = 8,
+            .system_prompt = "Use safe shell",
+            .triggers = &.{ "run", "exec" },
+            .priority = 7,
             .enabled = false,
         },
+        .{
+            .name = "browser",
+            .triggers = &.{"open"},
+            .priority = 3,
+        },
     };
-    cfg.tools.tool_customizations_file = "tools.external.json";
+    cfg.tools.tool_customizations_file = "tool-customizations.json";
+    cfg.tools.trigger_modifiers = &.{ "please", "now" };
+    cfg.tools.trigger_punctuation = "!?;";
     try cfg.save();
 
     const file = try std_compat.fs.openFileAbsolute(config_path, .{});
@@ -4014,14 +4102,76 @@ test "save roundtrip preserves tools tool_customizations" {
         .allocator = arena.allocator(),
     };
     try loaded.parseJson(content);
-    try std.testing.expectEqual(@as(usize, 1), loaded.tools.tool_customizations.len);
+
+    try std.testing.expectEqual(@as(usize, 2), loaded.tools.tool_customizations.len);
     try std.testing.expectEqualStrings("shell", loaded.tools.tool_customizations[0].name);
-    try std.testing.expectEqualStrings("Prefer shell for deterministic local checks.", loaded.tools.tool_customizations[0].system_prompt.?);
+    try std.testing.expectEqualStrings("Use safe shell", loaded.tools.tool_customizations[0].system_prompt.?);
     try std.testing.expectEqualStrings("run", loaded.tools.tool_customizations[0].triggers[0]);
-    try std.testing.expectEqual(@as(u8, 8), loaded.tools.tool_customizations[0].priority);
+    try std.testing.expectEqual(@as(u8, 7), loaded.tools.tool_customizations[0].priority);
     try std.testing.expect(!loaded.tools.tool_customizations[0].enabled);
-    try std.testing.expect(loaded.tools.tool_customizations_file != null);
-    try std.testing.expectEqualStrings("tools.external.json", loaded.tools.tool_customizations_file.?);
+    try std.testing.expectEqualStrings("browser", loaded.tools.tool_customizations[1].name);
+    try std.testing.expectEqualStrings("tool-customizations.json", loaded.tools.tool_customizations_file.?);
+    try std.testing.expectEqualStrings("please", loaded.tools.trigger_modifiers[0]);
+    try std.testing.expectEqualStrings("!?;", loaded.tools.trigger_punctuation);
+}
+
+test "load merges relative tool_customizations_file with inline customizations" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var tmp_dir = @import("compat").fs.Dir.wrap(tmp.dir);
+    try tmp_dir.makeDir("home");
+
+    const config_json =
+        \\{"tools": {
+        \\  "tool_customizations": [
+        \\    {"name": "shell", "system_prompt": "inline shell", "triggers": ["inline"], "priority": 1}
+        \\  ],
+        \\  "tool_customizations_file": "tool-customizations.json",
+        \\  "trigger_modifiers": ["please"],
+        \\  "trigger_punctuation": "!"
+        \\}}
+    ;
+    const external_json =
+        \\{
+        \\  "shell": {"system_prompt": "external shell", "triggers": ["external"], "priority": 8, "enabled": false},
+        \\  "file_read": {"system_prompt": "external read", "triggers": ["inspect"], "priority": 4}
+        \\}
+    ;
+    try tmp_dir.writeFile(.{ .sub_path = "home/config.json", .data = config_json });
+    try tmp_dir.writeFile(.{ .sub_path = "home/tool-customizations.json", .data = external_json });
+
+    const home = try tmp_dir.realpathAlloc(allocator, "home");
+    defer allocator.free(home);
+    const key_z = try allocator.dupeZ(u8, "NULLCLAW_HOME");
+    defer allocator.free(key_z);
+    const home_z = try allocator.dupeZ(u8, home);
+    defer allocator.free(home_z);
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(key_z.ptr, home_z.ptr, 1));
+    defer _ = c.unsetenv(key_z.ptr);
+
+    var loaded = try Config.load(allocator);
+    defer loaded.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), loaded.tools.tool_customizations.len);
+    const shell = findToolCustomizationForTest(loaded.tools.tool_customizations, "shell").?;
+    try std.testing.expectEqualStrings("external shell", shell.system_prompt.?);
+    try std.testing.expectEqualStrings("external", shell.triggers[0]);
+    try std.testing.expectEqual(@as(u8, 8), shell.priority);
+    try std.testing.expect(!shell.enabled);
+
+    const file_read = findToolCustomizationForTest(loaded.tools.tool_customizations, "file_read").?;
+    try std.testing.expectEqualStrings("external read", file_read.system_prompt.?);
+    try std.testing.expectEqualStrings("inspect", file_read.triggers[0]);
+    try std.testing.expectEqual(@as(u8, 4), file_read.priority);
+    try std.testing.expectEqualStrings("tool-customizations.json", loaded.tools.tool_customizations_file.?);
+    try std.testing.expectEqualStrings("please", loaded.tools.trigger_modifiers[0]);
+    try std.testing.expectEqualStrings("!", loaded.tools.trigger_punctuation);
 }
 
 test "json parse autonomy allow_raw_url_chars" {
