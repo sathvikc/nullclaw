@@ -495,10 +495,6 @@ pub const TeamsChannel = struct {
         self.running.store(true, .release);
         errdefer self.running.store(false, .release);
 
-        if (self.webhook_secret == null) {
-            log.warn("Teams webhook_secret not configured — inbound auth is disabled", .{});
-        }
-
         // Try to acquire initial token (best-effort — will retry on first send)
         self.acquireToken() catch |err| {
             log.warn("Teams initial token acquisition failed (will retry on send): {}", .{err});

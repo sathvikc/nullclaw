@@ -30,6 +30,9 @@ pub const lancedb = if (build_options.enable_memory_lancedb) @import("engines/la
 };
 pub const api = @import("engines/api.zig");
 pub const clickhouse = @import("engines/clickhouse.zig");
+pub const kg = if (build_options.enable_memory_kg) @import("engines/kg.zig") else struct {
+    pub const KgMemory = struct {};
+};
 pub const registry = @import("engines/registry.zig");
 
 // retrieval/ (Layer B: Retrieval Engine)
@@ -77,6 +80,7 @@ pub const RedisMemory = redis.RedisMemory;
 pub const ClickHouseMemory = clickhouse.ClickHouseMemory;
 pub const LanceDbMemory = lancedb.LanceDbMemory;
 pub const ApiMemory = api.ApiMemory;
+pub const KgMemory = kg.KgMemory;
 pub const ResponseCache = cache.ResponseCache;
 pub const Chunk = chunker.Chunk;
 pub const chunkMarkdown = chunker.chunkMarkdown;

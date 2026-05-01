@@ -190,25 +190,6 @@ fn compactAgentErrorMessage(err: anyerror) []const u8 {
     };
 }
 
-fn handleChannelInboundRoute(
-    session_mgr: *session_mod.SessionManager,
-    session_key: []const u8,
-    content: []const u8,
-) bool {
-    const decision = session_mgr.routeInbound(session_key, content) catch |err| {
-        log.warn("inbound route failed session={s} err={}", .{ session_key, err });
-        return false;
-    };
-    return switch (decision) {
-        .inject, .replace_injection => true,
-        .drop => blk: {
-            log.info("dropping message: session busy queue_mode=off session={s}", .{session_key});
-            break :blk true;
-        },
-        .process, .queue => false,
-    };
-}
-
 const TelegramSessionTarget = struct {
     base_chat_id: []const u8,
     thread_id: ?i64,
@@ -792,7 +773,9 @@ fn handleTelegramInteractiveCallback(
             return false;
         }
 
-        if (handleChannelInboundRoute(&runtime.session_mgr, session_key, content)) return true;
+        if (runtime.session_mgr.routeInbound(session_key, content) == .skip) {
+            return true;
+        }
 
         const model_reply = runtime.session_mgr.processMessage(session_key, content, conversation_context) catch |err| {
             log.err("failed to process telegram callback interaction: {}", .{err});
@@ -997,7 +980,7 @@ fn processTelegramMessage(
     };
     const sink = tg_ptr.makeSink(&stream_ctx);
 
-    if (handleChannelInboundRoute(&runtime.session_mgr, session_key, content)) return;
+    if (runtime.session_mgr.routeInbound(session_key, content) == .skip) return;
 
     tg_ptr.setTaskReaction(sender, message_id, .running);
     const reply = runtime.session_mgr.processMessageStreaming(session_key, content, conversation_context, sink, null) catch |err| {
@@ -1639,6 +1622,13 @@ pub fn runTelegramLoop(
                         break :parallel_attempt;
                     }
 
+                    if (active_worker_threads.get(session_key) != null and
+                        runtime.session_mgr.routeInbound(session_key, msg.content) == .skip)
+                    {
+                        handled_in_worker = true;
+                        break :parallel_attempt;
+                    }
+
                     // Preserve message order per session_key.
                     if (active_worker_threads.fetchRemove(session_key)) |entry| {
                         var idx: usize = 0;
@@ -1904,7 +1894,7 @@ pub fn runSignalLoop(
                 break :blk route.session_key;
             };
 
-            if (handleChannelInboundRoute(&runtime.session_mgr, session_key, msg.content)) continue;
+            if (runtime.session_mgr.routeInbound(session_key, msg.content) == .skip) continue;
 
             const typing_target = msg.reply_target;
             if (typing_target) |target| sg_ptr.startTyping(target) catch {};
@@ -2017,6 +2007,8 @@ pub fn runWeixinLoop(
                 break :blk route.session_key;
             };
 
+            if (runtime.session_mgr.routeInbound(session_key, msg.content) == .skip) continue;
+
             const conversation_context = buildConversationContext(.{
                 .channel = "weixin",
                 .account_id = wx_ptr.config.account_id,
@@ -2025,8 +2017,6 @@ pub fn runWeixinLoop(
                 .peer_id = msg.sender,
                 .is_group = false,
             });
-
-            if (handleChannelInboundRoute(&runtime.session_mgr, session_key, msg.content)) continue;
 
             const reply = runtime.session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
                 logAgentProcessingError(allocator, "Weixin agent error", err);
@@ -2272,7 +2262,7 @@ pub fn runMatrixLoop(
                 break :blk route.session_key;
             };
 
-            if (handleChannelInboundRoute(&runtime.session_mgr, session_key, msg.content)) continue;
+            if (runtime.session_mgr.routeInbound(session_key, msg.content) == .skip) continue;
 
             const typing_target = msg.reply_target orelse msg.sender;
             mx_ptr.startTyping(typing_target) catch {};
@@ -2420,7 +2410,7 @@ pub fn runMaxLoop(
                 break :blk route.session_key;
             };
 
-            if (handleChannelInboundRoute(&runtime.session_mgr, session_key, msg.content)) continue;
+            if (runtime.session_mgr.routeInbound(session_key, msg.content) == .skip) continue;
 
             mx_ptr.startTyping(reply_target) catch {};
             defer mx_ptr.stopTyping(reply_target) catch {};

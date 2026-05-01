@@ -20,7 +20,6 @@ const dispatch = @import("channels/dispatch.zig");
 const channel_outbox = @import("channels/outbox.zig");
 const channel_loop = @import("channel_loop.zig");
 const channel_manager = @import("channel_manager.zig");
-const session_mod = @import("session.zig");
 const agent_routing = @import("agent_routing.zig");
 const channel_catalog = @import("channel_catalog.zig");
 const channel_adapters = @import("channel_adapters.zig");
@@ -56,25 +55,6 @@ const HEARTBEAT_THREAD_STACK_SIZE: usize = thread_stacks.SESSION_TURN_STACK_SIZE
 /// Maximum number of supervised components.
 const MAX_COMPONENTS: usize = 8;
 var outbound_draft_id_counter: Atomic(u64) = Atomic(u64).init(1);
-
-fn handleDaemonInboundRoute(
-    session_mgr: *session_mod.SessionManager,
-    session_key: []const u8,
-    content: []const u8,
-) bool {
-    const decision = session_mgr.routeInbound(session_key, content) catch |err| {
-        log.warn("inbound route failed session={s} err={}", .{ session_key, err });
-        return false;
-    };
-    return switch (decision) {
-        .inject, .replace_injection => true,
-        .drop => blk: {
-            log.info("dropping inbound: session busy queue_mode=off session={s}", .{session_key});
-            break :blk true;
-        },
-        .process, .queue => false,
-    };
-}
 
 /// Component status for state file serialization.
 pub const ComponentStatus = struct {
@@ -245,6 +225,9 @@ fn logGatewayFailure(err: anyerror, port: u16) void {
         error.AddressInUse => {
             log.err("Gateway failed to start: port {d} is already in use. Is another nullclaw instance running?", .{port});
         },
+        error.PublicBindRequiresTunnel => {
+            log.err("Gateway failed to start: public bind requires an active tunnel or gateway.allow_public_bind=true.", .{});
+        },
         else => {
             log.err("Gateway failed to start: {}", .{err});
         },
@@ -255,7 +238,7 @@ fn logGatewayFailure(err: anyerror, port: u16) void {
 /// Gateway thread entry point.
 fn gatewayThread(allocator: std.mem.Allocator, config: *const Config, host: []const u8, port: u16, state: *DaemonState, event_bus: *bus_mod.Bus) void {
     const gateway = @import("gateway.zig");
-    gateway.run(allocator, host, port, config, event_bus) catch |err| {
+    gateway.run(allocator, host, port, config, event_bus, state.tunnel_url) catch |err| {
         logGatewayFailure(err, port);
         recordGatewayFailure(err, state);
         return;
@@ -1236,7 +1219,7 @@ fn inboundDispatcherThread(
                 markInboundMessageRead(channel, buildInboundMessageRef(&msg, parsed_meta.fields));
             }
 
-            if (handleDaemonInboundRoute(&runtime.session_mgr, session_key, msg.content)) continue;
+            if (runtime.session_mgr.routeInbound(session_key, msg.content) == .skip) continue;
 
             const typing_recipient = sendInboundProcessingIndicator(
                 allocator,

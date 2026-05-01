@@ -15,6 +15,7 @@ const redis_engine = @import("redis.zig");
 const lancedb_engine = @import("lancedb.zig");
 const api_engine = @import("api.zig");
 const clickhouse_engine = @import("clickhouse.zig");
+const kg_engine = if (build_options.enable_memory_kg) @import("kg.zig") else struct {};
 
 // ── Capability & descriptor types ────────────────────────────────
 
@@ -204,7 +205,17 @@ const clickhouse_backends = if (build_options.enable_memory_clickhouse) [_]Backe
     .create = &createClickHouse,
 }} else [0]BackendDescriptor{};
 
-pub const all = hybrid_backends ++ markdown_backends ++ api_backends ++ memory_backends ++ none_backends ++ sqlite_backends ++ lucid_backends ++ redis_backends ++ lancedb_backends ++ pg_backends ++ clickhouse_backends;
+const kg_backends = if (build_options.enable_memory_kg) [_]BackendDescriptor{.{
+    .name = "kg",
+    .label = "Knowledge Graph — SQLite with entity-relation traversal",
+    .auto_save_default = false,
+    .capabilities = .{ .supports_keyword_rank = true, .supports_session_store = false, .supports_transactions = true, .supports_outbox = false },
+    .needs_db_path = true,
+    .needs_workspace = false,
+    .create = &createKg,
+}} else [0]BackendDescriptor{};
+
+pub const all = hybrid_backends ++ markdown_backends ++ api_backends ++ memory_backends ++ none_backends ++ sqlite_backends ++ lucid_backends ++ redis_backends ++ lancedb_backends ++ pg_backends ++ clickhouse_backends ++ kg_backends;
 pub const known_backend_names = [_][]const u8{
     "hybrid",
     "none",
@@ -217,8 +228,9 @@ pub const known_backend_names = [_][]const u8{
     "lancedb",
     "postgres",
     "clickhouse",
+    "kg",
 };
-pub const known_backends_csv = "hybrid, none, markdown, memory, api, sqlite, lucid, redis, lancedb, postgres, clickhouse";
+pub const known_backends_csv = "hybrid, none, markdown, memory, api, sqlite, lucid, redis, lancedb, postgres, clickhouse, kg";
 
 // ── Lookup ───────────────────────────────────────────────────────
 
@@ -248,6 +260,7 @@ pub fn engineTokenForBackend(name: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, name, "lancedb")) return "lancedb";
     if (std.mem.eql(u8, name, "postgres")) return "postgres";
     if (std.mem.eql(u8, name, "clickhouse")) return "clickhouse";
+    if (std.mem.eql(u8, name, "kg")) return "kg";
     return null;
 }
 
@@ -425,6 +438,16 @@ fn createClickHouse(allocator: std.mem.Allocator, cfg: BackendConfig) !BackendIn
     return .{ .memory = impl_.memory(), .session_store = impl_.sessionStore() };
 }
 
+fn createKg(allocator: std.mem.Allocator, cfg: BackendConfig) !BackendInstance {
+    if (!build_options.enable_memory_kg) return error.KgNotEnabled;
+    const db_path = cfg.db_path orelse return error.NoDbPath;
+    const impl_ = try allocator.create(kg_engine.KgMemory);
+    errdefer allocator.destroy(impl_);
+    impl_.* = try kg_engine.KgMemory.init(allocator, db_path);
+    impl_.owns_self = true;
+    return .{ .memory = impl_.memory(), .session_store = null };
+}
+
 fn applyPostgresConnectTimeout(
     allocator: std.mem.Allocator,
     base_url: []const u8,
@@ -462,7 +485,8 @@ test "registry length" {
         @as(usize, @intFromBool(build_options.enable_memory_redis)) +
         @as(usize, @intFromBool(build_options.enable_memory_lancedb)) +
         @as(usize, @intFromBool(build_options.enable_postgres)) +
-        @as(usize, @intFromBool(build_options.enable_memory_clickhouse));
+        @as(usize, @intFromBool(build_options.enable_memory_clickhouse)) +
+        @as(usize, @intFromBool(build_options.enable_memory_kg));
     try std.testing.expectEqual(expected, all.len);
 }
 
@@ -597,6 +621,22 @@ test "findBackend clickhouse" {
     try std.testing.expect(!desc.needs_db_path);
     try std.testing.expect(!desc.needs_workspace);
     try std.testing.expect(desc.auto_save_default);
+}
+
+test "findBackend kg" {
+    if (!build_options.enable_memory_kg) {
+        try std.testing.expect(findBackend("kg") == null);
+        return;
+    }
+    const desc = findBackend("kg") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("kg", desc.name);
+    try std.testing.expect(desc.capabilities.supports_keyword_rank);
+    try std.testing.expect(!desc.capabilities.supports_session_store);
+    try std.testing.expect(desc.capabilities.supports_transactions);
+    try std.testing.expect(!desc.capabilities.supports_outbox);
+    try std.testing.expect(desc.needs_db_path);
+    try std.testing.expect(!desc.needs_workspace);
+    try std.testing.expect(!desc.auto_save_default);
 }
 
 test "findBackend unknown returns null" {

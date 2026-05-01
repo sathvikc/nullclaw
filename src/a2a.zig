@@ -669,7 +669,7 @@ pub fn handleStreamingRpc(
     const progress_sink = progress_ctx.makeSink();
 
     const context: ConversationContext = buildConversationContext(.{ .channel = "a2a" }).?;
-    const response = session_mgr.processMessageStreaming(task.session_key, text, context, sink, progress_sink) catch |err| {
+    const response = session_mgr.processInboundMessageStreaming(task.session_key, text, context, sink, progress_sink) catch |err| {
         log.err("streaming turn failed task={s} err={s}", .{ task.id, @errorName(err) });
         var failed_task = registry.finalizeTask(allocator, task.id, .failed, null) catch null;
         defer if (failed_task) |*snapshot| snapshot.deinit(allocator);
@@ -686,7 +686,7 @@ pub fn handleStreamingRpc(
         }
         return;
     };
-    defer freeSessionResponse(session_mgr, response);
+    defer if (response) |r| freeSessionResponse(session_mgr, r);
 
     var final_task = registry.finalizeTask(allocator, task.id, .completed, response) catch return;
     defer if (final_task) |*snapshot| snapshot.deinit(allocator);
@@ -802,14 +802,14 @@ fn handleSendMessage(
     _ = registry.setTaskState(task.id, .working);
 
     const context: ConversationContext = buildConversationContext(.{ .channel = "a2a" }).?;
-    const response = session_mgr.processMessage(task.session_key, text, context) catch |err| {
+    const response = session_mgr.processInboundMessage(task.session_key, text, context) catch |err| {
         log.err("turn failed task={s} err={s}", .{ task.id, @errorName(err) });
         _ = registry.finalizeTask(allocator, task.id, .failed, null) catch null;
         const err_body = buildJsonRpcError(allocator, request_id, -32603, "Agent processing failed") catch
             return errorResponse();
         return .{ .body = err_body };
     };
-    defer freeSessionResponse(session_mgr, response);
+    defer if (response) |r| freeSessionResponse(session_mgr, r);
 
     var completed_task = registry.finalizeTask(allocator, task.id, .completed, response) catch {
         const err_body = buildJsonRpcError(allocator, request_id, -32603, "Out of memory") catch
@@ -1643,9 +1643,18 @@ const MockSessionManager = struct {
     response: []const u8 = "mock response",
     interrupt_tool: ?[]const u8 = null,
     allocator: std.mem.Allocator = testing.allocator,
+    inbound_calls: usize = 0,
+    inbound_streaming_calls: usize = 0,
+    skip_inbound: bool = false,
 
     pub fn processMessage(self: *MockSessionManager, _: []const u8, _: []const u8, _: anytype) ![]const u8 {
         return self.allocator.dupe(u8, self.response);
+    }
+
+    pub fn processInboundMessage(self: *MockSessionManager, session_key: []const u8, content: []const u8, conversation_context: anytype) !?[]const u8 {
+        self.inbound_calls += 1;
+        if (self.skip_inbound) return null;
+        return try self.processMessage(session_key, content, conversation_context);
     }
 
     pub fn processMessageStreaming(self: *MockSessionManager, session_key: []const u8, content: []const u8, conversation_context: anytype, sink: ?streaming.Sink, _: ?agent_mod.ProgressSink) ![]const u8 {
@@ -1655,6 +1664,12 @@ const MockSessionManager = struct {
             s.emitFinal();
         }
         return self.processMessage(session_key, content, conversation_context);
+    }
+
+    pub fn processInboundMessageStreaming(self: *MockSessionManager, session_key: []const u8, content: []const u8, conversation_context: anytype, sink: ?streaming.Sink, progress_sink: ?agent_mod.ProgressSink) !?[]const u8 {
+        self.inbound_streaming_calls += 1;
+        if (self.skip_inbound) return null;
+        return try self.processMessageStreaming(session_key, content, conversation_context, sink, progress_sink);
     }
 
     pub fn requestTurnInterrupt(self: *MockSessionManager, _: []const u8) struct {
@@ -2514,6 +2529,26 @@ test "handleSendMessage accepts text/plain in acceptedOutputModes" {
     try testing.expectEqualStrings("200 OK", resp.status);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"result\"") != null);
     try testing.expect(std.mem.indexOf(u8, resp.body, "\"state\":\"completed\"") != null);
+    try testing.expectEqual(@as(usize, 1), mock.inbound_calls);
+}
+
+test "handleSendMessage completes without artifact when inbound routing skips" {
+    var registry = TaskRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    var mock = MockSessionManager{ .skip_inbound = true };
+    const body =
+        \\{"jsonrpc":"2.0","id":"req-skip","method":"message/send","params":{"message":{"messageId":"msg-1","role":"user","parts":[{"type":"text","text":"hello"}]}}}
+    ;
+    const resp = handleJsonRpc(testing.allocator, body, &registry, &mock);
+    defer if (resp.allocated) testing.allocator.free(resp.body);
+
+    // Regression: A2A must honor queue_mode routing and accept injected/dropped
+    // inbound messages without starting a second turn.
+    try testing.expectEqualStrings("200 OK", resp.status);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"state\":\"completed\"") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "\"artifacts\"") == null);
+    try testing.expectEqual(@as(usize, 1), mock.inbound_calls);
 }
 
 test "handleSendMessage rejects negative historyLength" {

@@ -1,6 +1,8 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const std_compat = @import("compat");
 const Atomic = @import("portable_atomic.zig").Atomic;
+const config_types = @import("config_types.zig");
 const fs_compat = @import("fs_compat.zig");
 
 /// Events the observer can record.
@@ -87,6 +89,18 @@ pub const Observer = struct {
 const MAX_TOOL_CALL_DETAIL_LEN: usize = 1024;
 const MAX_LLM_DETAIL_LEN: usize = 2048;
 const MAX_EVENT_DETAIL_LEN: usize = 1024;
+threadlocal var lightweight_trace_id: ?[32]u8 = null;
+
+fn fillRandomHex(buf: []u8) void {
+    var raw: [16]u8 = undefined;
+    const needed = buf.len / 2;
+    std_compat.crypto.random.bytes(raw[0..needed]);
+    const hex = "0123456789abcdef";
+    for (0..needed) |i| {
+        buf[i * 2] = hex[raw[i] >> 4];
+        buf[i * 2 + 1] = hex[raw[i] & 0x0f];
+    }
+}
 
 fn truncateForObserver(detail: ?[]const u8, max_len: usize) ?[]const u8 {
     const raw = detail orelse return null;
@@ -105,6 +119,50 @@ fn llmDetailForObserver(detail: ?[]const u8) ?[]const u8 {
 
 fn eventDetailForObserver(detail: ?[]const u8) ?[]const u8 {
     return truncateForObserver(detail, MAX_EVENT_DETAIL_LEN);
+}
+
+fn currentLightweightTraceId() ?[32]u8 {
+    return lightweight_trace_id;
+}
+
+fn ensureLightweightTraceId() [32]u8 {
+    if (lightweight_trace_id) |trace_id| return trace_id;
+    var trace_id: [32]u8 = undefined;
+    fillRandomHex(&trace_id);
+    lightweight_trace_id = trace_id;
+    return trace_id;
+}
+
+fn setLightweightTraceId(trace_id: ?[32]u8) void {
+    lightweight_trace_id = trace_id;
+}
+
+fn traceIdForEvent(event: *const ObserverEvent) ?[32]u8 {
+    return switch (event.*) {
+        .turn_complete => currentLightweightTraceId(),
+        else => ensureLightweightTraceId(),
+    };
+}
+
+fn clearTraceIdForEvent(event: *const ObserverEvent) void {
+    switch (event.*) {
+        .turn_complete, .agent_end => setLightweightTraceId(null),
+        else => {},
+    }
+}
+
+fn formatTracePrefix(buf: []u8, trace_id: ?[32]u8) []const u8 {
+    const id = trace_id orelse return "";
+    return std.fmt.bufPrint(buf, "trace_id={s} ", .{id[0..]}) catch "";
+}
+
+fn appendTraceIdToJsonObject(out: []u8, json_object: []const u8, trace_id: ?[32]u8) []const u8 {
+    const id = trace_id orelse return json_object;
+    if (json_object.len == 0 or json_object[json_object.len - 1] != '}') return json_object;
+    return std.fmt.bufPrint(out, "{s},\"trace_id\":{f}}}", .{
+        json_object[0 .. json_object.len - 1],
+        std.json.fmt(id[0..], .{}),
+    }) catch json_object;
 }
 
 // ── NoopObserver ─────────────────────────────────────────────────────
@@ -160,78 +218,90 @@ pub const LogObserver = struct {
     }
 
     fn logRecordEvent(_: *anyopaque, event: *const ObserverEvent) void {
+        const trace_id = traceIdForEvent(event);
+        var trace_buf: [48]u8 = undefined;
+        const prefix = formatTracePrefix(&trace_buf, trace_id);
         switch (event.*) {
             .agent_start => |e| {
                 if (e.channel) |ch| {
                     if (e.bot_account) |bot| {
-                        std.log.info("agent.start provider={s} model={s} channel={s} bot_account={s}", .{ e.provider, e.model, ch, bot });
+                        std.log.info("{s}agent.start provider={s} model={s} channel={s} bot_account={s}", .{ prefix, e.provider, e.model, ch, bot });
                     } else {
-                        std.log.info("agent.start provider={s} model={s} channel={s}", .{ e.provider, e.model, ch });
+                        std.log.info("{s}agent.start provider={s} model={s} channel={s}", .{ prefix, e.provider, e.model, ch });
                     }
                 } else if (e.bot_account) |bot| {
-                    std.log.info("agent.start provider={s} model={s} bot_account={s}", .{ e.provider, e.model, bot });
+                    std.log.info("{s}agent.start provider={s} model={s} bot_account={s}", .{ prefix, e.provider, e.model, bot });
                 } else {
-                    std.log.info("agent.start provider={s} model={s}", .{ e.provider, e.model });
+                    std.log.info("{s}agent.start provider={s} model={s}", .{ prefix, e.provider, e.model });
                 }
             },
-            .llm_request => |e| std.log.info("llm.request provider={s} model={s} messages={d}", .{ e.provider, e.model, e.messages_count }),
-            .llm_response => |e| std.log.info("llm.response provider={s} model={s} duration_ms={d} success={}", .{ e.provider, e.model, e.duration_ms, e.success }),
-            .agent_end => |e| std.log.info("agent.end duration_ms={d}", .{e.duration_ms}),
-            .tool_call_start => |e| std.log.info("tool.start tool={s}", .{e.tool}),
+            .llm_request => |e| std.log.info("{s}llm.request provider={s} model={s} messages={d}", .{ prefix, e.provider, e.model, e.messages_count }),
+            .llm_response => |e| std.log.info("{s}llm.response provider={s} model={s} duration_ms={d} success={}", .{ prefix, e.provider, e.model, e.duration_ms, e.success }),
+            .agent_end => |e| std.log.info("{s}agent.end duration_ms={d}", .{ prefix, e.duration_ms }),
+            .tool_call_start => |e| std.log.info("{s}tool.start tool={s}", .{ prefix, e.tool }),
             .tool_call => |e| {
                 if (toolDetailForObserver(e.detail)) |detail| {
-                    std.log.info("tool.call tool={s} duration_ms={d} success={} detail={s}", .{ e.tool, e.duration_ms, e.success, detail });
+                    std.log.info("{s}tool.call tool={s} duration_ms={d} success={} detail={s}", .{ prefix, e.tool, e.duration_ms, e.success, detail });
                 } else {
-                    std.log.info("tool.call tool={s} duration_ms={d} success={}", .{ e.tool, e.duration_ms, e.success });
+                    std.log.info("{s}tool.call tool={s} duration_ms={d} success={}", .{ prefix, e.tool, e.duration_ms, e.success });
                 }
             },
-            .tool_iterations_exhausted => |e| std.log.info("tool.iterations_exhausted iterations={d}", .{e.iterations}),
-            .turn_complete => std.log.info("turn.complete", .{}),
-            .channel_message => |e| std.log.info("channel.message channel={s} direction={s}", .{ e.channel, e.direction }),
-            .heartbeat_tick => std.log.info("heartbeat.tick", .{}),
-            .err => |e| std.log.info("error component={s} message={s}", .{ e.component, e.message }),
+            .tool_iterations_exhausted => |e| std.log.info("{s}tool.iterations_exhausted iterations={d}", .{ prefix, e.iterations }),
+            .turn_complete => std.log.info("{s}turn.complete", .{prefix}),
+            .channel_message => |e| std.log.info("{s}channel.message channel={s} direction={s}", .{ prefix, e.channel, e.direction }),
+            .heartbeat_tick => std.log.info("{s}heartbeat.tick", .{prefix}),
+            .err => |e| {
+                if (builtin.is_test) {
+                    std.log.info("{s}error component={s} message={s}", .{ prefix, e.component, e.message });
+                } else {
+                    std.log.err("{s}error component={s} message={s}", .{ prefix, e.component, e.message });
+                }
+            },
             .subagent_start => |e| {
                 if (eventDetailForObserver(e.task)) |task| {
-                    std.log.info("subagent.start agent_name={s} task={s}", .{ e.agent_name, task });
+                    std.log.info("{s}subagent.start agent_name={s} task={s}", .{ prefix, e.agent_name, task });
                 } else {
-                    std.log.info("subagent.start agent_name={s}", .{e.agent_name});
+                    std.log.info("{s}subagent.start agent_name={s}", .{ prefix, e.agent_name });
                 }
             },
             .cron_job_start => |e| {
                 if (e.channel) |ch| {
                     if (e.bot_account) |bot| {
                         if (eventDetailForObserver(e.task)) |task| {
-                            std.log.info("cron.job.start channel={s} bot_account={s} task={s}", .{ ch, bot, task });
+                            std.log.info("{s}cron.job.start channel={s} bot_account={s} task={s}", .{ prefix, ch, bot, task });
                         } else {
-                            std.log.info("cron.job.start channel={s} bot_account={s}", .{ ch, bot });
+                            std.log.info("{s}cron.job.start channel={s} bot_account={s}", .{ prefix, ch, bot });
                         }
                     } else if (eventDetailForObserver(e.task)) |task| {
-                        std.log.info("cron.job.start channel={s} task={s}", .{ ch, task });
+                        std.log.info("{s}cron.job.start channel={s} task={s}", .{ prefix, ch, task });
                     } else {
-                        std.log.info("cron.job.start channel={s}", .{ch});
+                        std.log.info("{s}cron.job.start channel={s}", .{ prefix, ch });
                     }
                 } else if (e.bot_account) |bot| {
                     if (eventDetailForObserver(e.task)) |task| {
-                        std.log.info("cron.job.start bot_account={s} task={s}", .{ bot, task });
+                        std.log.info("{s}cron.job.start bot_account={s} task={s}", .{ prefix, bot, task });
                     } else {
-                        std.log.info("cron.job.start bot_account={s}", .{bot});
+                        std.log.info("{s}cron.job.start bot_account={s}", .{ prefix, bot });
                     }
                 } else if (eventDetailForObserver(e.task)) |task| {
-                    std.log.info("cron.job.start task={s}", .{task});
+                    std.log.info("{s}cron.job.start task={s}", .{ prefix, task });
                 } else {
-                    std.log.info("cron.job.start", .{});
+                    std.log.info("{s}cron.job.start", .{prefix});
                 }
             },
-            .skill_load => |e| std.log.info("skill.load name={s} duration_ms={d}", .{ e.name, e.duration_ms }),
+            .skill_load => |e| std.log.info("{s}skill.load name={s} duration_ms={d}", .{ prefix, e.name, e.duration_ms }),
         }
+        clearTraceIdForEvent(event);
     }
 
     fn logRecordMetric(_: *anyopaque, metric: *const ObserverMetric) void {
+        var trace_buf: [48]u8 = undefined;
+        const prefix = formatTracePrefix(&trace_buf, currentLightweightTraceId());
         switch (metric.*) {
-            .request_latency_ms => |v| std.log.info("metric.request_latency latency_ms={d}", .{v}),
-            .tokens_used => |v| std.log.info("metric.tokens_used tokens={d}", .{v}),
-            .active_sessions => |v| std.log.info("metric.active_sessions sessions={d}", .{v}),
-            .queue_depth => |v| std.log.info("metric.queue_depth depth={d}", .{v}),
+            .request_latency_ms => |v| std.log.info("{s}metric.request_latency latency_ms={d}", .{ prefix, v }),
+            .tokens_used => |v| std.log.info("{s}metric.tokens_used tokens={d}", .{ prefix, v }),
+            .active_sessions => |v| std.log.info("{s}metric.active_sessions sessions={d}", .{ prefix, v }),
+            .queue_depth => |v| std.log.info("{s}metric.queue_depth depth={d}", .{ prefix, v }),
         }
     }
 
@@ -240,9 +310,11 @@ pub const LogObserver = struct {
         return "log";
     }
     fn logGetTraceId(_: *anyopaque) ?[32]u8 {
-        return null;
+        return currentLightweightTraceId();
     }
-    fn logSetTraceId(_: *anyopaque, _: [32]u8) void {}
+    fn logSetTraceId(_: *anyopaque, trace_id: [32]u8) void {
+        setLightweightTraceId(trace_id);
+    }
 };
 
 // ── VerboseObserver ──────────────────────────────────────────────────
@@ -266,6 +338,7 @@ pub const VerboseObserver = struct {
     }
 
     fn verboseRecordEvent(_: *anyopaque, event: *const ObserverEvent) void {
+        _ = traceIdForEvent(event);
         var buf: [4096]u8 = undefined;
         var bw = std_compat.fs.File.stderr().writer(&buf);
         const stderr = &bw.interface;
@@ -305,6 +378,7 @@ pub const VerboseObserver = struct {
             },
             else => {},
         }
+        clearTraceIdForEvent(event);
     }
 
     fn verboseRecordMetric(_: *anyopaque, _: *const ObserverMetric) void {}
@@ -313,9 +387,11 @@ pub const VerboseObserver = struct {
         return "verbose";
     }
     fn verboseGetTraceId(_: *anyopaque) ?[32]u8 {
-        return null;
+        return currentLightweightTraceId();
     }
-    fn verboseSetTraceId(_: *anyopaque, _: [32]u8) void {}
+    fn verboseSetTraceId(_: *anyopaque, trace_id: [32]u8) void {
+        setLightweightTraceId(trace_id);
+    }
 };
 
 // ── MultiObserver ────────────────────────────────────────────────────
@@ -428,7 +504,8 @@ pub const FileObserver = struct {
 
     fn fileRecordEvent(ptr: *anyopaque, event: *const ObserverEvent) void {
         const self = resolve(ptr);
-        var buf: [2048]u8 = undefined;
+        const trace_id = traceIdForEvent(event);
+        var buf: [4096]u8 = undefined;
         const line = switch (event.*) {
             .agent_start => |e| blk: {
                 if (e.channel) |ch| {
@@ -491,7 +568,9 @@ pub const FileObserver = struct {
             },
             .skill_load => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"skill_load\",\"name\":{f},\"duration_ms\":{d}}}", .{ std.json.fmt(e.name, .{}), e.duration_ms }) catch return,
         };
-        self.appendToFile(line);
+        var traced_buf: [4224]u8 = undefined;
+        self.appendToFile(appendTraceIdToJsonObject(&traced_buf, line, trace_id));
+        clearTraceIdForEvent(event);
     }
 
     fn fileRecordMetric(ptr: *anyopaque, metric: *const ObserverMetric) void {
@@ -503,7 +582,8 @@ pub const FileObserver = struct {
             .active_sessions => |v| std.fmt.bufPrint(&buf, "{{\"metric\":\"active_sessions\",\"value\":{d}}}", .{v}) catch return,
             .queue_depth => |v| std.fmt.bufPrint(&buf, "{{\"metric\":\"queue_depth\",\"value\":{d}}}", .{v}) catch return,
         };
-        self.appendToFile(line);
+        var traced_buf: [640]u8 = undefined;
+        self.appendToFile(appendTraceIdToJsonObject(&traced_buf, line, currentLightweightTraceId()));
     }
 
     fn fileFlush(_: *anyopaque) void {
@@ -515,9 +595,11 @@ pub const FileObserver = struct {
     }
 
     fn fileGetTraceId(_: *anyopaque) ?[32]u8 {
-        return null;
+        return currentLightweightTraceId();
     }
-    fn fileSetTraceId(_: *anyopaque, _: [32]u8) void {}
+    fn fileSetTraceId(_: *anyopaque, trace_id: [32]u8) void {
+        setLightweightTraceId(trace_id);
+    }
 };
 
 /// Factory: create observer from config backend string.
@@ -613,7 +695,19 @@ pub const OtelObserver = struct {
         service_name: ?[]const u8,
         headers: anytype,
     ) !OtelObserver {
-        var self = init(allocator, endpoint, service_name);
+        const resolved_endpoint = endpoint orelse "http://localhost:4318";
+        if (!config_types.DiagnosticsConfig.isValidOtelEndpoint(resolved_endpoint)) {
+            return error.InvalidOtelEndpoint;
+        }
+        for (headers) |header| {
+            if (!config_types.DiagnosticsConfig.isValidOtelHeaderName(header.key) or
+                !config_types.DiagnosticsConfig.isValidOtelHeaderValue(header.value))
+            {
+                return error.InvalidOtelHeader;
+            }
+        }
+
+        var self = init(allocator, resolved_endpoint, service_name);
         if (headers.len == 0) return self;
 
         const owned_headers = try allocator.alloc([]const u8, headers.len);
@@ -1263,6 +1357,17 @@ test "LogObserver name" {
     try std.testing.expectEqualStrings("log", obs.getName());
 }
 
+test "LogObserver trace id roundtrip" {
+    var log_obs = LogObserver{};
+    const obs = log_obs.observer();
+    setLightweightTraceId(null);
+    defer setLightweightTraceId(null);
+
+    const trace_id = [_]u8{'b'} ** 32;
+    obs.setTraceId(trace_id);
+    try std.testing.expectEqual(trace_id, obs.getTraceId().?);
+}
+
 test "LogObserver does not panic on events" {
     var log_obs = LogObserver{};
     const obs = log_obs.observer();
@@ -1410,6 +1515,34 @@ test "FileObserver tool_call detail is persisted as JSON string" {
 
     try std.testing.expect(std.mem.indexOf(u8, content, "\"event\":\"tool_call\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"detail\":\"exit code 1: \\\"permission denied\\\"\"") != null);
+}
+
+test "FileObserver persists trace_id when set" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    setLightweightTraceId(null);
+    defer setLightweightTraceId(null);
+
+    const base = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const path = try std.fmt.allocPrint(allocator, "{s}/obs_trace.jsonl", .{base});
+    defer allocator.free(path);
+
+    var file_obs = FileObserver{ .path = path };
+    const obs = file_obs.observer();
+    const trace_id = [_]u8{'a'} ** 32;
+    obs.setTraceId(trace_id);
+
+    const event = ObserverEvent{ .heartbeat_tick = {} };
+    obs.recordEvent(&event);
+
+    const file = try std_compat.fs.openFileAbsolute(path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 4096);
+    defer allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"trace_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"") != null);
 }
 
 test "FileObserver serializes concurrent appends" {
@@ -1766,9 +1899,9 @@ test "OtelObserver init defaults" {
 }
 
 test "OtelObserver init custom endpoint" {
-    var otel = OtelObserver.init(std.testing.allocator, "https://otel:4318", "myservice");
+    var otel = OtelObserver.init(std.testing.allocator, "https://otel.example.com:4318", "myservice");
     defer otel.deinit();
-    try std.testing.expectEqualStrings("https://otel:4318", otel.endpoint);
+    try std.testing.expectEqualStrings("https://otel.example.com:4318", otel.endpoint);
     try std.testing.expectEqualStrings("myservice", otel.service_name);
 }
 
@@ -1783,6 +1916,23 @@ test "OtelObserver initWithHeaders builds curl headers" {
     try std.testing.expectEqual(@as(usize, 2), otel.headers.len);
     try std.testing.expectEqualStrings("Authorization: Bearer secret", otel.headers[0]);
     try std.testing.expectEqualStrings("x-nullwatch-source: nullclaw", otel.headers[1]);
+}
+
+test "OtelObserver initWithHeaders rejects remote http endpoint" {
+    try std.testing.expectError(
+        error.InvalidOtelEndpoint,
+        OtelObserver.initWithHeaders(std.testing.allocator, "http://otel.example.com:4318", null, &.{}),
+    );
+}
+
+test "OtelObserver initWithHeaders rejects malformed header" {
+    const headers = [_]OtelObserver.HeaderEntry{
+        .{ .key = "Authorization", .value = "Bearer test\r\nX-Injected: yes" },
+    };
+    try std.testing.expectError(
+        error.InvalidOtelHeader,
+        OtelObserver.initWithHeaders(std.testing.allocator, null, null, &headers),
+    );
 }
 
 test "RuntimeObserver combines configured backend with extra observers" {

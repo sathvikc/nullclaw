@@ -9,6 +9,7 @@
 //! - RateTracker: sliding-window rate limiting (used by SecurityPolicy)
 
 pub const audit = @import("audit.zig");
+pub const botframework_auth = @import("botframework_auth.zig");
 pub const policy = @import("policy.zig");
 pub const pairing = @import("pairing.zig");
 pub const secrets = @import("secrets.zig");

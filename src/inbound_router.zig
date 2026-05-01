@@ -1,22 +1,23 @@
 //! Pure routing logic for inbound messages.
 //!
 //! Given session state and the configured queue policy, returns the action
-//! the effectful shell should take.  No I/O, no allocations — fully unit-testable.
+//! the effectful shell should take. No I/O, no allocations; fully unit-testable.
 //!
 //! Usage:
-//!   switch (session_mgr.routeInbound(session_key, text)) {
-//!       .process          => session_mgr.processMessageStreaming(...),
-//!       .inject           => {},
-//!       .replace_injection => {},
-//!       .queue            => session_mgr.processMessageStreaming(...),
-//!       .drop             => {},
+//!   const input = session_mgr.routeInput(session_key);
+//!   switch (inbound_router.route(input)) {
+//!       .process           => session_mgr.processMessageStreaming(...),
+//!       .inject            => session_mgr.injectMidTurn(session_key, text),
+//!       .replace_injection => session_mgr.injectMidTurn(session_key, text),  // same effect
+//!       .queue             => session_mgr.processMessageStreaming(...),      // waits on session lock
+//!       .drop              => {},
 //!   }
 
 const agent_mod = @import("agent/root.zig");
 
 pub const QueueMode = agent_mod.Agent.QueueMode;
 
-/// Lock-free snapshot of the state needed to make a routing decision.
+/// Snapshot of the state needed to make a routing decision.
 /// Obtained via SessionManager.routeInput().
 pub const RouteInput = struct {
     /// True when agent.turn() is currently executing for this session.
@@ -53,7 +54,7 @@ pub fn route(input: RouteInput) RoutingDecision {
     };
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────
+// Tests
 
 const testing = @import("std").testing;
 
@@ -112,7 +113,7 @@ test "route injects when turn running and queue_mode is debounce" {
         .queue_mode = .debounce,
         .has_pending_injection = false,
     }));
-    // debounce always injects (accumulation handled inside the injection buffer)
+    // Debounce timing/merge is handled by the caller before depositing text.
     try testing.expectEqual(RoutingDecision.inject, route(.{
         .turn_running = true,
         .queue_mode = .debounce,

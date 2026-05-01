@@ -215,7 +215,65 @@ pub const DiagnosticsConfig = struct {
 
         return false;
     }
+
+    pub fn isValidOtelHeaderName(raw: []const u8) bool {
+        return isValidHttpHeaderName(raw);
+    }
+
+    pub fn isValidOtelHeaderValue(raw: []const u8) bool {
+        return isValidHttpHeaderValue(raw);
+    }
 };
+
+fn isValidHttpsOrLocalHttpUrl(raw: []const u8) bool {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return false;
+    if (std.mem.indexOfAny(u8, trimmed, " \t\r\n") != null) return false;
+
+    const uri = std.Uri.parse(trimmed) catch return false;
+    const is_https = std.ascii.eqlIgnoreCase(uri.scheme, "https");
+    const is_http = std.ascii.eqlIgnoreCase(uri.scheme, "http");
+    if (!is_https and !is_http) return false;
+
+    const host_comp = uri.host orelse return false;
+    const host = switch (host_comp) {
+        .raw => |h| h,
+        .percent_encoded => |h| blk: {
+            if (std.mem.indexOfScalar(u8, h, '%') != null) return false;
+            break :blk h;
+        },
+    };
+    if (host.len == 0) return false;
+    if (std.mem.indexOfAny(u8, host, " \t\r\n") != null) return false;
+    if (host[0] == ':') return false;
+
+    if (is_http and !net_security.isLocalHost(host)) return false;
+
+    if (host[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, host, ']') orelse return false;
+        if (close != host.len - 1) return false;
+    }
+
+    if (std.mem.indexOfScalar(u8, trimmed, '#') != null) return false;
+    if (uri.port) |port| if (port == 0) return false;
+    return true;
+}
+
+fn isValidHttpHeaderName(raw: []const u8) bool {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return false;
+    for (trimmed) |ch| {
+        // RFC 7230 token subset; keep strict to prevent header injection.
+        if (ch <= 0x20 or ch >= 0x7f) return false;
+        if (ch == ':' or ch == '"' or ch == '\\') return false;
+    }
+    return true;
+}
+
+fn isValidHttpHeaderValue(raw: []const u8) bool {
+    if (std.mem.indexOfAny(u8, raw, "\r\n") != null) return false;
+    return true;
+}
 
 pub const AutonomyConfig = struct {
     level: AutonomyLevel = .supervised,
@@ -573,6 +631,10 @@ pub const TeamsConfig = struct {
     notification_channel_id: ?[]const u8 = null,
     bot_id: ?[]const u8 = null,
     config_dir: []const u8 = ".",
+
+    pub fn isValidWebhookSecret(raw: []const u8) bool {
+        return WebConfig.isValidAuthToken(raw);
+    }
 };
 
 pub const WebhookConfig = struct {
@@ -1765,54 +1827,15 @@ pub const McpServerConfig = struct {
     }
 
     pub fn isValidHttpUrl(raw: []const u8) bool {
-        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-        if (trimmed.len == 0) return false;
-        if (std.mem.indexOfAny(u8, trimmed, " \t\r\n") != null) return false;
-
-        const uri = std.Uri.parse(trimmed) catch return false;
-        const is_https = std.ascii.eqlIgnoreCase(uri.scheme, "https");
-        const is_http = std.ascii.eqlIgnoreCase(uri.scheme, "http");
-        if (!is_https and !is_http) return false;
-
-        const host_comp = uri.host orelse return false;
-        const host = switch (host_comp) {
-            .raw => |h| h,
-            .percent_encoded => |h| blk: {
-                if (std.mem.indexOfScalar(u8, h, '%') != null) return false;
-                break :blk h;
-            },
-        };
-        if (host.len == 0) return false;
-        if (std.mem.indexOfAny(u8, host, " \t\r\n") != null) return false;
-        if (host[0] == ':') return false;
-
-        // Keep MCP local-http exceptions aligned with shared host safety rules.
-        if (is_http and !net_security.isLocalHost(host)) return false;
-
-        if (host[0] == '[') {
-            const close = std.mem.indexOfScalar(u8, host, ']') orelse return false;
-            if (close != host.len - 1) return false;
-        }
-
-        if (std.mem.indexOfScalar(u8, trimmed, '#') != null) return false;
-        if (uri.port) |port| if (port == 0) return false;
-        return true;
+        return isValidHttpsOrLocalHttpUrl(raw);
     }
 
     pub fn isValidHeaderName(raw: []const u8) bool {
-        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-        if (trimmed.len == 0) return false;
-        for (trimmed) |ch| {
-            // RFC 7230 token subset; keep strict to prevent header injection.
-            if (ch <= 0x20 or ch >= 0x7f) return false;
-            if (ch == ':' or ch == '"' or ch == '\\') return false;
-        }
-        return true;
+        return isValidHttpHeaderName(raw);
     }
 
     pub fn isValidHeaderValue(raw: []const u8) bool {
-        if (std.mem.indexOfAny(u8, raw, "\r\n") != null) return false;
-        return true;
+        return isValidHttpHeaderValue(raw);
     }
 };
 
@@ -2126,6 +2149,19 @@ test "HttpRequestConfig fallback provider validation disallows auto" {
     try std.testing.expect(HttpRequestConfig.isValidSearchFallbackProviderName("JINA"));
     try std.testing.expect(!HttpRequestConfig.isValidSearchFallbackProviderName("auto"));
     try std.testing.expect(!HttpRequestConfig.isValidSearchFallbackProviderName("AUTO"));
+}
+
+test "DiagnosticsConfig OTEL endpoint validation allows local http and remote https" {
+    try std.testing.expect(DiagnosticsConfig.isValidOtelEndpoint("http://localhost:4318"));
+    try std.testing.expect(DiagnosticsConfig.isValidOtelEndpoint("http://127.0.0.1:4318"));
+    try std.testing.expect(DiagnosticsConfig.isValidOtelEndpoint("https://otel.example.com:4318"));
+    try std.testing.expect(!DiagnosticsConfig.isValidOtelEndpoint("http://otel.example.com:4318"));
+}
+
+test "DiagnosticsConfig OTEL header validation rejects CRLF injection" {
+    try std.testing.expect(DiagnosticsConfig.isValidOtelHeaderName("Authorization"));
+    try std.testing.expect(DiagnosticsConfig.isValidOtelHeaderValue("Bearer safe"));
+    try std.testing.expect(!DiagnosticsConfig.isValidOtelHeaderValue("Bearer safe\r\nX-Injected: yes"));
 }
 
 test "ProviderEntry.max_streaming_prompt_bytes defaults to null" {

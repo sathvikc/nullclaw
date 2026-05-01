@@ -27,17 +27,18 @@ Default gateway endpoint: `http://127.0.0.1:3000`
 | Endpoint | Method | Auth | Description |
 |---|---|---|---|
 | `/health` | GET | None | Health check |
-| `/pair` | POST | `X-Pairing-Code` | Exchange one-time pairing code for bearer token |
+| `/pair` | POST | `X-Pairing-Code` | Exchange one-time pairing code for bearer token (loopback-only when gateway is publicly bound) |
 | `/webhook` | POST | `Authorization: Bearer <token>` | Send message payload: `{"message":"..."}` |
-| `/cron` | GET | `Authorization: Bearer <token>` when pairing tokens exist | List live scheduler jobs from the running daemon |
-| `/cron/add` | POST | `Authorization: Bearer <token>` when pairing tokens exist | Add or schedule a live cron job |
-| `/cron/remove` | POST | `Authorization: Bearer <token>` when pairing tokens exist | Remove a live cron job by `id` |
-| `/cron/pause` | POST | `Authorization: Bearer <token>` when pairing tokens exist | Pause a live cron job by `id` |
-| `/cron/resume` | POST | `Authorization: Bearer <token>` when pairing tokens exist | Resume a live cron job by `id` |
-| `/cron/update` | POST | `Authorization: Bearer <token>` when pairing tokens exist | Partially update a live cron job |
+| `/cron` | GET | `Authorization: Bearer <token>` on public binds or when pairing tokens exist | List live scheduler jobs from the running daemon |
+| `/cron/add` | POST | `Authorization: Bearer <token>` on public binds or when pairing tokens exist | Add or schedule a live cron job |
+| `/cron/remove` | POST | `Authorization: Bearer <token>` on public binds or when pairing tokens exist | Remove a live cron job by `id` |
+| `/cron/pause` | POST | `Authorization: Bearer <token>` on public binds or when pairing tokens exist | Pause a live cron job by `id` |
+| `/cron/resume` | POST | `Authorization: Bearer <token>` on public binds or when pairing tokens exist | Resume a live cron job by `id` |
+| `/cron/update` | POST | `Authorization: Bearer <token>` on public binds or when pairing tokens exist | Partially update a live cron job |
 | `/whatsapp` | GET | Query params | Meta webhook verification |
 | `/whatsapp` | POST | Meta signature | WhatsApp inbound webhook |
 | `/max` | POST | `X-Max-Bot-Api-Secret` when configured | Max inbound webhook delivery |
+| `/api/messages` | POST | `Authorization: Bearer <Bot Framework JWT>` and optional `X-Webhook-Secret` | Teams Bot Framework inbound webhook |
 | `/.well-known/agent-card.json` | GET | None | A2A Agent Card discovery (public) |
 | `/a2a` | POST | `Authorization: Bearer <token>` | A2A JSON-RPC 2.0 endpoint |
 
@@ -53,7 +54,7 @@ curl http://127.0.0.1:3000/health
 
 ```bash
 curl -X POST \
-  -H "X-Pairing-Code: 123456" \
+  -H "X-Pairing-Code: PAIRING_CODE" \
   http://127.0.0.1:3000/pair
 ```
 
@@ -116,6 +117,13 @@ Max webhook notes:
 - `nullclaw` routes `/max` to the configured Max account by `account_id` query first, then by `X-Max-Bot-Api-Secret`.
 - If `channels.max[].webhook_secret` is configured, the header is required and must match exactly.
 - Use HTTPS in the configured Max-side webhook URL.
+
+Teams webhook notes:
+
+- `nullclaw` validates the Bot Framework bearer token against Microsoft's OpenID metadata and signing keys before accepting the activity.
+- The token issuer must be `https://api.botframework.com`, the audience must match the configured Teams `client_id`, and the token `serviceUrl` must match the activity body.
+- Teams `channelId` endorsements are enforced from the published Bot Framework key metadata.
+- If `channels.teams[].webhook_secret` is configured, `X-Webhook-Secret` must also match exactly.
 
 ## A2A (Agent-to-Agent Protocol)
 
@@ -298,8 +306,10 @@ Include `contextId` in the message to group tasks into a conversation. All messa
 
 1. Keep `gateway.require_pairing = true`.
 2. Keep gateway on loopback (`127.0.0.1`) and expose externally through tunnel/proxy.
-3. Treat bearer tokens as secrets; do not commit or log them.
-4. Treat Max webhook secrets the same way: randomize them per account and do not reuse one secret across multiple bots.
+3. If you intentionally use a non-loopback bind, generic endpoints (`/webhook`, `/cron/*`, `/a2a`) still require a stored bearer token even when interactive pairing is disabled; preconfigure `gateway.paired_tokens` if you are not using `/pair`.
+4. On non-loopback binds, `/pair` only accepts loopback clients. Do initial pairing locally or preconfigure `gateway.paired_tokens` before exposing the port.
+5. Treat bearer tokens as secrets; do not commit or log them.
+6. Treat Max webhook secrets the same way: randomize them per account and do not reuse one secret across multiple bots.
 
 ## Next Steps
 

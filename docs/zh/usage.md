@@ -67,6 +67,11 @@ nullclaw service start
 nullclaw service status
 ```
 
+高级 secrets 注入方式：
+
+- 生成的 service 启动器在执行 `nullclaw gateway` 之前，也会检查一个可执行的 `~/.nullclaw/service-env` 辅助脚本。
+- 可以把 `dotenvx`、`sops` 或其他本地 secret loader 放进这个脚本里，而不需要手动修改已安装的 service unit / 脚本。
+
 如果配置改动较大，建议重启服务：
 
 ```bash
