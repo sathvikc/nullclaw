@@ -51,7 +51,7 @@ fn parseToolCustomizationArray(allocator: std.mem.Allocator, arr: std.json.Array
         list.deinit(allocator);
     }
 
-    try list.ensureTotalCapacity(allocator, @intCast(arr.items.len));
+    try list.ensureTotalCapacity(allocator, arr.items.len);
     for (arr.items) |item| {
         if (item != .object) continue;
         const name_val = item.object.get("name") orelse continue;
@@ -70,7 +70,15 @@ fn parseToolCustomizationArray(allocator: std.mem.Allocator, arr: std.json.Array
             if (v == .array) cust.triggers = try parseStringArray(allocator, v.array);
         }
         if (item.object.get("priority")) |v| {
-            if (v == .integer) cust.priority = @intCast(std.math.clamp(v.integer, 0, 255));
+            if (v == .integer) {
+                if (v.integer <= 0) {
+                    cust.priority = 0;
+                } else if (v.integer >= 255) {
+                    cust.priority = 255;
+                } else {
+                    cust.priority = @intCast(v.integer);
+                }
+            }
         }
         if (item.object.get("enabled")) |v| {
             if (v == .bool) cust.enabled = v.bool;
