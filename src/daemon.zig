@@ -1133,6 +1133,65 @@ const DebouncedInboundPollResult = enum {
     closed,
 };
 
+const INBOUND_DISPATCH_QUEUE_CAPACITY: usize = 256;
+const INBOUND_DISPATCH_WORKER_COUNT: usize = if (builtin.is_test) 2 else 4;
+const EVICT_IDLE_DISPATCH_INTERVAL: u32 = 100;
+
+const InboundDispatchQueue = bus_mod.BoundedQueue(bus_mod.InboundMessage, INBOUND_DISPATCH_QUEUE_CAPACITY);
+
+const InboundWorkerCtx = struct {
+    allocator: std.mem.Allocator,
+    queue: *InboundDispatchQueue,
+    event_bus: *bus_mod.Bus,
+    registry: *const dispatch.ChannelRegistry,
+    runtime: *channel_loop.ChannelRuntime,
+    evict_counter: *Atomic(u32),
+};
+
+fn shouldRunInboundIdleEviction(dispatch_count: u32) bool {
+    return dispatch_count != 0 and (dispatch_count % EVICT_IDLE_DISPATCH_INTERVAL) == 0;
+}
+
+fn inboundDispatchShardIndex(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    msg: *const bus_mod.InboundMessage,
+    worker_count: usize,
+) usize {
+    if (worker_count == 0) return 0;
+
+    var parsed_meta = parseInboundMetadata(allocator, msg.metadata_json);
+    defer parsed_meta.deinit();
+
+    const routed_session_key = resolveInboundMainSessionKeyWithMetadata(
+        allocator,
+        config,
+        msg,
+        parsed_meta.fields,
+    ) orelse resolveInboundRouteSessionKeyWithMetadata(
+        allocator,
+        config,
+        msg,
+        parsed_meta.fields,
+    );
+    defer if (routed_session_key) |key| allocator.free(key);
+
+    const session_key = routed_session_key orelse msg.session_key;
+    const shard_count: u64 = @intCast(worker_count);
+    return @intCast(std.hash.Wyhash.hash(0, session_key) % shard_count);
+}
+
+fn publishInboundToWorkerQueue(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    worker_queues: []InboundDispatchQueue,
+    msg: bus_mod.InboundMessage,
+) error{Closed}!void {
+    std.debug.assert(worker_queues.len > 0);
+    const shard_index = inboundDispatchShardIndex(allocator, config, &msg, worker_queues.len);
+    try worker_queues[shard_index].publish(msg);
+}
+
 fn pollDebouncedInbound(
     _: std.mem.Allocator,
     event_bus: *bus_mod.Bus,
@@ -1161,17 +1220,237 @@ fn pollDebouncedInbound(
     return if (ready_messages.items.len > 0) .ready else .closed;
 }
 
+fn processInboundMessage(
+    allocator: std.mem.Allocator,
+    event_bus: *bus_mod.Bus,
+    registry: *const dispatch.ChannelRegistry,
+    runtime: *channel_loop.ChannelRuntime,
+    evict_counter: *Atomic(u32),
+    msg: *const bus_mod.InboundMessage,
+) void {
+    var parsed_meta = parseInboundMetadata(allocator, msg.metadata_json);
+    defer parsed_meta.deinit();
+
+    const outbound_account_id = parsed_meta.fields.account_id;
+    const routed_session_key = resolveInboundMainSessionKeyWithMetadata(
+        allocator,
+        runtime.config,
+        msg,
+        parsed_meta.fields,
+    ) orelse resolveInboundRouteSessionKeyWithMetadata(
+        allocator,
+        runtime.config,
+        msg,
+        parsed_meta.fields,
+    );
+    defer if (routed_session_key) |key| allocator.free(key);
+    const session_key = routed_session_key orelse msg.session_key;
+
+    const outbound_channel = resolveOutboundChannel(registry, msg.channel, outbound_account_id);
+    if (outbound_channel) |channel| {
+        markInboundMessageRead(channel, buildInboundMessageRef(msg, parsed_meta.fields));
+    }
+
+    if (runtime.session_mgr.routeInbound(session_key, msg.content) == .skip) return;
+
+    const typing_recipient = sendInboundProcessingIndicator(
+        allocator,
+        registry,
+        msg.channel,
+        outbound_account_id,
+        msg.chat_id,
+        parsed_meta.fields,
+    );
+    defer clearInboundProcessingIndicator(
+        allocator,
+        registry,
+        msg.channel,
+        outbound_account_id,
+        typing_recipient,
+    );
+
+    const use_tracked_draft_outbound = if (outbound_channel) |channel|
+        !channel.supportsStreamingOutbound() and dispatch.supportsDraftStreaming(channel)
+    else
+        false;
+    const use_streaming_outbound = if (outbound_channel) |channel|
+        channel.supportsStreamingOutbound() or dispatch.supportsDraftStreaming(channel)
+    else
+        false;
+    const outbound_draft_id: u64 = if (use_tracked_draft_outbound) nextOutboundDraftId() else 0;
+    var streaming_ctx = StreamingOutboundCtx{
+        .allocator = allocator,
+        .event_bus = event_bus,
+        .channel = msg.channel,
+        .account_id = outbound_account_id,
+        .chat_id = msg.chat_id,
+        .draft_id = outbound_draft_id,
+    };
+    var stream_sink: ?streaming.Sink = null;
+    var outbound_tag_filter: streaming.TagFilter = undefined;
+    if (use_streaming_outbound) {
+        const raw_sink = streaming.Sink{
+            .callback = publishStreamingChunk,
+            .ctx = @ptrCast(&streaming_ctx),
+        };
+        stream_sink = makeStreamingSinkForChannel(use_streaming_outbound, raw_sink, &outbound_tag_filter);
+    }
+
+    if (std.mem.eql(u8, msg.channel, "max")) {
+        channels_mod.max.setInteractiveOwnerContext(msg.sender_id);
+        defer channels_mod.max.setInteractiveOwnerContext(null);
+    }
+
+    const conversation_context = buildInboundConversationContext(msg, parsed_meta.fields);
+
+    const reply = runtime.session_mgr.processMessageStreaming(
+        session_key,
+        msg.content,
+        conversation_context,
+        stream_sink,
+        null,
+    ) catch |err| {
+        log.warn("inbound dispatch process failed: {}", .{err});
+
+        // Send user-visible error reply back to the originating channel
+        const err_msg: []const u8 = switch (err) {
+            error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
+            error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
+            error.NoResponseContent => "Model returned an empty response. Please try again.",
+            error.OutOfMemory => "Out of memory.",
+            else => "An error occurred. Try again.",
+        };
+        var err_out = if (outbound_account_id) |aid|
+            bus_mod.makeOutboundWithAccount(allocator, msg.channel, aid, msg.chat_id, err_msg) catch return
+        else
+            bus_mod.makeOutbound(allocator, msg.channel, msg.chat_id, err_msg) catch return;
+        err_out.draft_id = outbound_draft_id;
+        event_bus.publishOutbound(err_out) catch {
+            err_out.deinit(allocator);
+        };
+        return;
+    };
+    defer allocator.free(reply);
+
+    if ((parsed_meta.fields.replace_message orelse false) and parsed_meta.fields.message_id != null) {
+        if (outbound_channel) |channel| {
+            var payload = makeAssistantReplyPayload(allocator, reply) catch |err| {
+                log.warn("failed to build edit payload: {}", .{err});
+                const out = makeAssistantReplyOutbound(
+                    allocator,
+                    msg.channel,
+                    outbound_account_id,
+                    msg.chat_id,
+                    reply,
+                    outbound_draft_id,
+                ) catch return;
+                event_bus.publishOutbound(out) catch |publish_err| {
+                    out.deinit(allocator);
+                    log.err("inbound dispatch publishOutbound failed: {}", .{publish_err});
+                };
+                return;
+            };
+            defer payload.deinit(allocator);
+
+            if (channel.editMessage(.{
+                .target = msg.chat_id,
+                .message_id = parsed_meta.fields.message_id.?,
+                .payload = payload.payload(),
+            })) |_| {
+                return;
+            } else |err| {
+                log.warn("editMessage failed; falling back to normal outbound: {}", .{err});
+            }
+        }
+    }
+
+    const out = makeAssistantReplyOutbound(
+        allocator,
+        msg.channel,
+        outbound_account_id,
+        msg.chat_id,
+        reply,
+        outbound_draft_id,
+    ) catch |err| {
+        log.err("inbound dispatch makeOutbound failed: {}", .{err});
+        return;
+    };
+
+    event_bus.publishOutbound(out) catch |err| {
+        out.deinit(allocator);
+        if (err != error.Closed) {
+            log.err("inbound dispatch publishOutbound failed: {}", .{err});
+        }
+        return;
+    };
+
+    health.markComponentOk("inbound_dispatcher");
+    const dispatch_count = evict_counter.fetchAdd(1, .monotonic) + 1;
+    if (shouldRunInboundIdleEviction(dispatch_count)) {
+        _ = runtime.session_mgr.evictIdle(runtime.config.agent.session_idle_timeout_secs);
+    }
+}
+
+fn inboundWorkerThread(ctx: *InboundWorkerCtx) void {
+    while (ctx.queue.consume()) |msg| {
+        var inbound_msg = msg;
+        defer inbound_msg.deinit(ctx.allocator);
+        processInboundMessage(
+            ctx.allocator,
+            ctx.event_bus,
+            ctx.registry,
+            ctx.runtime,
+            ctx.evict_counter,
+            &inbound_msg,
+        );
+    }
+}
+
 fn inboundDispatcherThread(
     allocator: std.mem.Allocator,
     event_bus: *bus_mod.Bus,
     registry: *const dispatch.ChannelRegistry,
     runtime: *channel_loop.ChannelRuntime,
-    state: *DaemonState,
+    _: *DaemonState,
 ) void {
-    var evict_counter: u32 = 0;
+    var evict_counter = Atomic(u32).init(0);
     var debouncer = inbound_debounce.InboundDebouncer.init(allocator, runtime.config.messages.inbound.debounce_ms);
     defer debouncer.deinit();
     var ready_messages: std.ArrayListUnmanaged(bus_mod.InboundMessage) = .empty;
+
+    var worker_queues: [INBOUND_DISPATCH_WORKER_COUNT]InboundDispatchQueue = undefined;
+    var worker_ctxs: [INBOUND_DISPATCH_WORKER_COUNT]InboundWorkerCtx = undefined;
+    var worker_threads: [INBOUND_DISPATCH_WORKER_COUNT]?std.Thread = .{null} ** INBOUND_DISPATCH_WORKER_COUNT;
+    var worker_count: usize = 0;
+    while (worker_count < INBOUND_DISPATCH_WORKER_COUNT) : (worker_count += 1) {
+        worker_queues[worker_count] = InboundDispatchQueue.init();
+        worker_ctxs[worker_count] = .{
+            .allocator = allocator,
+            .queue = &worker_queues[worker_count],
+            .event_bus = event_bus,
+            .registry = registry,
+            .runtime = runtime,
+            .evict_counter = &evict_counter,
+        };
+        worker_threads[worker_count] = std.Thread.spawn(
+            .{ .stack_size = thread_stacks.SESSION_TURN_STACK_SIZE },
+            inboundWorkerThread,
+            .{&worker_ctxs[worker_count]},
+        ) catch |err| {
+            log.warn("inbound worker spawn failed: {}", .{err});
+            break;
+        };
+    }
+    defer {
+        for (worker_queues[0..worker_count]) |*queue| {
+            queue.close();
+        }
+        var i: usize = 0;
+        while (i < worker_count) : (i += 1) {
+            if (worker_threads[i]) |thread| thread.join();
+        }
+    }
+
     defer {
         for (ready_messages.items) |msg| msg.deinit(allocator);
         ready_messages.deinit(allocator);
@@ -1194,171 +1473,15 @@ fn inboundDispatcherThread(
 
         while (ready_messages.items.len > 0) {
             var msg = ready_messages.orderedRemove(0);
-            defer msg.deinit(allocator);
-
-            var parsed_meta = parseInboundMetadata(allocator, msg.metadata_json);
-            defer parsed_meta.deinit();
-
-            const outbound_account_id = parsed_meta.fields.account_id;
-            const routed_session_key = resolveInboundMainSessionKeyWithMetadata(
-                allocator,
-                runtime.config,
-                &msg,
-                parsed_meta.fields,
-            ) orelse resolveInboundRouteSessionKeyWithMetadata(
-                allocator,
-                runtime.config,
-                &msg,
-                parsed_meta.fields,
-            );
-            defer if (routed_session_key) |key| allocator.free(key);
-            const session_key = routed_session_key orelse msg.session_key;
-
-            const outbound_channel = resolveOutboundChannel(registry, msg.channel, outbound_account_id);
-            if (outbound_channel) |channel| {
-                markInboundMessageRead(channel, buildInboundMessageRef(&msg, parsed_meta.fields));
-            }
-
-            if (runtime.session_mgr.routeInbound(session_key, msg.content) == .skip) continue;
-
-            const typing_recipient = sendInboundProcessingIndicator(
-                allocator,
-                registry,
-                msg.channel,
-                outbound_account_id,
-                msg.chat_id,
-                parsed_meta.fields,
-            );
-            defer clearInboundProcessingIndicator(
-                allocator,
-                registry,
-                msg.channel,
-                outbound_account_id,
-                typing_recipient,
-            );
-
-            const use_tracked_draft_outbound = if (outbound_channel) |channel|
-                !channel.supportsStreamingOutbound() and dispatch.supportsDraftStreaming(channel)
-            else
-                false;
-            const use_streaming_outbound = if (outbound_channel) |channel|
-                channel.supportsStreamingOutbound() or dispatch.supportsDraftStreaming(channel)
-            else
-                false;
-            const outbound_draft_id: u64 = if (use_tracked_draft_outbound) nextOutboundDraftId() else 0;
-            var streaming_ctx = StreamingOutboundCtx{
-                .allocator = allocator,
-                .event_bus = event_bus,
-                .channel = msg.channel,
-                .account_id = outbound_account_id,
-                .chat_id = msg.chat_id,
-                .draft_id = outbound_draft_id,
-            };
-            var stream_sink: ?streaming.Sink = null;
-            var outbound_tag_filter: streaming.TagFilter = undefined;
-            if (use_streaming_outbound) {
-                const raw_sink = streaming.Sink{
-                    .callback = publishStreamingChunk,
-                    .ctx = @ptrCast(&streaming_ctx),
+            if (worker_count > 0) {
+                publishInboundToWorkerQueue(allocator, runtime.config, worker_queues[0..worker_count], msg) catch |err| {
+                    msg.deinit(allocator);
+                    if (err == error.Closed) break;
+                    continue;
                 };
-                stream_sink = makeStreamingSinkForChannel(use_streaming_outbound, raw_sink, &outbound_tag_filter);
-            }
-
-            if (std.mem.eql(u8, msg.channel, "max")) {
-                channels_mod.max.setInteractiveOwnerContext(msg.sender_id);
-                defer channels_mod.max.setInteractiveOwnerContext(null);
-            }
-
-            const conversation_context = buildInboundConversationContext(&msg, parsed_meta.fields);
-
-            const reply = runtime.session_mgr.processMessageStreaming(
-                session_key,
-                msg.content,
-                conversation_context,
-                stream_sink,
-                null,
-            ) catch |err| {
-                log.warn("inbound dispatch process failed: {}", .{err});
-
-                // Send user-visible error reply back to the originating channel
-                const err_msg: []const u8 = switch (err) {
-                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
-                    error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
-                    error.NoResponseContent => "Model returned an empty response. Please try again.",
-                    error.OutOfMemory => "Out of memory.",
-                    else => "An error occurred. Try again.",
-                };
-                var err_out = if (outbound_account_id) |aid|
-                    bus_mod.makeOutboundWithAccount(allocator, msg.channel, aid, msg.chat_id, err_msg) catch continue
-                else
-                    bus_mod.makeOutbound(allocator, msg.channel, msg.chat_id, err_msg) catch continue;
-                err_out.draft_id = outbound_draft_id;
-                event_bus.publishOutbound(err_out) catch {
-                    err_out.deinit(allocator);
-                };
-                continue;
-            };
-            defer allocator.free(reply);
-
-            if ((parsed_meta.fields.replace_message orelse false) and parsed_meta.fields.message_id != null) {
-                if (outbound_channel) |channel| {
-                    var payload = makeAssistantReplyPayload(allocator, reply) catch |err| {
-                        log.warn("failed to build edit payload: {}", .{err});
-                        const out = makeAssistantReplyOutbound(
-                            allocator,
-                            msg.channel,
-                            outbound_account_id,
-                            msg.chat_id,
-                            reply,
-                            outbound_draft_id,
-                        ) catch continue;
-                        event_bus.publishOutbound(out) catch |publish_err| {
-                            out.deinit(allocator);
-                            log.err("inbound dispatch publishOutbound failed: {}", .{publish_err});
-                        };
-                        continue;
-                    };
-                    defer payload.deinit(allocator);
-
-                    if (channel.editMessage(.{
-                        .target = msg.chat_id,
-                        .message_id = parsed_meta.fields.message_id.?,
-                        .payload = payload.payload(),
-                    })) |_| {
-                        continue;
-                    } else |err| {
-                        log.warn("editMessage failed; falling back to normal outbound: {}", .{err});
-                    }
-                }
-            }
-
-            const out = makeAssistantReplyOutbound(
-                allocator,
-                msg.channel,
-                outbound_account_id,
-                msg.chat_id,
-                reply,
-                outbound_draft_id,
-            ) catch |err| {
-                log.err("inbound dispatch makeOutbound failed: {}", .{err});
-                continue;
-            };
-
-            event_bus.publishOutbound(out) catch |err| {
-                out.deinit(allocator);
-                if (err == error.Closed) break;
-                log.err("inbound dispatch publishOutbound failed: {}", .{err});
-                continue;
-            };
-
-            state.markRunning("inbound_dispatcher");
-            health.markComponentOk("inbound_dispatcher");
-
-            // Periodic session eviction for bus-based channels
-            evict_counter += 1;
-            if (evict_counter >= 100) {
-                evict_counter = 0;
-                _ = runtime.session_mgr.evictIdle(runtime.config.agent.session_idle_timeout_secs);
+            } else {
+                processInboundMessage(allocator, event_bus, registry, runtime, &evict_counter, &msg);
+                msg.deinit(allocator);
             }
         }
     }
@@ -1366,7 +1489,14 @@ fn inboundDispatcherThread(
     debouncer.flushAll(&ready_messages) catch {};
     while (ready_messages.items.len > 0) {
         var msg = ready_messages.orderedRemove(0);
-        msg.deinit(allocator);
+        if (worker_count > 0) {
+            publishInboundToWorkerQueue(allocator, runtime.config, worker_queues[0..worker_count], msg) catch {
+                msg.deinit(allocator);
+            };
+        } else {
+            processInboundMessage(allocator, event_bus, registry, runtime, &evict_counter, &msg);
+            msg.deinit(allocator);
+        }
     }
 }
 
@@ -1785,6 +1915,63 @@ test "pollDebouncedInbound merge out-of-memory does not double free" {
         pollDebouncedInbound(allocator, &event_bus, &debouncer, &ready_messages),
     );
     try std.testing.expectEqual(@as(usize, 0), ready_messages.items.len);
+}
+
+test "shouldRunInboundIdleEviction only triggers at configured interval" {
+    try std.testing.expect(!shouldRunInboundIdleEviction(0));
+    try std.testing.expect(!shouldRunInboundIdleEviction(EVICT_IDLE_DISPATCH_INTERVAL - 1));
+    try std.testing.expect(shouldRunInboundIdleEviction(EVICT_IDLE_DISPATCH_INTERVAL));
+    try std.testing.expect(shouldRunInboundIdleEviction(EVICT_IDLE_DISPATCH_INTERVAL * 2));
+    try std.testing.expect(!shouldRunInboundIdleEviction(EVICT_IDLE_DISPATCH_INTERVAL + 1));
+}
+
+test "inboundDispatchShardIndex keeps routed session on same worker" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "tg-ops",
+            .match = .{
+                .channel = "telegram",
+                .account_id = "backup",
+                .peer = .{ .kind = .group, .id = "-100123:thread:77" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+        .channels = .{
+            .telegram = &[_]@import("config_types.zig").TelegramConfig{
+                .{ .account_id = "backup", .bot_token = "token" },
+            },
+        },
+    };
+    const first = bus_mod.InboundMessage{
+        .channel = "telegram",
+        .sender_id = "system:cron",
+        .chat_id = "chat-42",
+        .content = "first",
+        .session_key = "raw:first",
+        .metadata_json = "{\"account_id\":\"backup\",\"peer_kind\":\"group\",\"peer_id\":\"-100123\",\"thread_id\":\"77\"}",
+    };
+    const second = bus_mod.InboundMessage{
+        .channel = "telegram",
+        .sender_id = "system:cron",
+        .chat_id = "chat-42",
+        .content = "second",
+        .session_key = "raw:second",
+        .metadata_json = "{\"account_id\":\"backup\",\"peer_kind\":\"group\",\"peer_id\":\"-100123\",\"thread_id\":\"77\"}",
+    };
+
+    const worker_count = INBOUND_DISPATCH_WORKER_COUNT;
+    const shard_count: u64 = @intCast(worker_count);
+    const expected_shard: usize = @intCast(std.hash.Wyhash.hash(0, "agent:tg-ops:main") % shard_count);
+
+    // Regression (#855): same resolved session must stay on one FIFO worker queue.
+    try std.testing.expectEqual(expected_shard, inboundDispatchShardIndex(allocator, &config, &first, worker_count));
+    try std.testing.expectEqual(expected_shard, inboundDispatchShardIndex(allocator, &config, &second, worker_count));
 }
 
 test "hasSupervisedChannels false for defaults" {

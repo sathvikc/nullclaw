@@ -1651,6 +1651,10 @@ pub const SessionManager = struct {
         return self.processMessageStreaming(session_key, content, conversation_context, null, null);
     }
 
+    fn lockSessionForTurn(session: *Session) void {
+        session.mutex.lock();
+    }
+
     /// Route and process an inbound message. Returns null when routing consumed
     /// the message via drop/injection and the caller should not send a reply.
     pub fn processInboundMessage(self: *SessionManager, session_key: []const u8, content: []const u8, conversation_context: ?ConversationContext) !?[]const u8 {
@@ -1681,7 +1685,7 @@ pub const SessionManager = struct {
     ) !?[]const u8 {
         const session = try self.getOrCreate(session_key);
 
-        session.mutex.lock();
+        lockSessionForTurn(session);
         defer session.mutex.unlock();
         session.turn_running.store(true, .release);
         defer {
@@ -1762,7 +1766,7 @@ pub const SessionManager = struct {
 
         const session = try self.getOrCreate(session_key);
 
-        session.mutex.lock();
+        lockSessionForTurn(session);
         defer session.mutex.unlock();
         session.turn_running.store(true, .release);
         defer {
@@ -3950,6 +3954,59 @@ test "requestTurnInterrupt returns active tool snapshot when available" {
     try testing.expect(res.requested);
     try testing.expect(res.active_tool != null);
     try testing.expectEqualStrings("shell", res.active_tool.?);
+}
+
+test "lockSessionForTurn waits without interrupting active serial turn" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("interrupt:contention");
+    session.turn_running.store(true, .release);
+    defer session.turn_running.store(false, .release);
+    session.agent.clearInterruptRequest();
+
+    session.mutex.lock();
+    var session_unlocked = false;
+    defer if (!session_unlocked) session.mutex.unlock();
+
+    const Worker = struct {
+        const Ctx = struct {
+            session: *Session,
+            started: *std.atomic.Value(bool),
+        };
+
+        fn run(ctx: Ctx) void {
+            ctx.started.store(true, .release);
+            SessionManager.lockSessionForTurn(ctx.session);
+            ctx.session.mutex.unlock();
+        }
+    };
+
+    var worker_started = std.atomic.Value(bool).init(false);
+    const ctx = Worker.Ctx{ .session = session, .started = &worker_started };
+    var thread = try std.Thread.spawn(.{}, Worker.run, .{ctx});
+    var thread_joined = false;
+    defer if (!thread_joined) thread.join();
+
+    var attempts: usize = 0;
+    while (attempts < 100 and !worker_started.load(.acquire)) : (attempts += 1) {
+        std_compat.thread.sleep(2 * std.time.ns_per_ms);
+    }
+    try testing.expect(worker_started.load(.acquire));
+
+    attempts = 0;
+    while (attempts < 20) : (attempts += 1) {
+        std_compat.thread.sleep(2 * std.time.ns_per_ms);
+    }
+    // Regression (#832): serial queued turns must wait behind active turns without hard-stopping them.
+    try testing.expect(!session.agent.interrupt_requested.load(.acquire));
+
+    session.mutex.unlock();
+    session_unlocked = true;
+    thread.join();
+    thread_joined = true;
 }
 
 // ---------------------------------------------------------------------------
