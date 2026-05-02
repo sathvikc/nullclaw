@@ -947,6 +947,10 @@ Tunnel providers for exposing the gateway to the public internet. Required for w
 - `level = "yolo"`: bypasses command policy checks; use only for trusted local debugging.
 - `workspace_only`: keep `true` to limit file access scope.
 - `max_actions_per_hour`: keep conservative limits first.
+- `block_high_risk_commands` (default: `true`): blocks destructive commands such as `rm`, `sudo`, `mkfs`, `dd`, `shutdown`, `ssh`.
+- `block_medium_risk_commands` (default: `true`): blocks medium-risk commands, including network/transfer commands such as `curl`, `wget`, `nc`, `scp`, `ftp`, `telnet` and state-changing commands such as `git commit`, `npm install`, `touch`, or `mkdir`. Set to `false` to allow these while still blocking high-risk commands.
+- `require_approval_for_medium_risk` (default: `true`): when `block_medium_risk_commands` is `false`, require explicit approval before running medium-risk commands in `supervised` mode.
+- `allowed_commands`: explicit list of allowed command basenames. Use `["*"]` for wildcard (full autonomy only). High-risk and medium-risk runtime gates still apply regardless of this list.
 
 ### `security`
 
@@ -971,6 +975,7 @@ Use only in controlled environments:
     "allowed_commands": ["*"],
     "allowed_paths": ["*"],
     "require_approval_for_medium_risk": false,
+    "block_medium_risk_commands": false,
     "block_high_risk_commands": false
   }
 }

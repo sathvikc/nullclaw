@@ -623,6 +623,7 @@ Use this when you want full web-search provider control plus unrestricted shell 
     "allowed_commands": ["*"],
     "allowed_paths": ["*"],
     "require_approval_for_medium_risk": false,
+    "block_medium_risk_commands": false,
     "block_high_risk_commands": false
   }
 }
@@ -636,6 +637,7 @@ Use this when you want full web-search provider control plus unrestricted shell 
 - `allowed_commands` entries support `"cmd"`, `"cmd *"`, and `"*"` formats.
   - `"cmd"` and `"cmd *"` both allow that command family at the allowlist stage.
   - `"*"` allows any command at the allowlist stage.
+- High-risk and medium-risk runtime gates still apply after the allowlist check; set `block_medium_risk_commands: false` when you intentionally allow network/transfer commands such as `curl`/`wget` or other medium-risk mutations.
 - `allowed_paths: ["*"]` allows access outside workspace, except system-protected paths.
 
 ### Web UI / Browser Relay

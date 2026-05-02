@@ -1347,6 +1347,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (aut.object.get("block_high_risk_commands")) |v| {
                 if (v == .bool) self.autonomy.block_high_risk_commands = v.bool;
             }
+            if (aut.object.get("block_medium_risk_commands")) |v| {
+                if (v == .bool) self.autonomy.block_medium_risk_commands = v.bool;
+            }
             if (aut.object.get("level")) |v| {
                 if (v == .string) {
                     if (types.AutonomyLevel.fromString(v.string)) |lvl| {

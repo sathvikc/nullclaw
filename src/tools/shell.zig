@@ -177,6 +177,7 @@ pub const ShellTool = struct {
                         break :blk ToolResult.fail("Command not allowed by security policy");
                     },
                     error.HighRiskBlocked => ToolResult.fail("High-risk command blocked by security policy"),
+                    error.MediumRiskBlocked => ToolResult.fail("Medium-risk command blocked by security policy"),
                     error.ApprovalRequired => blk: {
                         const msg = try std.fmt.allocPrint(allocator, "Command requires approval (medium/high risk): {s}", .{command});
                         break :blk ToolResult{ .success = false, .output = "", .error_msg = msg };
@@ -649,6 +650,8 @@ test "shell ApprovalRequired error includes command name" {
         .workspace_dir = "/tmp",
         .require_approval_for_medium_risk = true,
         .block_high_risk_commands = false,
+        // touch is medium-risk; set false so the approval gate is reachable
+        .block_medium_risk_commands = false,
         .tracker = &tracker,
         .allowed_commands = &allowed,
     };
@@ -676,6 +679,8 @@ test "shell ApprovalRequired propagates oom for error message allocation" {
         .workspace_dir = "/tmp",
         .require_approval_for_medium_risk = true,
         .block_high_risk_commands = false,
+        // touch is medium-risk; set false so the approval gate is reachable
+        .block_medium_risk_commands = false,
         .tracker = &tracker,
         .allowed_commands = &allowed,
     };
@@ -690,6 +695,28 @@ test "shell ApprovalRequired propagates oom for error message allocation" {
         error.OutOfMemory,
         st.execute(failing.allocator(), parsed.value.object),
     );
+}
+
+test "shell MediumRiskBlocked error is user-facing" {
+    const policy_mod = @import("../security/policy.zig");
+    var tracker = policy_mod.RateTracker.init(std.testing.allocator, 100);
+    defer tracker.deinit();
+    const allowed = [_][]const u8{"curl"};
+    var policy = policy_mod.SecurityPolicy{
+        .autonomy = .full,
+        .workspace_dir = "/tmp",
+        .block_medium_risk_commands = true,
+        .tracker = &tracker,
+        .allowed_commands = &allowed,
+    };
+
+    var st = ShellTool{ .workspace_dir = "/tmp", .policy = &policy };
+    const parsed = try root.parseTestArgs("{\"command\": \"curl https://example.com\"}");
+    defer parsed.deinit();
+    const result = try st.execute(std.testing.allocator, parsed.value.object);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("Medium-risk command blocked by security policy", result.error_msg.?);
 }
 
 test "shell wildcard policy permits command outside default allowlist" {

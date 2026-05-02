@@ -4389,6 +4389,16 @@ test "json parse autonomy allow_raw_url_chars" {
     try std.testing.expect(cfg.autonomy.allow_raw_url_chars);
 }
 
+test "json parse autonomy block_medium_risk_commands" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"autonomy": {"block_medium_risk_commands": false}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(!cfg.autonomy.block_medium_risk_commands);
+}
+
 test "json parse gateway paired tokens" {
     const allocator = std.testing.allocator;
     const json =

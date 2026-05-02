@@ -281,6 +281,10 @@ pub const AutonomyConfig = struct {
     max_actions_per_hour: u32 = 20,
     require_approval_for_medium_risk: bool = true,
     block_high_risk_commands: bool = true,
+    /// When true, block medium-risk commands. This includes network/transfer
+    /// commands (curl, wget, nc, scp, ftp, telnet) and state-changing commands
+    /// classified by arguments (git commit, npm install, touch, mkdir, etc.).
+    block_medium_risk_commands: bool = true,
     allowed_commands: []const []const u8 = &.{},
     /// When true, skip the single-`&` shell-operator check so that bare
     /// `&` in URLs (e.g. `curl https://...?a=1&b=2`) is permitted.
@@ -1920,6 +1924,7 @@ test "security defaults stay least-privilege" {
     try std.testing.expectEqual(@as(u32, 20), autonomy.max_actions_per_hour);
     try std.testing.expect(autonomy.require_approval_for_medium_risk);
     try std.testing.expect(autonomy.block_high_risk_commands);
+    try std.testing.expect(autonomy.block_medium_risk_commands);
     try std.testing.expect(!autonomy.allow_raw_url_chars);
 
     const http_request = HttpRequestConfig{};

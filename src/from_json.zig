@@ -38,24 +38,28 @@ fn applyAutonomySelection(cfg: *Config, autonomy: []const u8) AutonomySelectionE
         cfg.autonomy.level = .supervised;
         cfg.autonomy.require_approval_for_medium_risk = true;
         cfg.autonomy.block_high_risk_commands = true;
+        cfg.autonomy.block_medium_risk_commands = true;
         return;
     }
     if (std.mem.eql(u8, autonomy, "autonomous")) {
         cfg.autonomy.level = .full;
         cfg.autonomy.require_approval_for_medium_risk = false;
         cfg.autonomy.block_high_risk_commands = true;
+        cfg.autonomy.block_medium_risk_commands = true;
         return;
     }
     if (std.mem.eql(u8, autonomy, "fully_autonomous")) {
         cfg.autonomy.level = .full;
         cfg.autonomy.require_approval_for_medium_risk = false;
         cfg.autonomy.block_high_risk_commands = false;
+        cfg.autonomy.block_medium_risk_commands = false;
         return;
     }
     if (std.mem.eql(u8, autonomy, "yolo")) {
         cfg.autonomy.level = .yolo;
         cfg.autonomy.require_approval_for_medium_risk = false;
         cfg.autonomy.block_high_risk_commands = false;
+        cfg.autonomy.block_medium_risk_commands = false;
         return;
     }
     return error.InvalidAutonomyLevel;
@@ -637,6 +641,24 @@ test "applyAutonomySelection rejects invalid value" {
         .allocator = std.testing.allocator,
     };
     try std.testing.expectError(error.InvalidAutonomyLevel, applyAutonomySelection(&cfg, "danger-mode"));
+}
+
+test "applyAutonomySelection maps medium-risk blocking" {
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+    };
+
+    try applyAutonomySelection(&cfg, "autonomous");
+    try std.testing.expectEqual(config_mod.AutonomyLevel.full, cfg.autonomy.level);
+    try std.testing.expect(cfg.autonomy.block_high_risk_commands);
+    try std.testing.expect(cfg.autonomy.block_medium_risk_commands);
+
+    try applyAutonomySelection(&cfg, "fully_autonomous");
+    try std.testing.expectEqual(config_mod.AutonomyLevel.full, cfg.autonomy.level);
+    try std.testing.expect(!cfg.autonomy.block_high_risk_commands);
+    try std.testing.expect(!cfg.autonomy.block_medium_risk_commands);
 }
 
 test "applyChannelsFromString enables webhook from csv" {

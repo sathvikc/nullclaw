@@ -26,6 +26,7 @@ Onboarding maps the autonomy choice to these fields:
 - `autonomy.level`: `supervised`, `full`, or `yolo`.
 - `autonomy.require_approval_for_medium_risk`: `true` for supervised, otherwise `false`.
 - `autonomy.block_high_risk_commands`: `true` for supervised/autonomous, `false` for fully autonomous/yolo.
+- `autonomy.block_medium_risk_commands`: `true` for supervised/autonomous, `false` for fully autonomous/yolo.
 
 ## Channel Configuration
 
