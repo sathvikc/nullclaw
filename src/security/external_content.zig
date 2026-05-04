@@ -242,3 +242,13 @@ test "ContentSource labels" {
     try std.testing.expectEqualStrings("Web Fetch", ContentSource.web_fetch.label());
     try std.testing.expectEqualStrings("Web Search", ContentSource.web_search.label());
 }
+
+test "wrapExternalContent preserves multibyte UTF-8 content" {
+    const allocator = std.testing.allocator;
+    const utf8_content = "Hello, 世界! 🌍 Москва ñ";
+    const result = try wrapExternalContent(allocator, utf8_content, .web_fetch);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "世界") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "🌍") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Москва") != null);
+}

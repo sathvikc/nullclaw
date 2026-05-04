@@ -10153,3 +10153,136 @@ test "globMatch handles prefix wildcard" {
     try std.testing.expect(Agent.globMatch("shell", "shell"));
     try std.testing.expect(!Agent.globMatch("shell", "shell_extra"));
 }
+
+test "loop honors max_tool_iterations limit" {
+    // Verifies that when a provider always returns a tool call, the agent loop
+    // stops at exactly max_tool_iterations and emits tool_iterations_exhausted.
+    const NoopTool = struct {
+        const Self = @This();
+        pub const tool_name = "noop_iter";
+        pub const tool_description = "noop for iteration cap test";
+        pub const tool_params = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}";
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(_: *Self, allocator: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            return .{ .success = true, .output = try allocator.dupe(u8, "noop ok") };
+        }
+    };
+
+    // Provider always returns a tool call so it never completes voluntarily.
+    // On the summary call (after cap is hit) it returns a plain text response.
+    const LoopingProvider = struct {
+        const Self = @This();
+        calls: usize = 0,
+        cap: usize,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            // Within the cap: always return a tool call to keep the loop going.
+            // On the summary call (calls > cap): return plain text.
+            if (self.calls <= self.cap) {
+                const tool_calls = try allocator.alloc(providers.ToolCall, 1);
+                tool_calls[0] = .{
+                    .id = try allocator.dupe(u8, "call-noop-iter"),
+                    .name = try allocator.dupe(u8, "noop_iter"),
+                    .arguments = try allocator.dupe(u8, "{}"),
+                };
+                return .{
+                    .content = try allocator.dupe(u8, "calling tool"),
+                    .tool_calls = tool_calls,
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+            return .{
+                .content = try allocator.dupe(u8, "summary after cap"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
+        fn getName(_: *anyopaque) []const u8 {
+            return "looping-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const max_iters: u32 = 2;
+    const allocator = std.testing.allocator;
+
+    var provider_state = LoopingProvider{ .cap = max_iters };
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = LoopingProvider.chatWithSystem,
+        .chat = LoopingProvider.chat,
+        .supportsNativeTools = LoopingProvider.supportsNativeTools,
+        .getName = LoopingProvider.getName,
+        .deinit = LoopingProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var noop_tool = NoopTool{};
+    const tool_list = [_]Tool{noop_tool.tool()};
+    var specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+
+    var observer = RecordingObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = observer.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = max_iters,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("loop forever");
+    defer allocator.free(response);
+
+    // Loop must stop — not infinite loop.
+    // tool_iterations_exhausted event fired exactly once.
+    try std.testing.expectEqual(@as(usize, 1), observer.tool_iterations_exhausted_count);
+    // turn_complete fired exactly once.
+    try std.testing.expectEqual(@as(usize, 1), observer.turn_complete_count);
+    // Provider called max_iters times for tool iterations + 1 for the summary call.
+    try std.testing.expectEqual(max_iters + 1, @as(u32, @intCast(provider_state.calls)));
+    // Response contains the iteration-limit prefix.
+    try std.testing.expect(std.mem.indexOf(u8, response, "[Tool iteration limit:") != null);
+}

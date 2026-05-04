@@ -203,6 +203,21 @@ test "sandbox storage default initialization" {
     try std.testing.expectEqualStrings(DockerSandbox.default_image, storage.docker.image);
 }
 
+test "detectBest fallback chain on host with no Linux backends" {
+    if (comptime builtin.os.tag == .linux) return error.SkipZigTest;
+    // Zero-init storage so createSandbox does not read undefined defaults
+    // when picking the fallback variant.
+    var storage = SandboxStorage{};
+    const sb = createSandbox(std.testing.allocator, .auto, "/tmp/workspace", &storage);
+    const name = sb.name();
+    try std.testing.expect(
+        std.mem.eql(u8, name, "docker") or std.mem.eql(u8, name, "none"),
+    );
+    try std.testing.expect(!std.mem.eql(u8, name, "landlock"));
+    try std.testing.expect(!std.mem.eql(u8, name, "firejail"));
+    try std.testing.expect(!std.mem.eql(u8, name, "bubblewrap"));
+}
+
 test "auto detect skips version-only linux sandbox shims" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
 

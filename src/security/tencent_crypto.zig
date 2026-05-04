@@ -331,3 +331,37 @@ test "tc3Sign key too long returns error" {
         tc3Sign(long_key, "2026-03-16", "hunyuan", "payload"),
     );
 }
+
+test "tc3Sign is deterministic and routes every parameter into the digest" {
+    // The KAT in `tc3Sign matches official Tencent Cloud example` already
+    // pins the algorithm against a vendor-published vector — the most
+    // important correctness property. Asserting `differentKey -> differentSig`
+    // is tautological for HMAC-SHA256 and would only fail if the function
+    // ignored its key argument outright, which the KAT already rules out.
+    //
+    // The remaining gap is verifying that the OTHER parameters (date and
+    // service) actually flow into the derived signing key. Tencent's TC3-HMAC
+    // chains HMAC(key=secret, date) -> HMAC(key=hKey, service) -> HMAC(...,
+    // "tc3_request") -> sign. A regression that hard-codes the date or
+    // service salt would still pass a single-input KAT.
+    const key = "secret";
+    const date_a = "2026-05-01";
+    const date_b = "2026-05-02";
+    const service_a = "cvm";
+    const service_b = "hunyuan";
+    const message = "test_message";
+
+    const sig_baseline = try tc3Sign(key, date_a, service_a, message);
+
+    // Same inputs MUST yield the same signature (verifier-side determinism).
+    const sig_repeat = try tc3Sign(key, date_a, service_a, message);
+    try std.testing.expectEqualStrings(&sig_baseline, &sig_repeat);
+
+    // Date salt MUST flow into the derived key.
+    const sig_other_date = try tc3Sign(key, date_b, service_a, message);
+    try std.testing.expect(!std.mem.eql(u8, &sig_baseline, &sig_other_date));
+
+    // Service salt MUST flow into the derived key (multi-tenant isolation).
+    const sig_other_service = try tc3Sign(key, date_a, service_b, message);
+    try std.testing.expect(!std.mem.eql(u8, &sig_baseline, &sig_other_service));
+}

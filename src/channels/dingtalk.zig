@@ -2191,3 +2191,16 @@ test "healthCheck requires running and connection" {
     channel.connected.store(true, .release);
     try std.testing.expect(channel.healthCheck());
 }
+
+test "DingTalkChannel create + healthCheck + stop leaks zero bytes" {
+    // DingTalkChannel uses clearEphemeralState() as its teardown method.
+    var ch_struct = DingTalkChannel.initFromConfig(std.testing.allocator, .{
+        .client_id = "test-client-id",
+        .client_secret = "test-client-secret",
+    });
+    defer ch_struct.clearEphemeralState();
+
+    const ch = ch_struct.channel();
+    _ = ch.healthCheck();
+    ch.stop();
+}

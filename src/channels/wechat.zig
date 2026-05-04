@@ -505,3 +505,95 @@ test "wechat smoke basic channel contract" {
     try std.testing.expectEqualStrings("wechat", ch.channel().name());
     try std.testing.expect(!ch.channel().healthCheck());
 }
+
+test "WeChatChannel create + healthCheck + stop leaks zero bytes" {
+    // WeChatChannel holds no heap allocations at init-time.  No deinit needed.
+    var ch_struct = WeChatChannel.initFromConfig(std.testing.allocator, .{
+        .callback_token = "test-callback-token",
+    });
+
+    const ch = ch_struct.channel();
+    _ = ch.healthCheck();
+    ch.stop();
+}
+
+test "WeChatChannel start + stop under is_test leaks zero bytes" {
+    // vtableStart sets self.running = true only — no I/O, no thread.
+    // Double stop must be idempotent per Channel contract.
+    var ch_struct = WeChatChannel.initFromConfig(std.testing.allocator, .{
+        .callback_token = "test-callback-token",
+    });
+
+    const ch = ch_struct.channel();
+    try ch.start();
+    ch.stop();
+    // Double stop — must not double-free or crash.
+    ch.stop();
+}
+
+test "verifySignature rejects tampered token" {
+    // Compute a valid SHA-1 signature for a fixed set of parameters, then
+    // verify that substituting a different token causes rejection.
+    const token = "correct-token";
+    const tampered_token = "evil-token";
+    const timestamp = "1710000000";
+    const nonce = "nonce42";
+
+    var parts = [3][]const u8{ token, timestamp, nonce };
+    var i: usize = 0;
+    while (i < parts.len) : (i += 1) {
+        var j: usize = i + 1;
+        while (j < parts.len) : (j += 1) {
+            if (std.mem.lessThan(u8, parts[j], parts[i])) {
+                const tmp = parts[i];
+                parts[i] = parts[j];
+                parts[j] = tmp;
+            }
+        }
+    }
+
+    var sha1 = std.crypto.hash.Sha1.init(.{});
+    for (parts) |p| sha1.update(p);
+    var digest: [std.crypto.hash.Sha1.digest_length]u8 = undefined;
+    sha1.final(&digest);
+    const sig = std.fmt.bytesToHex(digest, .lower);
+
+    // Correct params: must accept.
+    try std.testing.expect(verifySignature(token, timestamp, nonce, sig[0..]));
+    // Tampered token: must reject.
+    try std.testing.expect(!verifySignature(tampered_token, timestamp, nonce, sig[0..]));
+}
+
+test "verifyMessageSignature rejects tampered encrypted field" {
+    // Compute a valid SHA-1 signature covering the encrypted ciphertext, then
+    // verify that a modified ciphertext causes rejection.
+    const token = "wechat-token";
+    const timestamp = "1710000001";
+    const nonce = "nonce99";
+    const encrypted = "CORRECT_ENCRYPTED_PAYLOAD";
+    const tampered_encrypted = "TAMPERED_ENCRYPTED_PAYLOAD";
+
+    var parts = [4][]const u8{ token, timestamp, nonce, encrypted };
+    var i: usize = 0;
+    while (i < parts.len) : (i += 1) {
+        var j: usize = i + 1;
+        while (j < parts.len) : (j += 1) {
+            if (std.mem.lessThan(u8, parts[j], parts[i])) {
+                const tmp = parts[i];
+                parts[i] = parts[j];
+                parts[j] = tmp;
+            }
+        }
+    }
+
+    var sha1 = std.crypto.hash.Sha1.init(.{});
+    for (parts) |p| sha1.update(p);
+    var digest: [std.crypto.hash.Sha1.digest_length]u8 = undefined;
+    sha1.final(&digest);
+    const sig = std.fmt.bytesToHex(digest, .lower);
+
+    // Correct encrypted field: must accept.
+    try std.testing.expect(verifyMessageSignature(token, timestamp, nonce, encrypted, sig[0..]));
+    // Tampered encrypted field + original sig: must reject.
+    try std.testing.expect(!verifyMessageSignature(token, timestamp, nonce, tampered_encrypted, sig[0..]));
+}

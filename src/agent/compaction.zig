@@ -100,10 +100,12 @@ pub fn autoCompactHistory(
     if (!count_trigger and !token_trigger) return false;
 
     const keep_recent = @min(config.keep_recent, @as(u32, @intCast(non_system_count)));
-    const compact_count = non_system_count - keep_recent;
+    var compact_count = non_system_count - keep_recent;
     if (compact_count == 0) return false;
 
-    const compact_end = start + compact_count;
+    const compact_end = adjustKeepStartForToolResultPair(history.items, start, start + compact_count);
+    compact_count = compact_end - start;
+    if (compact_count == 0) return false;
 
     // Multi-part strategy: if >10 messages to summarize, split into halves
     const summary = if (compact_count > 10) blk: {
@@ -168,8 +170,22 @@ pub fn autoCompactHistory(
     return true;
 }
 
+fn adjustKeepStartForToolResultPair(
+    history: []const OwnedMessage,
+    start: usize,
+    keep_start: usize,
+) usize {
+    var adjusted = keep_start;
+    while (adjusted > start and adjusted < history.len and history[adjusted].role == .tool) {
+        adjusted -= 1;
+    }
+    return adjusted;
+}
+
 /// Force-compress history for context exhaustion recovery.
-/// Keeps system prompt (if any) + last CONTEXT_RECOVERY_KEEP messages.
+/// Keeps system prompt (if any) + last CONTEXT_RECOVERY_KEEP messages. If the
+/// keep window would start with a tool result, it is extended backward so the
+/// result is not orphaned from the assistant turn that produced it.
 /// Everything in between is dropped without LLM summarization (we can't call
 /// the LLM since the context is exhausted). Returns true if compression was performed.
 pub fn forceCompressHistory(
@@ -182,7 +198,12 @@ pub fn forceCompressHistory(
 
     if (non_system_count <= CONTEXT_RECOVERY_KEEP) return false;
 
-    const keep_start = history.items.len - CONTEXT_RECOVERY_KEEP;
+    const keep_start = adjustKeepStartForToolResultPair(
+        history.items,
+        start,
+        history.items.len - CONTEXT_RECOVERY_KEEP,
+    );
+    if (keep_start == start) return false;
     const to_remove = keep_start - start;
 
     // Free messages being removed
@@ -214,7 +235,10 @@ pub fn trimHistory(
 
     if (non_system_count <= max) return;
 
-    const to_remove = non_system_count - max;
+    var to_remove = non_system_count - max;
+    const keep_start = adjustKeepStartForToolResultPair(history.items, start, start + to_remove);
+    to_remove = keep_start - start;
+    if (to_remove == 0) return;
     // Free the messages being removed
     for (history.items[start .. start + to_remove]) |*msg| {
         msg.deinit(allocator);
@@ -633,6 +657,104 @@ test "autoCompactHistory no-op below count and token thresholds" {
     try std.testing.expectEqual(@as(usize, 2), agent.history.items.len);
 }
 
+test "autoCompactHistory does not orphan leading tool result" {
+    const SummarizingProvider = struct {
+        const Self = @This();
+
+        calls: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return .{
+                .content = try allocator.dupe(u8, "auto summary"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "summarizing-test-provider";
+        }
+
+        fn deinit(_: *anyopaque) void {}
+    };
+
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = SummarizingProvider.chatWithSystem,
+        .chat = SummarizingProvider.chat,
+        .supportsNativeTools = SummarizingProvider.supportsNativeTools,
+        .getName = SummarizingProvider.getName,
+        .deinit = SummarizingProvider.deinit,
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = SummarizingProvider{};
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+    var agent = try makeTestAgent(allocator);
+    agent.provider = provider;
+    defer agent.deinit();
+
+    try agent.history.append(allocator, .{
+        .role = .system,
+        .content = try allocator.dupe(u8, "system prompt"),
+    });
+    for (0..7) |i| {
+        try agent.history.append(allocator, .{
+            .role = .user,
+            .content = try std.fmt.allocPrint(allocator, "filler-{d}", .{i}),
+        });
+    }
+    try agent.history.append(allocator, .{
+        .role = .assistant,
+        .content = try allocator.dupe(u8, "assistant tool-call"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .tool,
+        .content = try allocator.dupe(u8, "tool result"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "after tool"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .assistant,
+        .content = try allocator.dupe(u8, "final reply"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "next prompt"),
+    });
+
+    const compacted = try autoCompactHistory(allocator, &agent.history, provider, agent.model_name, .{
+        .keep_recent = 4,
+        .max_history_messages = 4,
+        .workspace_dir = null,
+    });
+
+    try std.testing.expect(compacted);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.calls);
+    try std.testing.expectEqual(@as(usize, 7), agent.history.items.len);
+    try std.testing.expect(agent.history.items[0].role == .system);
+    try std.testing.expect(agent.history.items[1].role == .assistant);
+    try std.testing.expect(std.mem.indexOf(u8, agent.history.items[1].content, "[Compaction summary]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agent.history.items[1].content, "auto summary") != null);
+    try std.testing.expect(agent.history.items[2].role == .assistant);
+    try std.testing.expectEqualStrings("assistant tool-call", agent.history.items[2].content);
+    try std.testing.expect(agent.history.items[3].role == .tool);
+    try std.testing.expectEqualStrings("tool result", agent.history.items[3].content);
+    try std.testing.expectEqualStrings("next prompt", agent.history.items[6].content);
+}
+
 test "DEFAULT_TOKEN_LIMIT constant" {
     try std.testing.expectEqual(config_types.DEFAULT_AGENT_TOKEN_LIMIT, DEFAULT_TOKEN_LIMIT);
 }
@@ -664,6 +786,100 @@ test "forceCompressHistory keeps system + last 4 messages" {
     try std.testing.expectEqualStrings("system prompt", agent.history.items[0].content);
     try std.testing.expectEqualStrings("msg-4", agent.history.items[1].content);
     try std.testing.expectEqualStrings("msg-7", agent.history.items[4].content);
+}
+
+test "forceCompressHistory does not orphan leading tool result" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    try agent.history.append(allocator, .{
+        .role = .system,
+        .content = try allocator.dupe(u8, "system prompt"),
+    });
+    for (0..7) |i| {
+        try agent.history.append(allocator, .{
+            .role = .user,
+            .content = try std.fmt.allocPrint(allocator, "filler-{d}", .{i}),
+        });
+    }
+    try agent.history.append(allocator, .{
+        .role = .assistant,
+        .content = try allocator.dupe(u8, "assistant tool-call"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .tool,
+        .content = try allocator.dupe(u8, "tool result"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "after tool"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .assistant,
+        .content = try allocator.dupe(u8, "final reply"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "next prompt"),
+    });
+
+    const compressed = forceCompressHistory(allocator, &agent.history);
+    try std.testing.expect(compressed);
+
+    try std.testing.expectEqual(@as(usize, 6), agent.history.items.len);
+    try std.testing.expect(agent.history.items[0].role == .system);
+    try std.testing.expect(agent.history.items[1].role == .assistant);
+    try std.testing.expectEqualStrings("assistant tool-call", agent.history.items[1].content);
+    try std.testing.expect(agent.history.items[2].role == .tool);
+    try std.testing.expectEqualStrings("tool result", agent.history.items[2].content);
+    try std.testing.expectEqualStrings("next prompt", agent.history.items[5].content);
+}
+
+test "trimHistory does not orphan leading tool result" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    try agent.history.append(allocator, .{
+        .role = .system,
+        .content = try allocator.dupe(u8, "system prompt"),
+    });
+    for (0..7) |i| {
+        try agent.history.append(allocator, .{
+            .role = .user,
+            .content = try std.fmt.allocPrint(allocator, "filler-{d}", .{i}),
+        });
+    }
+    try agent.history.append(allocator, .{
+        .role = .assistant,
+        .content = try allocator.dupe(u8, "assistant tool-call"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .tool,
+        .content = try allocator.dupe(u8, "tool result"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "after tool"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .assistant,
+        .content = try allocator.dupe(u8, "final reply"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "next prompt"),
+    });
+
+    trimHistory(allocator, &agent.history, 4);
+
+    try std.testing.expectEqual(@as(usize, 6), agent.history.items.len);
+    try std.testing.expect(agent.history.items[0].role == .system);
+    try std.testing.expect(agent.history.items[1].role == .assistant);
+    try std.testing.expectEqualStrings("assistant tool-call", agent.history.items[1].content);
+    try std.testing.expect(agent.history.items[2].role == .tool);
+    try std.testing.expectEqualStrings("tool result", agent.history.items[2].content);
 }
 
 test "forceCompressHistory without system prompt" {

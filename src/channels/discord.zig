@@ -2041,3 +2041,14 @@ test "discord intent bitmask guilds" {
     // Default intents = 1|512|32768|4096 = 37377
     try std.testing.expectEqual(@as(u32, 37377), 1 | 512 | 32768 | 4096);
 }
+
+test "DiscordChannel create + healthCheck + stop leaks zero bytes" {
+    // DiscordChannel holds no heap allocations at init-time.  No deinit needed.
+    var ch_struct = DiscordChannel.initFromConfig(std.testing.allocator, .{
+        .token = "test-bot-token",
+    });
+
+    const ch = ch_struct.channel();
+    _ = ch.healthCheck();
+    ch.stop();
+}

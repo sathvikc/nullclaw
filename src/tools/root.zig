@@ -1366,6 +1366,107 @@ test "bindMemoryTools matches by vtable, not by colliding tool name" {
     try std.testing.expectEqual(@as(usize, 0xDEADBEEF), fake_memory_store_name.sentinel);
 }
 
+test "every tool from allTools exposes non-empty metadata and survives lifecycle" {
+    const alloc = std.testing.allocator;
+
+    // Use a tmp workspace to satisfy path-touching tools.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(alloc, ".");
+    defer alloc.free(ws_path);
+
+    const tools = try allTools(alloc, ws_path, .{});
+    defer deinitTools(alloc, tools);
+
+    // The ToolVTable name/description/parameters_json slots take an
+    // anyopaque ptr but never dereference it — they return compile-time
+    // T.tool_name / T.tool_description / T.tool_params constants. So this
+    // loop verifies metadata-presence only; the ptr itself is exercised
+    // by `every tool from allTools has useful schema semantics` below
+    // (which calls execute() through the vtable). The leak-free lifecycle
+    // is enforced by std.testing.allocator at scope exit.
+    for (tools) |tool| {
+        const n = tool.name();
+        try std.testing.expect(n.len > 0);
+        const desc = tool.description();
+        try std.testing.expect(desc.len > 0);
+        const params = tool.parametersJson();
+        try std.testing.expect(params.len > 0);
+    }
+}
+
+fn toolSchemaHasRequiredFields(schema_value: JsonValue) !bool {
+    try std.testing.expect(schema_value == .object);
+
+    const type_field = schema_value.object.get("type") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(type_field == .string);
+    try std.testing.expectEqualStrings("object", type_field.string);
+
+    const properties = schema_value.object.get("properties") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(properties == .object);
+
+    const required = schema_value.object.get("required") orelse return false;
+    try std.testing.expect(required == .array);
+
+    var has_required = false;
+    for (required.array.items) |field| {
+        try std.testing.expect(field == .string);
+        has_required = true;
+        try std.testing.expect(properties.object.contains(field.string));
+    }
+
+    return has_required;
+}
+
+test "every tool from allTools has useful schema semantics" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(alloc, ".");
+    defer alloc.free(ws_path);
+
+    const browser_domains = [_][]const u8{"example.com"};
+    const tools = try allTools(alloc, ws_path, .{
+        .http_enabled = true,
+        .browser_enabled = true,
+        .screenshot_enabled = true,
+        .browser_open_domains = &browser_domains,
+    });
+    defer deinitTools(alloc, tools);
+
+    var seen_names = std.StringHashMap(void).init(alloc);
+    defer seen_names.deinit();
+
+    for (tools) |tool| {
+        const name = tool.name();
+        try std.testing.expect(name.len > 0);
+        const gop = try seen_names.getOrPut(name);
+        try std.testing.expect(!gop.found_existing);
+
+        const description = tool.description();
+        try std.testing.expect(description.len > 0);
+        try std.testing.expectEqualStrings(description, std.mem.trim(u8, description, " \t\r\n"));
+
+        const params = tool.parametersJson();
+        try std.testing.expect(params.len > 0);
+
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, params, .{});
+        defer parsed.deinit();
+
+        if (try toolSchemaHasRequiredFields(parsed.value)) {
+            const empty_args = try parseTestArgs("{}");
+            defer empty_args.deinit();
+
+            var result_arena = std.heap.ArenaAllocator.init(alloc);
+            defer result_arena.deinit();
+
+            const result = try tool.execute(result_arena.allocator(), empty_args.value.object);
+            try std.testing.expect(!result.success);
+            try std.testing.expect(result.output.len > 0 or (result.error_msg != null and result.error_msg.?.len > 0));
+        }
+    }
+}
+
 test {
     @import("std").testing.refAllDecls(@This());
 }

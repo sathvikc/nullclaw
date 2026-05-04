@@ -228,6 +228,7 @@ pub const SqliteMemory = struct {
         }
 
         var self_ = Self{ .db = db, .allocator = allocator };
+        errdefer self_.deinit();
         try self_.configurePragmas(use_wal);
         try self_.migrate();
         try self_.migrateSessionId();
@@ -2626,4 +2627,42 @@ test "sqlite clearMessages does not affect other sessions" {
     const s2_msgs = try mem.loadMessages(std.testing.allocator, "s2");
     defer root.freeMessages(std.testing.allocator, s2_msgs);
     try std.testing.expectEqual(@as(usize, 1), s2_msgs.len);
+}
+
+test "SqliteMemory.init on non-sqlite file errors and frees the partially-opened db handle" {
+    // The errdefer added in init() (`errdefer self_.deinit();`) closes the
+    // sqlite3 handle when migrate() / migrateSessionId() / migrateAgentNamespace()
+    // fail. std.testing.allocator only sees Zig-heap allocations and CANNOT
+    // observe the native sqlite3 handle leak directly — but a future refactor
+    // that adds Zig-heap allocations between `sqlite3_open` and the migrations
+    // (e.g. caching the path) would surface here as a leak, and a regression
+    // that removed the errdefer would manifest as a quiet handle leak that
+    // CI's "fd count" or `lsof` reveals only on long-running test runs.
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Write a plain text file where the DB would be opened.
+    // sqlite3_open succeeds on any file; migrate() fails with SQLITE_NOTADB.
+    try @import("compat").fs.Dir.wrap(tmp.dir).writeFile(.{ .sub_path = "blocker.db", .data = "not a sqlite database" });
+
+    const blocker_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(alloc, "blocker.db");
+    defer alloc.free(blocker_path);
+
+    const blocker_pathz = try alloc.dupeZ(u8, blocker_path);
+    defer alloc.free(blocker_pathz);
+
+    // Expect SOME error from the migrations layer. We accept a small set of
+    // errors rather than pinning the exact tag, because different sqlite
+    // versions classify the failure differently (CORRUPT vs NOTADB at
+    // different operations).
+    if (SqliteMemory.init(alloc, blocker_pathz)) |opened_value| {
+        var opened = opened_value;
+        defer opened.deinit();
+        return error.TestExpectedError;
+    } else |err| switch (err) {
+        error.MigrationFailed, error.PrepareFailed => {},
+        else => return err,
+    }
 }

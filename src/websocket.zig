@@ -3,6 +3,7 @@
 //! Supports both `wss://` and `ws://` transports.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const std_compat = @import("compat");
 
 const log = std.log.scoped(.websocket);
@@ -625,6 +626,72 @@ pub fn applyMask(payload: []u8, mask_key: [4]u8) void {
     for (payload, 0..) |*b, i| b.* ^= mask_key[i % 4];
 }
 
+fn createWsTestSocketPair() ![2]std.posix.socket_t {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi or
+        @TypeOf(std.posix.system.socketpair) == void)
+    {
+        return error.SkipZigTest;
+    } else {
+        var sockets: [2]std.posix.socket_t = undefined;
+        while (true) {
+            switch (std.posix.errno(std.posix.system.socketpair(
+                std.posix.AF.UNIX,
+                std.posix.SOCK.STREAM,
+                0,
+                &sockets,
+            ))) {
+                .SUCCESS => return sockets,
+                .INTR => continue,
+                else => return error.SkipZigTest,
+            }
+        }
+    }
+}
+
+fn writeAllFd(fd: std.posix.fd_t, bytes: []const u8) !void {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.SkipZigTest;
+    } else {
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            const rc = std.posix.system.write(fd, bytes[offset..].ptr, bytes.len - offset);
+            switch (std.posix.errno(rc)) {
+                .SUCCESS => {
+                    const n: usize = @intCast(rc);
+                    if (n == 0) return error.Unexpected;
+                    offset += n;
+                },
+                .INTR => continue,
+                else => return error.Unexpected,
+            }
+        }
+    }
+}
+
+fn readExactFd(fd: std.posix.fd_t, buf: []u8) !void {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return error.SkipZigTest;
+    } else {
+        var offset: usize = 0;
+        while (offset < buf.len) {
+            const n = try std.posix.read(fd, buf[offset..]);
+            if (n == 0) return error.ConnectionClosed;
+            offset += n;
+        }
+    }
+}
+
+fn writeServerFrame(fd: std.posix.fd_t, fin: bool, opcode: Opcode, payload: []const u8) !void {
+    if (payload.len > 125) return error.TestUnexpectedResult;
+
+    const header = [_]u8{
+        (if (fin) @as(u8, 0x80) else 0) | @as(u8, @intFromEnum(opcode)),
+        @intCast(payload.len),
+    };
+    try writeAllFd(fd, &header);
+    try writeAllFd(fd, payload);
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Tests
 // ════════════════════════════════════════════════════════════════════════════
@@ -908,6 +975,65 @@ test "ws buildFrame zero-len payload close" {
     try std.testing.expectEqual(@as(u8, 0x80), buf[1]); // MASK=1, len=0
 }
 
+test "ws readMessage aggregates fragmented text and binary frames" {
+    const sockets = try createWsTestSocketPair();
+    defer std.Io.Threaded.closeFd(sockets[1]);
+
+    var client = WsClient{
+        .allocator = std.testing.allocator,
+        .stream = .{ .handle = sockets[0] },
+        .tls = null,
+        .write_mu = .{},
+    };
+    defer client.deinit();
+
+    try writeServerFrame(sockets[1], false, .text, "hel");
+    try writeServerFrame(sockets[1], true, .continuation, "lo");
+    try writeServerFrame(sockets[1], false, .binary, &.{ 0x01, 0x02 });
+    try writeServerFrame(sockets[1], true, .continuation, &.{ 0x03, 0x04 });
+
+    const text_msg = (try client.readMessage()) orelse return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(text_msg.payload);
+    try std.testing.expectEqual(Opcode.text, text_msg.opcode);
+    try std.testing.expectEqualStrings("hello", text_msg.payload);
+
+    const binary_msg = (try client.readMessage()) orelse return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(binary_msg.payload);
+    try std.testing.expectEqual(Opcode.binary, binary_msg.opcode);
+    try std.testing.expectEqualSlices(u8, &.{ 0x01, 0x02, 0x03, 0x04 }, binary_msg.payload);
+}
+
+test "ws readFrame auto-pongs ping and returns null on close frame" {
+    const sockets = try createWsTestSocketPair();
+    defer std.Io.Threaded.closeFd(sockets[1]);
+
+    var client = WsClient{
+        .allocator = std.testing.allocator,
+        .stream = .{ .handle = sockets[0] },
+        .tls = null,
+        .write_mu = .{},
+    };
+    defer client.deinit();
+
+    try writeServerFrame(sockets[1], true, .ping, "p");
+
+    const ping_frame = (try client.readFrame()) orelse return error.TestUnexpectedResult;
+    defer if (ping_frame.payload.len > 0) std.testing.allocator.free(ping_frame.payload);
+    try std.testing.expectEqual(Opcode.ping, ping_frame.opcode);
+    try std.testing.expectEqualStrings("p", ping_frame.payload);
+
+    var pong: [7]u8 = undefined;
+    try readExactFd(sockets[1], &pong);
+    try std.testing.expectEqual(@as(u8, 0x8A), pong[0]);
+    try std.testing.expect((pong[1] & 0x80) != 0);
+    try std.testing.expectEqual(@as(u8, 1), pong[1] & 0x7F);
+    try std.testing.expectEqual(@as(u8, 'p'), pong[6] ^ pong[2]);
+
+    try writeServerFrame(sockets[1], true, .close, &.{});
+    const closed = try client.readFrame();
+    try std.testing.expect(closed == null);
+}
+
 // Regression: v2026.3.12 applied a blanket `n == 0 → ConnectionClosed` check
 // to both TLS and plain socket paths. TLS readVec may return 0 while it
 // refills its internal buffer or processes post-handshake records, so only
@@ -998,4 +1124,32 @@ test "ws readExact plain reads data then ConnectionClosed on EOF" {
     // Next read hits EOF
     var buf2: [1]u8 = undefined;
     try std.testing.expectError(error.ConnectionClosed, client.readExact(&buf2));
+}
+
+test "readFrame rejects oversized payload claim before allocation" {
+    // Verifies the FrameTooLarge guard (readFrame line: payload_len > 4 MiB)
+    // triggers before any heap allocation. We send only the 10-byte header
+    // claiming 5 MiB — readFrame must return error.FrameTooLarge without
+    // attempting to allocate or read the (absent) payload bytes.
+    const sockets = try createWsTestSocketPair();
+    defer std.Io.Threaded.closeFd(sockets[1]);
+
+    var client = WsClient{
+        .allocator = std.testing.allocator,
+        .stream = .{ .handle = sockets[0] },
+        .tls = null,
+        .write_mu = .{},
+    };
+    defer client.deinit();
+
+    // 5 MiB = 5 * 1024 * 1024 = 0x00_00_00_00_00_50_00_00
+    const oversized_header = [_]u8{
+        0x82, // FIN=1, opcode=binary
+        0x7F, // payload_len=127 → 8-byte extended length follows
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x50, 0x00, 0x00, // 5 MiB
+    };
+    try writeAllFd(sockets[1], &oversized_header);
+    (std_compat.net.Stream{ .handle = sockets[1] }).shutdown(.send) catch {};
+
+    try std.testing.expectError(error.FrameTooLarge, client.readFrame());
 }

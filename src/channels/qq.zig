@@ -2960,3 +2960,31 @@ test "qq handleGatewayEvent GROUP_AT_MESSAGE_CREATE drops when group id missing"
 
     try std.testing.expectEqual(@as(usize, 0), event_bus_inst.inboundDepth());
 }
+
+test "QQChannel create + healthCheck + stop leaks zero bytes" {
+    // Use websocket receive_mode so healthCheck checks atomics only (no network I/O).
+    // QQChannel holds no heap allocations at init-time.  No deinit needed.
+    var ch_struct = QQChannel.initFromConfig(std.testing.allocator, .{
+        .receive_mode = .websocket,
+    });
+
+    const ch = ch_struct.channel();
+    _ = ch.healthCheck();
+    ch.stop();
+}
+
+test "QQChannel start + stop under is_test leaks zero bytes" {
+    // In .webhook receive_mode, vtableStart returns after setting running
+    // only — no gateway thread is spawned.  Double stop must be idempotent
+    // per Channel contract (ws_fd stays invalid_socket, gateway_thread stays
+    // null, dedup_set stays empty so second deinit is a no-op).
+    var ch_struct = QQChannel.initFromConfig(std.testing.allocator, .{
+        .receive_mode = .webhook,
+    });
+
+    const ch = ch_struct.channel();
+    try ch.start();
+    ch.stop();
+    // Double stop — must not double-free or crash.
+    ch.stop();
+}

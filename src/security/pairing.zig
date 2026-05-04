@@ -892,3 +892,50 @@ test "hasPairedTokens false when pairing disabled and no tokens" {
     defer guard.deinit();
     try std.testing.expect(!guard.hasPairedTokens());
 }
+
+test "isAuthenticated rejects tampered, truncated, and substitute bearer tokens" {
+    // The token is SHA-256 hashed before constant-time comparison; any
+    // single-bit change produces an avalanche-different hash. Tampering
+    // only the last byte (as the original test did) would still pass if
+    // the comparator were buggy in a "prefix-match" direction. Tamper at
+    // first / middle / last positions to exercise the full hash boundary,
+    // and add several adversarial-shape negatives that would defeat naive
+    // comparators.
+    var guard = try PairingGuard.init(std.testing.allocator, true, &.{});
+    defer guard.deinit();
+    const code = guard.pairingCode().?;
+    const token = (try guard.tryPair(code)).?;
+    defer std.testing.allocator.free(token);
+
+    try std.testing.expect(guard.isAuthenticated(token));
+    try std.testing.expect(token.len > 4);
+
+    // Position-based tamper: first, middle, last byte.
+    const positions = [_]usize{ 0, token.len / 2, token.len - 1 };
+    for (positions) |pos| {
+        var tampered = try std.testing.allocator.dupe(u8, token);
+        defer std.testing.allocator.free(tampered);
+        tampered[pos] ^= 0xFF;
+        try std.testing.expect(!guard.isAuthenticated(tampered));
+    }
+
+    // Truncation: catches a buggy comparator that would prefix-match.
+    try std.testing.expect(!guard.isAuthenticated(token[0 .. token.len - 1]));
+
+    // Length-mismatch via suffix concatenation: catches a comparator that
+    // ignores trailing bytes.
+    var extended = try std.testing.allocator.alloc(u8, token.len + 1);
+    defer std.testing.allocator.free(extended);
+    @memcpy(extended[0..token.len], token);
+    extended[token.len] = 'x';
+    try std.testing.expect(!guard.isAuthenticated(extended));
+
+    // All-zero token of the same length: catches a default-value-accept bug.
+    const zeros = try std.testing.allocator.alloc(u8, token.len);
+    defer std.testing.allocator.free(zeros);
+    @memset(zeros, 0);
+    try std.testing.expect(!guard.isAuthenticated(zeros));
+
+    // Empty token: boundary case.
+    try std.testing.expect(!guard.isAuthenticated(""));
+}

@@ -3535,3 +3535,33 @@ test "lark build card action callback response returns raw card" {
     try std.testing.expect(std.mem.indexOf(u8, response, "\"card\":{\"type\":\"raw\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "yes") != null);
 }
+
+test "LarkChannel create + healthCheck + stop leaks zero bytes" {
+    // LarkChannel holds no heap allocations at init-time.  No deinit needed.
+    var ch_struct = LarkChannel.initFromConfig(std.testing.allocator, .{
+        .app_id = "test-app-id",
+        .app_secret = "test-app-secret",
+    });
+
+    const ch = ch_struct.channel();
+    _ = ch.healthCheck();
+    ch.stop();
+}
+
+test "LarkChannel start + stop under is_test leaks zero bytes" {
+    // In .webhook receive_mode, vtableStart returns immediately after setting
+    // atomics — no websocket thread is spawned.  Double stop must be
+    // idempotent per Channel contract (ws_fd stays invalid_socket, ws_thread
+    // stays null, so the stop path is a no-op on the second call).
+    var ch_struct = LarkChannel.initFromConfig(std.testing.allocator, .{
+        .app_id = "test-app-id",
+        .app_secret = "test-app-secret",
+        .receive_mode = .webhook,
+    });
+
+    const ch = ch_struct.channel();
+    try ch.start();
+    ch.stop();
+    // Double stop — must not double-free or crash.
+    ch.stop();
+}

@@ -3724,3 +3724,99 @@ test "buildSchedulerStatusJson reports scheduler summary" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"active_jobs\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"paused_jobs\":1") != null);
 }
+
+test "cron register + cancel leaks zero bytes for every job kind" {
+    // Uses the leak-detecting GPA (std.testing.allocator). Any allocation
+    // in addJob / addOnce / addAgentJob / addAgentOnce that is not freed
+    // by removeJob will be reported as a leak when the test runner tears
+    // down the allocator.
+    //
+    // The agent-job path is the most leak-prone — it allocates id,
+    // expression, command, prompt, model (optional), delivery.channel,
+    // delivery.account_id, delivery.to, delivery.peer_id, and
+    // delivery.thread_id, each behind its own _owned flag in freeJobOwned.
+    // The original new test only covered addJob + addOnce and would have
+    // missed a regression in any of those agent-only fields.
+    const alloc = std.testing.allocator;
+
+    var sched = CronScheduler.init(alloc, 10, true);
+    defer sched.deinit();
+
+    // Recurring shell job.
+    const recurring = try sched.addJob("*/5 * * * *", "echo recurring");
+    // dupe the id because removeJob takes ownership of (frees) the matched
+    // job's heap-owned id; passing the original `recurring.id` slice would
+    // be a use-after-free pattern.
+    const recurring_id = try alloc.dupe(u8, recurring.id);
+    defer alloc.free(recurring_id);
+    try std.testing.expect(sched.removeJob(recurring_id));
+    try std.testing.expectEqual(@as(usize, 0), sched.listJobs().len);
+
+    // One-shot shell job: extra `@once:<delay>` expression allocation.
+    const once = try sched.addOnce("10m", "echo once");
+    const once_id = try alloc.dupe(u8, once.id);
+    defer alloc.free(once_id);
+    try std.testing.expect(sched.removeJob(once_id));
+    try std.testing.expectEqual(@as(usize, 0), sched.listJobs().len);
+
+    // Recurring agent job: every delivery field non-null to exercise the
+    // full _owned-flag matrix in freeJobOwned.
+    const agent_recurring = try sched.addAgentJob("*/15 * * * *", "be helpful", "claude-sonnet", .{
+        .mode = .always,
+        .channel = "telegram",
+        .account_id = "main",
+        .to = "12345",
+        .peer_kind = .direct,
+        .peer_id = "user-99",
+        .thread_id = "topic-7",
+        .best_effort = false,
+    });
+    const agent_recurring_id = try alloc.dupe(u8, agent_recurring.id);
+    defer alloc.free(agent_recurring_id);
+    try std.testing.expect(sched.removeJob(agent_recurring_id));
+    try std.testing.expectEqual(@as(usize, 0), sched.listJobs().len);
+
+    // One-shot agent job: same field matrix, plus the `@once:<delay>` expr.
+    // Pass `null` for model to exercise the optional-skip path.
+    const agent_once = try sched.addAgentOnce("5m", "remind me", null, .{
+        .mode = .on_success,
+        .channel = "discord",
+        .account_id = "guild-42",
+        .to = "channel-7",
+        .peer_kind = .group,
+        .peer_id = "guild-42",
+        .thread_id = null,
+        .best_effort = true,
+    });
+    const agent_once_id = try alloc.dupe(u8, agent_once.id);
+    defer alloc.free(agent_once_id);
+    try std.testing.expect(sched.removeJob(agent_once_id));
+    try std.testing.expectEqual(@as(usize, 0), sched.listJobs().len);
+
+    // removeJob on an unknown id must return false without leaking or
+    // crashing, regardless of whether jobs are present.
+    try std.testing.expect(!sched.removeJob("nonexistent-id"));
+}
+
+test "cron rejects obviously malformed expressions" {
+    // Each input exercises a distinct branch in parseCronExpression /
+    // parseCronField. Note: "* * * * * * *" (7 fields) is valid per the
+    // spec and is excluded.
+    const malformed = [_][]const u8{
+        "", // empty
+        "garbage", // single non-cron token
+        "* * *", // wrong field count (3, not 5/6/7)
+        "60 * * * *", // minute out of range
+        "* 24 * * *", // hour out of range
+        "* * 32 * *", // day-of-month out of range
+        "* * * 13 *", // month out of range
+        "* * * * 8", // day-of-week out of range (allow_sunday_7 caps at 7)
+        "*/0 * * * *", // step = 0 — divide-by-zero classic
+        "5-3 * * * *", // reversed range (start > end)
+        "abc * * * *", // alphabetic in numeric field
+    };
+    for (malformed) |input| {
+        const result = nextRunForCronExpression(input, 0);
+        try std.testing.expect(std.meta.isError(result));
+    }
+}

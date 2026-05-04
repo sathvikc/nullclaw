@@ -474,3 +474,49 @@ test "wecom smoke basic channel contract" {
     try std.testing.expectEqualStrings("wecom", ch.channel().name());
     try std.testing.expect(!ch.channel().healthCheck());
 }
+
+test "WeComChannel create + healthCheck + stop leaks zero bytes" {
+    // WeComChannel holds no heap allocations at init-time.  No deinit needed.
+    var ch_struct = WeComChannel.initFromConfig(std.testing.allocator, .{
+        .webhook_url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test",
+    });
+
+    const ch = ch_struct.channel();
+    _ = ch.healthCheck();
+    ch.stop();
+}
+
+test "verifySignature rejects tampered encrypted field" {
+    // Compute a valid SHA-1 signature for the original encrypted ciphertext,
+    // then verify that a modified ciphertext is rejected.  Guards against
+    // regressions where the encrypted field is omitted from the digest input.
+    const token = "wecom-token";
+    const timestamp = "1710000000";
+    const nonce = "nonce123";
+    const encrypted = "CORRECT_WECOM_PAYLOAD";
+    const tampered_encrypted = "TAMPERED_WECOM_PAYLOAD";
+
+    var parts = [4][]const u8{ token, timestamp, nonce, encrypted };
+    var i: usize = 0;
+    while (i < parts.len) : (i += 1) {
+        var j: usize = i + 1;
+        while (j < parts.len) : (j += 1) {
+            if (std.mem.lessThan(u8, parts[j], parts[i])) {
+                const tmp = parts[i];
+                parts[i] = parts[j];
+                parts[j] = tmp;
+            }
+        }
+    }
+
+    var sha1 = std.crypto.hash.Sha1.init(.{});
+    for (parts) |p| sha1.update(p);
+    var digest: [std.crypto.hash.Sha1.digest_length]u8 = undefined;
+    sha1.final(&digest);
+    const sig = std.fmt.bytesToHex(digest, .lower);
+
+    // Correct encrypted field: must accept.
+    try std.testing.expect(verifySignature(token, timestamp, nonce, encrypted, sig[0..]));
+    // Tampered encrypted field + original sig: must reject.
+    try std.testing.expect(!verifySignature(token, timestamp, nonce, tampered_encrypted, sig[0..]));
+}

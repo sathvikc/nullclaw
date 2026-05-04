@@ -2219,6 +2219,34 @@ test "parseCallbackPayload parses token and option index" {
     try std.testing.expect(parseCallbackPayload("plain") == null);
 }
 
+test "MaxChannel create + healthCheck + stop leaks zero bytes" {
+    // MaxChannel holds no heap allocations at init-time.  No deinit needed.
+    // healthCheck() returns true in test mode (builtin.is_test guard).
+    var ch_struct = MaxChannel.initFromConfig(std.testing.allocator, .{
+        .bot_token = "test-bot-token",
+    });
+
+    const ch = ch_struct.channel();
+    _ = ch.healthCheck();
+    ch.stop();
+}
+
+test "MaxChannel start + stop under is_test leaks zero bytes" {
+    // In .polling mode (default), vtableStart skips the unsubscribe call
+    // (!builtin.is_test guard) and fetchBotIdentity returns early
+    // (comptime builtin.is_test guard) — no network I/O, no thread.
+    // Double stop must be idempotent per Channel contract.
+    var ch_struct = MaxChannel.initFromConfig(std.testing.allocator, .{
+        .bot_token = "test-bot-token",
+    });
+
+    const ch = ch_struct.channel();
+    try ch.start();
+    ch.stop();
+    // Double stop — must not double-free or crash.
+    ch.stop();
+}
+
 test {
     @import("std").testing.refAllDecls(@This());
 }

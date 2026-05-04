@@ -855,3 +855,39 @@ test "secret store encrypt decrypt multiple values same store" {
         try std.testing.expectEqualStrings(expected, dec);
     }
 }
+
+test "ChaCha20Poly1305.decrypt tag failure returns DecryptionFailed not segfault" {
+    const key: [32]u8 = [_]u8{1} ** 32;
+    const nonce: [12]u8 = [_]u8{2} ** 12;
+    const plaintext = "secret data";
+
+    // Encrypt to a stack buffer.
+    var ct_buf: [64]u8 = undefined;
+    const ct = try encrypt(key, nonce, plaintext, &ct_buf);
+
+    // Tamper the last byte (corrupts the auth tag).
+    var tampered: [64]u8 = ct_buf;
+    tampered[ct.len - 1] ^= 0xFF;
+
+    // Decrypt MUST return error, not segfault. Stack buffer is the
+    // only allowed output target per AGENTS.md §10.
+    var pt_buf: [64]u8 = undefined;
+    const result = decrypt(key, nonce, tampered[0..ct.len], &pt_buf);
+    try std.testing.expectError(error.DecryptionFailed, result);
+
+    // Tamper at start-of-tag boundary (offset = ct.len - 16, the first byte
+    // of Poly1305 tag) — catches a hypothetical regression where only the
+    // tag-trailing byte is checked.
+    var tampered2: [64]u8 = ct_buf;
+    const tag_start = ct.len - 16;
+    tampered2[tag_start] ^= 0xFF;
+    var pt_buf2: [64]u8 = undefined;
+    try std.testing.expectError(error.DecryptionFailed, decrypt(key, nonce, tampered2[0..ct.len], &pt_buf2));
+
+    // Tamper a ciphertext byte (before the tag) — the AEAD must reject
+    // the modification because it invalidates the Poly1305 MAC.
+    var tampered3: [64]u8 = ct_buf;
+    tampered3[0] ^= 0xFF;
+    var pt_buf3: [64]u8 = undefined;
+    try std.testing.expectError(error.DecryptionFailed, decrypt(key, nonce, tampered3[0..ct.len], &pt_buf3));
+}

@@ -126,6 +126,7 @@ pub const SlackChannel = struct {
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     connected: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     socket_fallback_to_polling: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    lifecycle_mu: std_compat.sync.Mutex = .{},
     poll_thread: ?std.Thread = null,
     socket_thread: ?std.Thread = null,
     ws_fd: std.atomic.Value(SocketFd) = std.atomic.Value(SocketFd).init(invalid_socket),
@@ -487,6 +488,7 @@ pub const SlackChannel = struct {
     }
 
     fn fetchBotUserId(self: *SlackChannel) !void {
+        if (builtin.is_test) return;
         const url = API_BASE ++ "/auth.test";
         const auth_header = try std.fmt.allocPrint(self.allocator, "Authorization: Bearer {s}", .{self.normalizedBotToken()});
         defer self.allocator.free(auth_header);
@@ -1236,6 +1238,9 @@ pub const SlackChannel = struct {
 
     fn vtableStart(ptr: *anyopaque) anyerror!void {
         const self: *SlackChannel = @ptrCast(@alignCast(ptr));
+        self.lifecycle_mu.lock();
+        defer self.lifecycle_mu.unlock();
+
         if (self.running.load(.acquire)) return;
         if (!self.hasValidBotToken()) return error.SlackBotTokenRequired;
 
@@ -1281,6 +1286,9 @@ pub const SlackChannel = struct {
 
     fn vtableStop(ptr: *anyopaque) void {
         const self: *SlackChannel = @ptrCast(@alignCast(ptr));
+        self.lifecycle_mu.lock();
+        defer self.lifecycle_mu.unlock();
+
         self.running.store(false, .release);
         self.connected.store(false, .release);
 
@@ -2344,4 +2352,74 @@ test "parseSocketConnectParts extracts host port and path" {
     try std.testing.expectEqualStrings("wss-primary.slack.com", parts.host);
     try std.testing.expectEqual(@as(u16, 443), parts.port);
     try std.testing.expectEqualStrings("/link/?ticket=abc123", parts.path);
+}
+
+test "SlackChannel create + healthCheck + stop leaks zero bytes" {
+    // SlackChannel holds no heap allocations at init-time.  No deinit needed.
+    var ch_struct = SlackChannel.initFromConfig(std.testing.allocator, .{
+        .bot_token = "test-bot-token",
+    });
+
+    const ch = ch_struct.channel();
+    _ = ch.healthCheck();
+    ch.stop();
+}
+
+test "markdownToSlackMrkdwn converts repeated formatted markdown consistently" {
+    var input: std.ArrayListUnmanaged(u8) = .empty;
+    defer input.deinit(std.testing.allocator);
+
+    const repetitions = 5000;
+    for (0..repetitions) |_| {
+        try input.appendSlice(std.testing.allocator, "**bold** ~~strike~~ `code` [link](http://x) ");
+    }
+
+    const mrkdwn = try markdownToSlackMrkdwn(std.testing.allocator, input.items);
+    defer std.testing.allocator.free(mrkdwn);
+
+    const expected_unit = "*bold* ~strike~ `code` <http://x|link> ";
+    try std.testing.expectEqual(expected_unit.len * repetitions, mrkdwn.len);
+    try std.testing.expect(std.mem.startsWith(u8, mrkdwn, expected_unit));
+    try std.testing.expect(std.mem.endsWith(u8, mrkdwn, expected_unit));
+    try std.testing.expect(std.mem.indexOf(u8, mrkdwn, "**bold**") == null);
+    try std.testing.expect(std.mem.indexOf(u8, mrkdwn, "~~strike~~") == null);
+    try std.testing.expect(std.mem.indexOf(u8, mrkdwn, "[link](http://x)") == null);
+}
+
+test "SlackChannel start + stop concurrency stress test" {
+    // We use HTTP mode here to avoid the thread spawning and auth.test
+    // making real network calls. Under is_test, start/stop shouldn't
+    // cause actual side-effects, but the flags running/connected
+    // are mutated and the lifecycle_mu protects them.
+    var ch_struct = SlackChannel.initFromConfig(std.testing.allocator, .{
+        .account_id = "test",
+        .mode = .http,
+        .bot_token = "xoxb-test",
+        .signing_secret = "secret",
+    });
+
+    const ThreadFn = struct {
+        fn run(channel: root.Channel) void {
+            for (0..100) |_| {
+                _ = channel.start() catch {};
+                channel.stop();
+            }
+        }
+    };
+
+    var threads: [10]std.Thread = undefined;
+    for (&threads) |*t| {
+        t.* = try std.Thread.spawn(.{}, ThreadFn.run, .{ch_struct.channel()});
+    }
+
+    for (threads) |t| {
+        t.join();
+    }
+
+    // Ensure cleanup
+    ch_struct.channel().stop();
+    try std.testing.expect(!ch_struct.running.load(.acquire));
+    try std.testing.expect(!ch_struct.connected.load(.acquire));
+    try std.testing.expect(ch_struct.socket_thread == null);
+    try std.testing.expect(ch_struct.poll_thread == null);
 }

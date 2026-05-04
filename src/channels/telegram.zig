@@ -2906,11 +2906,20 @@ pub const TelegramChannel = struct {
         // Clean up buffered media group messages to prevent shutdown leaks.
         self.resetPendingMediaBuffers();
         self.resetPendingTextBuffers();
+        // Reset to .empty after deinit so a second stop() (e.g. supervisor
+        // restart on .gateway_loop transitions, or test harnesses) does not
+        // call deinit on an undefined ArrayListUnmanaged. Same pattern as
+        // SignalChannel.vtableStop and TelegramChannel.deinitDraftBuffers.
         self.pending_media_messages.deinit(self.allocator);
+        self.pending_media_messages = .empty;
         self.pending_media_group_ids.deinit(self.allocator);
+        self.pending_media_group_ids = .empty;
         self.pending_media_received_at.deinit(self.allocator);
+        self.pending_media_received_at = .empty;
         self.pending_text_messages.deinit(self.allocator);
+        self.pending_text_messages = .empty;
         self.pending_text_received_at.deinit(self.allocator);
+        self.pending_text_received_at = .empty;
         if (self.bot_username) |name| {
             self.allocator.free(name);
             self.bot_username = null;
@@ -5867,4 +5876,39 @@ test "makeSink returns null for topic targets" {
 test "createForumTopicFromTarget rejects empty name" {
     var ch = TelegramChannel.init(std.testing.allocator, "test-token", &.{}, &.{}, "allowlist");
     try std.testing.expectError(error.InvalidTopicName, ch.createForumTopicFromTarget("-100123#topic:77", "   "));
+}
+
+test "TelegramChannel create + healthCheck + stop leaks zero bytes" {
+    // TelegramChannel holds no heap allocations at init-time (all fields are
+    // slices into caller-owned config data).  No deinit needed.
+    var ch_struct = TelegramChannel.initFromConfig(std.testing.allocator, .{
+        .bot_token = "test-token",
+    });
+
+    const ch = ch_struct.channel();
+    _ = ch.healthCheck();
+    ch.stop();
+}
+
+test "TelegramChannel double stop is safe" {
+    // Regression: TelegramChannel.vtableStop used to deinit pending_media_messages,
+    // pending_media_group_ids, pending_media_received_at, pending_text_messages,
+    // and pending_text_received_at WITHOUT resetting them to .empty.
+    // ArrayListUnmanaged.deinit sets self.* = undefined, so a second
+    // vtableStop() call would deinit undefined memory — the same latent UB
+    // SignalChannel had before its own .empty fix (signal.zig:1356).
+    //
+    // Unlike Signal, Telegram is .listener_mode = .polling so the supervisor
+    // does not double-call vtableStop today, but a refactor that promotes
+    // Telegram to .gateway_loop or a test harness that exercises stop+stop
+    // would trigger the bug. This test pins the idempotent-stop contract
+    // alongside the fix.
+    var ch_struct = TelegramChannel.initFromConfig(std.testing.allocator, .{
+        .bot_token = "test-token",
+    });
+
+    const ch = ch_struct.channel();
+    ch.stop();
+    // Second stop must be a no-op, not a deinit-on-undefined.
+    ch.stop();
 }

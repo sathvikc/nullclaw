@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const std_compat = @import("compat");
 const http_util = @import("http_util.zig");
 const json_miniparse = @import("json_miniparse.zig");
@@ -88,6 +89,8 @@ pub fn freeCandidates(allocator: std.mem.Allocator, candidates: []SkillCandidate
 pub fn scout(allocator: std.mem.Allocator, query: []const u8) !std.ArrayList(SkillCandidate) {
     var candidates: std.ArrayList(SkillCandidate) = .empty;
     errdefer candidates.deinit(allocator);
+
+    if (builtin.is_test) return candidates;
 
     // Build the search URL
     const encoded_query = try urlEncode(allocator, query);
@@ -390,9 +393,41 @@ pub fn evaluateCandidate(candidate: SkillCandidate, min_score: f64) EvalResult {
 
 // ── Integration ─────────────────────────────────────────────────
 
-/// Integrate a skill: clone repo to skills_dir/NAME/,
-/// verify structure (agent skill manifests, root.zig, or build.zig).
-pub fn integrate(allocator: std.mem.Allocator, candidate: SkillCandidate, skills_dir: []const u8) !IntegrationResult {
+const CloneRepoFn = *const fn (std.mem.Allocator, []const u8, []const u8) anyerror!void;
+
+fn cloneErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.CloneSpawnFailed => "Failed to spawn git clone",
+        error.CloneWaitFailed => "Failed to wait for git clone",
+        error.CloneNonZeroExit => "git clone exited with non-zero status",
+        error.CloneTerminated => "git clone terminated by signal",
+        else => "Failed to clone repository",
+    };
+}
+
+fn cloneRepoWithGit(allocator: std.mem.Allocator, repo_url: []const u8, target_path: []const u8) !void {
+    var child = std_compat.process.Child.init(
+        &.{ "git", "clone", "--depth", "1", repo_url, target_path },
+        allocator,
+    );
+    child.stderr_behavior = .Pipe;
+    child.stdout_behavior = .Pipe;
+
+    child.spawn() catch return error.CloneSpawnFailed;
+    const term = child.wait() catch return error.CloneWaitFailed;
+
+    switch (term) {
+        .exited => |code| if (code != 0) return error.CloneNonZeroExit,
+        else => return error.CloneTerminated,
+    }
+}
+
+fn integrateWithCloneFn(
+    allocator: std.mem.Allocator,
+    candidate: SkillCandidate,
+    skills_dir: []const u8,
+    clone_repo: CloneRepoFn,
+) !IntegrationResult {
     const safe_name = try sanitizePathComponent(candidate.result_name);
 
     // Ensure skills directory exists
@@ -410,47 +445,14 @@ pub fn integrate(allocator: std.mem.Allocator, candidate: SkillCandidate, skills
     const target_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ skills_dir, safe_name });
     defer allocator.free(target_path);
 
-    // Clone the repository using git
-    var child = std_compat.process.Child.init(
-        &.{ "git", "clone", "--depth", "1", candidate.repo_url, target_path },
-        allocator,
-    );
-    child.stderr_behavior = .Pipe;
-    child.stdout_behavior = .Pipe;
-
-    child.spawn() catch {
+    clone_repo(allocator, candidate.repo_url, target_path) catch |err| {
         return IntegrationResult{
             .skill_name = safe_name,
             .install_path = skills_dir,
             .success = false,
-            .error_message = "Failed to spawn git clone",
+            .error_message = cloneErrorMessage(err),
         };
     };
-    const term = child.wait() catch {
-        return IntegrationResult{
-            .skill_name = safe_name,
-            .install_path = skills_dir,
-            .success = false,
-            .error_message = "Failed to wait for git clone",
-        };
-    };
-
-    switch (term) {
-        .exited => |code| if (code != 0) {
-            return IntegrationResult{
-                .skill_name = safe_name,
-                .install_path = skills_dir,
-                .success = false,
-                .error_message = "git clone exited with non-zero status",
-            };
-        },
-        else => return IntegrationResult{
-            .skill_name = safe_name,
-            .install_path = skills_dir,
-            .success = false,
-            .error_message = "git clone terminated by signal",
-        },
-    }
 
     if (!hasSupportedSkillStructure(target_path)) {
         // Remove the cloned directory since it lacks expected structure
@@ -468,6 +470,12 @@ pub fn integrate(allocator: std.mem.Allocator, candidate: SkillCandidate, skills
         .install_path = skills_dir,
         .success = true,
     };
+}
+
+/// Integrate a skill: clone repo to skills_dir/NAME/,
+/// verify structure (agent skill manifests, root.zig, or build.zig).
+pub fn integrate(allocator: std.mem.Allocator, candidate: SkillCandidate, skills_dir: []const u8) !IntegrationResult {
+    return integrateWithCloneFn(allocator, candidate, skills_dir, cloneRepoWithGit);
 }
 
 /// Check if a file exists in a directory.
@@ -800,6 +808,16 @@ test "sanitizePathComponent accepts valid names" {
     try std.testing.expectEqualStrings("test-skill", result);
 }
 
+test "sanitizePathComponent rejects traversal and injection payloads" {
+    try std.testing.expectError(error.EmptyName, sanitizePathComponent(".."));
+    try std.testing.expectError(error.UnsafePath, sanitizePathComponent("../foo"));
+    try std.testing.expectError(error.UnsafePath, sanitizePathComponent("foo/../bar"));
+    try std.testing.expectError(error.UnsafePath, sanitizePathComponent("/etc/passwd"));
+    try std.testing.expectError(error.UnsafePath, sanitizePathComponent("C:\\Windows"));
+    // NUL byte injection
+    try std.testing.expectError(error.UnsafePath, sanitizePathComponent("test\x00skill"));
+}
+
 test "sanitizePathComponent trims dots" {
     const result = try sanitizePathComponent(".hidden.");
     try std.testing.expectEqualStrings("hidden", result);
@@ -948,11 +966,44 @@ test "buildGitHubSearchUrl handles special chars" {
     try std.testing.expect(std.mem.indexOf(u8, url, "foo+%26+bar") != null);
 }
 
-test "scout returns empty list (no network)" {
+test "scout bypasses network in test mode" {
     const allocator = std.testing.allocator;
     var candidates = try scout(allocator, "test");
     defer candidates.deinit(allocator);
+    // builtin.is_test returns empty cleanly without initiating an HTTP request.
     try std.testing.expectEqual(@as(usize, 0), candidates.items.len);
+}
+
+test "parseGitHubSearchResults extracts candidate metadata" {
+    const allocator = std.testing.allocator;
+    var candidates: std.ArrayList(SkillCandidate) = .empty;
+    defer {
+        freeCandidates(allocator, candidates.items);
+        candidates.deinit(allocator);
+    }
+
+    const body =
+        \\{"items":[
+        \\  {"name":"zig-skill","full_name":"owner/zig-skill","html_url":"https://github.com/owner/zig-skill","description":"A Zig skill","language":"Zig","stargazers_count":42,"owner":{"login":"owner"},"license":{"key":"mit"}},
+        \\  {"name":"plain-skill","full_name":"owner/plain-skill","html_url":"https://github.com/owner/plain-skill","description":null,"language":null,"stargazers_count":0,"owner":{"login":"owner"},"license":null}
+        \\]}
+    ;
+
+    try parseGitHubSearchResults(allocator, body, &candidates);
+
+    try std.testing.expectEqual(@as(usize, 2), candidates.items.len);
+    try std.testing.expectEqualStrings("zig-skill", candidates.items[0].result_name);
+    try std.testing.expectEqualStrings("https://github.com/owner/zig-skill", candidates.items[0].repo_url);
+    try std.testing.expectEqualStrings("A Zig skill", candidates.items[0].description);
+    try std.testing.expectEqualStrings("Zig", candidates.items[0].language.?);
+    try std.testing.expectEqual(@as(u64, 42), candidates.items[0].stars);
+    try std.testing.expectEqualStrings("owner", candidates.items[0].owner);
+    try std.testing.expect(candidates.items[0].has_license);
+
+    try std.testing.expectEqualStrings("plain-skill", candidates.items[1].result_name);
+    try std.testing.expectEqualStrings("", candidates.items[1].description);
+    try std.testing.expect(candidates.items[1].language == null);
+    try std.testing.expect(!candidates.items[1].has_license);
 }
 
 test "evaluateCandidate with build.zig gets compatibility boost" {
@@ -1026,4 +1077,98 @@ test "IntegrationResult fields" {
     };
     try std.testing.expect(r.success);
     try std.testing.expect(r.error_message == null);
+}
+
+test "integrate verifies cloned skill structure before success" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const skills_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(skills_dir);
+
+    const c = SkillCandidate{
+        .result_name = "test-skill-1",
+        .repo_url = "https://github.com/test/success",
+        .description = "desc",
+    };
+
+    const Clone = struct {
+        fn run(_: std.mem.Allocator, _: []const u8, target_path: []const u8) !void {
+            try std_compat.fs.makeDirAbsolute(target_path);
+            var buf: [std_compat.fs.max_path_bytes]u8 = undefined;
+            const full = try std.fmt.bufPrint(&buf, "{s}/SKILL.md", .{target_path});
+            const file = try std_compat.fs.createFileAbsolute(full, .{});
+            file.close();
+        }
+    };
+
+    const res = try integrateWithCloneFn(allocator, c, skills_dir, Clone.run);
+    try std.testing.expect(res.success);
+    try std.testing.expectEqualStrings("test-skill-1", res.skill_name);
+
+    const target_path = try std.fmt.allocPrint(allocator, "{s}/test-skill-1", .{skills_dir});
+    defer allocator.free(target_path);
+    try std_compat.fs.accessAbsolute(target_path, .{});
+}
+
+test "integrate reports clone failures before structure checks" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const skills_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(skills_dir);
+
+    const c = SkillCandidate{
+        .result_name = "test-skill-2",
+        .repo_url = "https://github.com/test/source",
+        .description = "desc",
+    };
+
+    const Clone = struct {
+        fn run(_: std.mem.Allocator, _: []const u8, _: []const u8) !void {
+            return error.CloneNonZeroExit;
+        }
+    };
+
+    const res = try integrateWithCloneFn(allocator, c, skills_dir, Clone.run);
+    try std.testing.expect(!res.success);
+    try std.testing.expect(res.error_message != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.error_message.?, "git clone") != null);
+}
+
+test "integrate cleans up repo if supported structure is missing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const skills_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(skills_dir);
+
+    const c = SkillCandidate{
+        .result_name = "test-skill-3",
+        .repo_url = "https://github.com/test/source",
+        .description = "desc",
+    };
+
+    const Clone = struct {
+        fn run(_: std.mem.Allocator, _: []const u8, target_path: []const u8) !void {
+            try std_compat.fs.makeDirAbsolute(target_path);
+        }
+    };
+
+    const res = try integrateWithCloneFn(allocator, c, skills_dir, Clone.run);
+    try std.testing.expect(!res.success);
+    try std.testing.expect(res.error_message != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.error_message.?, "SKILL.md") != null);
+
+    // Ensure it was cleaned up
+    const target_path = try std.fmt.allocPrint(allocator, "{s}/test-skill-3", .{skills_dir});
+    defer allocator.free(target_path);
+    std_compat.fs.accessAbsolute(target_path, .{}) catch |err| {
+        try std.testing.expectEqual(error.FileNotFound, err);
+        return;
+    };
+    return error.TestExpectedError;
 }

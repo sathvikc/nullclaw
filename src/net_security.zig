@@ -806,3 +806,73 @@ test "resolveConnectHost returns literal for global ipv4" {
     defer std.testing.allocator.free(resolved);
     try std.testing.expectEqualStrings("8.8.8.8", resolved);
 }
+
+// ── URL scheme validation ────────────────────────────────────────────
+
+/// Outbound URL validation error. The runtime rejects any non-HTTPS URL at
+/// the tool boundary per AGENTS.md §3.5 (Secure by Default).
+pub const UrlValidationError = error{
+    InsecureScheme,
+    UnsupportedScheme,
+    MalformedUrl,
+};
+
+/// Validate an outbound URL for HTTP/browser tools. Accepts only `https://`.
+/// Rejects `http://`, `ws://`, `wss://`, `file://`, `data:`, `ftp://`, and
+/// any other scheme. WebSocket callers should use a separate helper once a
+/// concrete outbound WebSocket tool needs it.
+/// Case-insensitive on the scheme prefix per RFC 3986 §3.1.
+pub fn validateOutboundUrl(url: []const u8) UrlValidationError!void {
+    if (url.len == 0) return error.MalformedUrl;
+
+    const scheme_end = std.mem.indexOf(u8, url, "://") orelse {
+        if (std.mem.indexOfScalar(u8, url, ':')) |colon| {
+            const scheme = url[0..colon];
+            if (std.ascii.eqlIgnoreCase(scheme, "data") or
+                std.ascii.eqlIgnoreCase(scheme, "javascript") or
+                std.ascii.eqlIgnoreCase(scheme, "blob"))
+            {
+                return error.UnsupportedScheme;
+            }
+            return error.MalformedUrl;
+        }
+        return error.MalformedUrl;
+    };
+
+    const scheme = url[0..scheme_end];
+    if (std.ascii.eqlIgnoreCase(scheme, "https")) return;
+    if (std.ascii.eqlIgnoreCase(scheme, "http")) return error.InsecureScheme;
+    if (std.ascii.eqlIgnoreCase(scheme, "ws")) return error.InsecureScheme;
+    return error.UnsupportedScheme;
+}
+
+test "validateOutboundUrl accepts https" {
+    try validateOutboundUrl("https://example.com");
+    try validateOutboundUrl("https://example.com/path");
+    try validateOutboundUrl("https://example.com:8443/p?q=1");
+    try validateOutboundUrl("HTTPS://example.com");
+    try validateOutboundUrl("https://[::1]/");
+}
+
+test "validateOutboundUrl rejects http with InsecureScheme" {
+    try std.testing.expectError(error.InsecureScheme, validateOutboundUrl("http://example.com"));
+    try std.testing.expectError(error.InsecureScheme, validateOutboundUrl("HTTP://example.com"));
+    try std.testing.expectError(error.InsecureScheme, validateOutboundUrl("ws://example.com"));
+}
+
+test "validateOutboundUrl rejects unsupported schemes" {
+    try std.testing.expectError(error.UnsupportedScheme, validateOutboundUrl("file:///etc/passwd"));
+    try std.testing.expectError(error.UnsupportedScheme, validateOutboundUrl("ftp://example.com"));
+    try std.testing.expectError(error.UnsupportedScheme, validateOutboundUrl("gopher://example.com"));
+    try std.testing.expectError(error.UnsupportedScheme, validateOutboundUrl("wss://example.com"));
+    try std.testing.expectError(error.UnsupportedScheme, validateOutboundUrl("WSS://example.com"));
+    try std.testing.expectError(error.UnsupportedScheme, validateOutboundUrl("data:,Hello"));
+    try std.testing.expectError(error.UnsupportedScheme, validateOutboundUrl("javascript:alert(1)"));
+    try std.testing.expectError(error.UnsupportedScheme, validateOutboundUrl("blob:https://example.com/id"));
+}
+
+test "validateOutboundUrl rejects malformed input" {
+    try std.testing.expectError(error.MalformedUrl, validateOutboundUrl(""));
+    try std.testing.expectError(error.MalformedUrl, validateOutboundUrl("not a url"));
+    try std.testing.expectError(error.MalformedUrl, validateOutboundUrl("/absolute/path"));
+}

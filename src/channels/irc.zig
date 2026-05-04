@@ -1086,3 +1086,15 @@ test "irc disconnect without connection is safe" {
     try std.testing.expect(ch.stream == null);
     try std.testing.expect(ch.tls_state == null);
 }
+
+test "IrcChannel create + healthCheck + stop leaks zero bytes" {
+    // IrcChannel holds no heap allocations at init-time.  No deinit needed.
+    var ch_struct = IrcChannel.initFromConfig(std.testing.allocator, .{
+        .host = "irc.example.com",
+        .nick = "test-bot",
+    });
+
+    const ch = ch_struct.channel();
+    _ = ch.healthCheck();
+    ch.stop();
+}

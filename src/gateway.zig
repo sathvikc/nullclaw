@@ -438,6 +438,10 @@ pub const IdempotencyStore = struct {
     }
 
     pub fn deinit(self: *IdempotencyStore, allocator: std.mem.Allocator) void {
+        var iter = self.keys.iterator();
+        while (iter.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+        }
         self.keys.deinit(allocator);
     }
 
@@ -457,14 +461,21 @@ pub const IdempotencyStore = struct {
             }
         }
         for (to_remove.items) |k| {
-            _ = self.keys.remove(k);
+            if (self.keys.fetchRemove(k)) |kv| {
+                allocator.free(kv.key);
+            }
         }
 
-        // Check if already present
+        // Check if already present after removing expired entries. Idempotency
+        // keys are exact identifiers; do not truncate or prefix-match them.
         if (self.keys.get(key)) |_| return false;
 
         // Record new key
-        self.keys.put(allocator, key, now) catch return true;
+        const duped_key = allocator.dupe(u8, key) catch return true;
+        self.keys.put(allocator, duped_key, now) catch {
+            allocator.free(duped_key);
+            return true;
+        };
         return true;
     }
 };
@@ -993,6 +1004,12 @@ pub fn jsonStringField(json: []const u8, key: []const u8) ?[]const u8 {
         }
     }
     return null;
+}
+
+fn isJsonObjectPayload(allocator: std.mem.Allocator, body: []const u8) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return false;
+    defer parsed.deinit();
+    return parsed.value == .object;
 }
 
 /// Extract an integer field from a JSON blob.
@@ -3263,6 +3280,13 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
     }
 
     const wa_body = extractBody(ctx.raw_request);
+    if (wa_body) |body| {
+        if (!isJsonObjectPayload(ctx.req_allocator, body)) {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"invalid json payload\"}";
+            return;
+        }
+    }
     var wa_app_secret = ctx.state.whatsapp_app_secret;
     var wa_access_token = ctx.state.whatsapp_access_token;
     var wa_allow_from = ctx.state.whatsapp_allow_from;
@@ -4719,6 +4743,49 @@ fn handleMaxWebhookRoute(ctx: *WebhookHandlerContext) void {
     ctx.response_body = "{\"status\":\"ok\"}";
 }
 
+test "handleWhatsAppWebhookRoute rejects malformed JSON before sender extraction" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const whatsapp_accounts = [_]config_types.WhatsAppConfig{
+        .{
+            .account_id = "main",
+            .phone_number_id = "phone-1",
+            .access_token = "token",
+            .verify_token = "verify",
+            .allow_from = &.{"user-1"},
+        },
+    };
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .channels = .{ .whatsapp = &whatsapp_accounts },
+    };
+
+    const raw_request = "POST /whatsapp HTTP/1.1\r\nContent-Length: 27\r\n\r\n{\"from\":\"user-1\",\"text\":\"hi\"";
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = allocator,
+        .req_allocator = allocator,
+        .raw_request = raw_request,
+        .method = "POST",
+        .target = "/whatsapp",
+        .config_opt = &cfg,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+
+    handleWhatsAppWebhookRoute(&ctx);
+    try std.testing.expectEqualStrings("400 Bad Request", ctx.response_status);
+    try std.testing.expectEqualStrings("{\"error\":\"invalid json payload\"}", ctx.response_body);
+}
+
 fn handleTeamsWebhookRoute(ctx: *WebhookHandlerContext) void {
     if (!build_options.enable_channel_teams) {
         ctx.response_status = "404 Not Found";
@@ -4756,6 +4823,11 @@ fn handleTeamsWebhookRoute(ctx: *WebhookHandlerContext) void {
         ctx.response_body = "{\"error\":\"empty body\"}";
         return;
     };
+    if (!isJsonObjectPayload(ctx.req_allocator, body)) {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"invalid json payload\"}";
+        return;
+    }
 
     // Parse Bot Framework Activity JSON
     const activity_type = jsonStringField(body, "type") orelse {
@@ -6403,6 +6475,37 @@ test "idempotency store duplicate after many inserts" {
     try std.testing.expect(store.recordIfNew(std.testing.allocator, "third"));
     // First key should still be duplicate
     try std.testing.expect(!store.recordIfNew(std.testing.allocator, "first"));
+}
+
+test "idempotency store allows expired key again" {
+    var store = IdempotencyStore.init(1);
+    defer store.deinit(std.testing.allocator);
+
+    try std.testing.expect(store.recordIfNew(std.testing.allocator, "expires"));
+    const entry = store.keys.getPtr("expires") orelse return error.TestUnexpectedResult;
+    entry.* = std_compat.time.nanoTimestamp() - store.ttl_ns - 1;
+
+    try std.testing.expect(store.recordIfNew(std.testing.allocator, "expires"));
+    try std.testing.expect(!store.recordIfNew(std.testing.allocator, "expires"));
+}
+
+test "idempotency store keeps long keys exact" {
+    var store = IdempotencyStore.init(300);
+    defer store.deinit(std.testing.allocator);
+
+    var long_key_a: [200]u8 = undefined;
+    @memset(&long_key_a, 'A');
+    var long_key_b: [200]u8 = undefined;
+    @memset(&long_key_b, 'A');
+    long_key_b[199] = 'B';
+
+    try std.testing.expect(store.recordIfNew(std.testing.allocator, &long_key_a));
+    try std.testing.expect(!store.recordIfNew(std.testing.allocator, &long_key_a));
+
+    // Same first 199 bytes, different final byte: still a distinct idempotency key.
+    try std.testing.expect(store.recordIfNew(std.testing.allocator, &long_key_b));
+    // Prefix is also distinct from the longer key.
+    try std.testing.expect(store.recordIfNew(std.testing.allocator, long_key_a[0..128]));
 }
 
 test "rate limiter window_ns calculation" {
@@ -8457,6 +8560,53 @@ test "handleTeamsWebhookRoute requires configured webhook secret after JWT valid
     try std.testing.expectEqualStrings("{\"error\":\"unauthorized\"}", ctx.response_body);
 }
 
+test "handleTeamsWebhookRoute rejects malformed JSON payload" {
+    if (!build_options.enable_channel_teams) return;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const teams_accounts = [_]config_types.TeamsConfig{
+        .{
+            .account_id = "default",
+            .client_id = "test-app-id",
+            .client_secret = "teams-secret",
+            .tenant_id = "tenant-1",
+            .webhook_secret = "teams-webhook-secret-012345",
+        },
+    };
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .channels = .{ .teams = &teams_accounts },
+    };
+
+    const body = "{\"type\":\"message\",\"text\":"; // Unclosed JSON
+    const raw_request = try buildTeamsWebhookRequest(allocator, botframework_auth.fixtureTokenForTest(), null, body);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.teams_auth_cache.seedFixtureForTest(std.testing.allocator);
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = allocator,
+        .req_allocator = allocator,
+        .raw_request = raw_request,
+        .method = "POST",
+        .target = "/api/messages",
+        .config_opt = &cfg,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+
+    handleTeamsWebhookRoute(&ctx);
+    try std.testing.expectEqualStrings("400 Bad Request", ctx.response_status);
+    try std.testing.expectEqualStrings("{\"error\":\"invalid json payload\"}", ctx.response_body);
+}
+
 test "isValidBotFrameworkServiceUrl accepts documented Teams traffic manager host" {
     try std.testing.expect(isValidBotFrameworkServiceUrl("https://smba.trafficmanager.net/amer/"));
     try std.testing.expect(isValidBotFrameworkServiceUrl("https://SMBA.TRAFFICMANAGER.NET/teams/"));
@@ -8738,7 +8888,10 @@ test "nextAcceptSleepMs resets to poll interval on WouldBlock" {
 }
 
 test "nextAcceptSleepMs exponentially backs off and caps for non-WouldBlock errors" {
+    // Regression #851: repeated accept errors must back off instead of busy-looping.
     const unexpected = error.Unexpected;
+    try std.testing.expectEqual(@as(u64, 200), nextAcceptSleepMs(0, unexpected));
+    try std.testing.expectEqual(@as(u64, 200), nextAcceptSleepMs(50, unexpected));
     try std.testing.expectEqual(@as(u64, 200), nextAcceptSleepMs(100, unexpected));
     try std.testing.expectEqual(@as(u64, 800), nextAcceptSleepMs(400, unexpected));
     try std.testing.expectEqual(ACCEPT_ERROR_BACKOFF_MAX_MS, nextAcceptSleepMs(900, unexpected));
@@ -9066,6 +9219,44 @@ test "verifySlackSignature rejects stale timestamp" {
     }
 
     try std.testing.expect(!verifySlackSignature(std.testing.allocator, body, ts, &sig_buf, secret));
+}
+
+test "verifySlackSignature rejects tampered body" {
+    // Compute a valid Slack v0 HMAC-SHA256 signature over the original body,
+    // then verify that presenting the same signature with a different body is
+    // rejected.  Guards against regressions where body is excluded from the
+    // "v0:ts:body" signing input.
+    const secret = "slack-signing-secret";
+    const original_body = "{\"type\":\"event_callback\",\"event\":{\"text\":\"hello\"}}";
+    const tampered_body = "{\"type\":\"event_callback\",\"event\":{\"text\":\"evil\"}}";
+
+    var ts_buf: [32]u8 = undefined;
+    const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{std_compat.time.timestamp()}) catch unreachable;
+
+    var signed: std.ArrayListUnmanaged(u8) = .empty;
+    defer signed.deinit(std.testing.allocator);
+    var signed_writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &signed);
+    const sw = &signed_writer.writer;
+    try sw.print("v0:{s}:", .{ts});
+    try sw.writeAll(original_body);
+    signed = signed_writer.toArrayList();
+
+    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+    var mac: [HmacSha256.mac_length]u8 = undefined;
+    HmacSha256.create(&mac, signed.items, secret);
+
+    var sig_buf: [67]u8 = undefined; // "v0=" + 64 hex chars
+    @memcpy(sig_buf[0..3], "v0=");
+    for (0..32) |idx| {
+        const byte = mac[idx];
+        sig_buf[3 + idx * 2] = "0123456789abcdef"[byte >> 4];
+        sig_buf[3 + idx * 2 + 1] = "0123456789abcdef"[byte & 0x0f];
+    }
+
+    // Original body + correct sig: must accept.
+    try std.testing.expect(verifySlackSignature(std.testing.allocator, original_body, ts, &sig_buf, secret));
+    // Tampered body + original sig: must reject.
+    try std.testing.expect(!verifySlackSignature(std.testing.allocator, tampered_body, ts, &sig_buf, secret));
 }
 
 test "hasSlackHttpEndpoint respects mode and webhook_path" {

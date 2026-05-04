@@ -903,3 +903,30 @@ test "sendMessage rejects empty target" {
     var ch = WeixinChannel.init(std.testing.allocator, .{ .token = "test-token" });
     try std.testing.expectError(error.InvalidTarget, ch.sendMessage("", "hello"));
 }
+
+test "WeixinChannel create + healthCheck + stop leaks zero bytes" {
+    var ch_struct = WeixinChannel.initFromConfig(std.testing.allocator, .{
+        .token = "test-token",
+    });
+    defer ch_struct.deinit();
+
+    const ch = ch_struct.channel();
+    _ = ch.healthCheck();
+    ch.stop();
+}
+
+test "WeixinChannel start + stop under is_test leaks zero bytes" {
+    // vtableStart sets self.running = true only — no I/O, no thread.
+    // Double stop must be idempotent per Channel contract.
+    // deinit() releases the context_tokens HashMap (always empty at init-time).
+    var ch_struct = WeixinChannel.initFromConfig(std.testing.allocator, .{
+        .token = "test-token",
+    });
+    defer ch_struct.deinit();
+
+    const ch = ch_struct.channel();
+    try ch.start();
+    ch.stop();
+    // Double stop — must not double-free or crash.
+    ch.stop();
+}

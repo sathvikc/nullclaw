@@ -331,3 +331,118 @@ test "contract: kg session_id" {
     defer mem.deinit();
     try contractSessionId(mem.memory());
 }
+
+// ── Recall-after-store contract ──────────────────────────────────────
+
+fn recallAfterStoreContract(m: Memory) !void {
+    const allocator = std.testing.allocator;
+    const unique_key = "recall_probe";
+    // The query must be a single FTS5 token — sqlite's FTS5 unicode61
+    // tokenizer treats `_` as a separator, so a query like "recall_probe"
+    // would split into the phrase ["recall", "probe"] and miss the
+    // sqlite/kg FTS path entirely. KG has no LIKE fallback, so a
+    // multi-token query would silently fail there. `xyz123uniquecontent`
+    // is a single alphanumeric token that all three search paths
+    // (FTS5 phrase, markdown substring, LRU substring) match identically.
+    const unique_content = "xyz123uniquecontent recall_probe_content";
+    try m.store(unique_key, unique_content, .core, null);
+
+    const query = "xyz123uniquecontent";
+    const results = try m.recall(allocator, query, 10, null);
+    defer root.freeEntries(allocator, results);
+
+    try std.testing.expect(results.len >= 1);
+    var found = false;
+    for (results) |e| {
+        if (std.mem.indexOf(u8, e.content, query) != null) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "stateful memory backends recall stored entries" {
+    // NoneMemory is intentionally covered by "contract: none noop"; it must
+    // not recall stored entries because writes are explicit no-ops.
+    if (build_options.enable_sqlite) {
+        var sql = try SqliteMemory.init(std.testing.allocator, ":memory:");
+        defer sql.deinit();
+        try recallAfterStoreContract(sql.memory());
+    }
+    {
+        var dir = std.testing.tmpDir(.{});
+        defer dir.cleanup();
+        const path = try @import("compat").fs.Dir.wrap(dir.dir).realpathAlloc(std.testing.allocator, ".");
+        defer std.testing.allocator.free(path);
+        var md = try MarkdownMemory.init(std.testing.allocator, path);
+        defer md.deinit();
+        try recallAfterStoreContract(md.memory());
+    }
+    {
+        var lru = InMemoryLruMemory.init(std.testing.allocator, 100);
+        defer lru.deinit();
+        try recallAfterStoreContract(lru.memory());
+    }
+    if (build_options.enable_memory_kg) {
+        var kg = try KgMemory.init(std.testing.allocator, ":memory:");
+        defer kg.deinit();
+        try recallAfterStoreContract(kg.memory());
+    }
+}
+
+// ── Deinit-after-store contract ──────────────────────────────────────
+
+/// Validates that deinit is safe after a successful store call —
+/// post-store internal state must not require any extra "close" /
+/// "flush" call before deinit. AGENTS.md §3.4 fail-fast: no UB, no
+/// double-free, no leak.
+///
+/// Note: the Memory vtable has no `close()` method. An earlier draft of
+/// this comment referenced one ("close not called") — that was wrong.
+/// The contract being checked is simply that deinit alone is sufficient
+/// teardown after a mutation.
+fn contractDeinitAfterStore(m: Memory) !void {
+    try m.store("ownership_probe", "content", .core, null);
+}
+
+test "every engine survives store-then-deinit" {
+    // sqlite
+    if (build_options.enable_sqlite) {
+        var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+        defer mem.deinit();
+        try contractDeinitAfterStore(mem.memory());
+    }
+
+    // markdown
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+        defer std.testing.allocator.free(base);
+        var mem = try MarkdownMemory.init(std.testing.allocator, base);
+        defer mem.deinit();
+        try contractDeinitAfterStore(mem.memory());
+    }
+
+    // lru
+    {
+        var mem = InMemoryLruMemory.init(std.testing.allocator, 100);
+        defer mem.deinit();
+        try contractDeinitAfterStore(mem.memory());
+    }
+
+    // none — no-op store, but contract still applies
+    {
+        var mem = NoneMemory.init();
+        defer mem.deinit();
+        try contractDeinitAfterStore(mem.memory());
+    }
+
+    // kg
+    if (build_options.enable_memory_kg) {
+        var mem = try KgMemory.init(std.testing.allocator, ":memory:");
+        defer mem.deinit();
+        try contractDeinitAfterStore(mem.memory());
+    }
+}

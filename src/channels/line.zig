@@ -1008,3 +1008,36 @@ test "line parseAndFilterEvents empty allow_from passes all" {
 
     try std.testing.expectEqual(@as(usize, 1), events.len);
 }
+
+test "LineChannel create + healthCheck + stop leaks zero bytes" {
+    // LineChannel holds no heap allocations at init-time.  No deinit needed.
+    var ch_struct = LineChannel.initFromConfig(std.testing.allocator, .{
+        .access_token = "test-access-token",
+        .channel_secret = "test-channel-secret",
+    });
+
+    const ch = ch_struct.channel();
+    _ = ch.healthCheck();
+    ch.stop();
+}
+
+test "verifyLineSignature rejects tampered body" {
+    // Compute a valid sig for the original body, then verify that presenting
+    // the same sig with a different body is rejected.  Guards against future
+    // regressions where the HMAC input is silently short-circuited.
+    const secret = "channel-secret-abc";
+    const original_body = "webhook-body-content";
+    const tampered_body = "webhook-body-content_tampered";
+
+    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+    var mac: [HmacSha256.mac_length]u8 = undefined;
+    HmacSha256.create(&mac, original_body, secret);
+
+    var encoded_buf: [44]u8 = undefined;
+    const valid_sig = std.base64.standard.Encoder.encode(&encoded_buf, &mac);
+
+    // Correct body + correct sig: must accept.
+    try std.testing.expect(verifyLineSignature(original_body, valid_sig, secret));
+    // Tampered body + original sig: must reject.
+    try std.testing.expect(!verifyLineSignature(tampered_body, valid_sig, secret));
+}

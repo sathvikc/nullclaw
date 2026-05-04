@@ -1262,3 +1262,15 @@ test "mattermost chatmode onchar strips configured prefix before publish" {
     try std.testing.expectEqualStrings("mattermost:mm-main:channel:town", msg.session_key);
     try std.testing.expect(eb.consumeInbound() == null);
 }
+
+test "MattermostChannel create + healthCheck + stop leaks zero bytes" {
+    // MattermostChannel holds no heap allocations at init-time.  No deinit needed.
+    var ch_struct = MattermostChannel.initFromConfig(std.testing.allocator, .{
+        .bot_token = "test-bot-token",
+        .base_url = "https://mattermost.example.com",
+    });
+
+    const ch = ch_struct.channel();
+    _ = ch.healthCheck();
+    ch.stop();
+}

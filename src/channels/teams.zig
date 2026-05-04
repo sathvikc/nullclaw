@@ -821,3 +821,16 @@ test "vtableSend preserves message without nc_choices" {
         msg;
     try std.testing.expectEqualStrings("Hello, how can I help?", clean);
 }
+
+test "TeamsChannel create + healthCheck + stop leaks zero bytes" {
+    // TeamsChannel holds no heap allocations at init-time.  No deinit needed.
+    var ch_struct = TeamsChannel.initFromConfig(std.testing.allocator, .{
+        .client_id = "test-client-id",
+        .client_secret = "test-client-secret",
+        .tenant_id = "test-tenant-id",
+    });
+
+    const ch = ch_struct.channel();
+    _ = ch.healthCheck();
+    ch.stop();
+}

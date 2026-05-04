@@ -32,10 +32,9 @@ pub const BrowserOpenTool = struct {
         const url = root.getString(args, "url") orelse
             return ToolResult.fail("Missing 'url' parameter");
 
-        // Validate URL
-        if (!std.mem.startsWith(u8, url, "https://")) {
+        net_security.validateOutboundUrl(url) catch {
             return ToolResult.fail("Only https:// URLs are allowed");
-        }
+        };
 
         const host = net_security.extractHost(url) orelse {
             return ToolResult.fail("URL must include a host");
@@ -133,6 +132,17 @@ test "browser_open rejects http" {
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "https") != null);
+}
+
+test "browser_open accepts uppercase https scheme before allowlist checks" {
+    const domains = [_][]const u8{"allowed.example"};
+    var bo = BrowserOpenTool{ .allowed_domains = &domains };
+    const t = bo.tool();
+    const parsed = try root.parseTestArgs("{\"url\": \"HTTPS://blocked.example/path\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "allowed_domains") != null);
 }
 
 test "browser_open rejects empty allowlist" {

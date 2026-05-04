@@ -7728,3 +7728,21 @@ test "validation accepts named agent provider aliases from configured providers"
 
     try cfg.validate();
 }
+
+test "Config parseJson rejects truncated JSON" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Truncated JSON must fail before partially parsed config is accepted.
+    const malformed_json = "{\"models\":{\"providers\":{\"openai\":";
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    const result = cfg.parseJson(malformed_json);
+    try std.testing.expect(std.meta.isError(result));
+}

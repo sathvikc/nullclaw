@@ -992,3 +992,16 @@ test "whatsapp normalize phone buffer too small" {
     // Phone "123" needs 4 bytes ("+123"), but buf is only 2 bytes
     try std.testing.expectEqualStrings("123", WhatsAppChannel.normalizePhone(&buf, "123"));
 }
+
+test "WhatsAppChannel create + healthCheck + stop leaks zero bytes" {
+    // WhatsAppChannel holds no heap allocations at init-time.  No deinit needed.
+    var ch_struct = WhatsAppChannel.initFromConfig(std.testing.allocator, .{
+        .access_token = "test-access-token",
+        .phone_number_id = "test-phone-id",
+        .verify_token = "test-verify-token",
+    });
+
+    const ch = ch_struct.channel();
+    _ = ch.healthCheck();
+    ch.stop();
+}

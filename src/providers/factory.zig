@@ -517,6 +517,57 @@ pub const ProviderHolder = union(enum) {
 // Tests
 // ════════════════════════════════════════════════════════════════════════════
 
+const ProviderHolderTag = std.meta.Tag(ProviderHolder);
+
+const ProviderHolderCase = struct {
+    name: []const u8,
+    expected_name_substr: []const u8,
+    expected_tag: ProviderHolderTag,
+    base_url: ?[]const u8 = null,
+};
+
+const provider_holder_cases = [_]ProviderHolderCase{
+    .{ .name = "openrouter", .expected_name_substr = "openrouter", .expected_tag = .openrouter },
+    .{ .name = "anthropic", .expected_name_substr = "anthropic", .expected_tag = .anthropic },
+    .{ .name = "openai", .expected_name_substr = "openai", .expected_tag = .openai },
+    .{ .name = "gemini", .expected_name_substr = "gemini", .expected_tag = .gemini },
+    .{ .name = "vertex", .expected_name_substr = "vertex", .expected_tag = .vertex },
+    .{ .name = "ollama", .expected_name_substr = "ollama", .expected_tag = .ollama },
+    .{ .name = "groq", .expected_name_substr = "groq", .expected_tag = .compatible },
+    .{ .name = "claude-cli", .expected_name_substr = "claude", .expected_tag = .claude_cli },
+    .{ .name = "codex-cli", .expected_name_substr = "codex", .expected_tag = .codex_cli },
+    .{ .name = "gemini-cli", .expected_name_substr = "gemini", .expected_tag = .gemini_cli },
+    .{ .name = "openai-codex", .expected_name_substr = "openai", .expected_tag = .openai_codex },
+};
+
+fn providerHolderForCase(allocator: std.mem.Allocator, c: ProviderHolderCase) ProviderHolder {
+    return switch (c.expected_tag) {
+        .claude_cli => .{ .claude_cli = .{
+            .allocator = allocator,
+            .model = "test-claude",
+        } },
+        .codex_cli => .{ .codex_cli = .{
+            .allocator = allocator,
+            .model = "test-codex",
+        } },
+        .gemini_cli => .{ .gemini_cli = .{
+            .allocator = allocator,
+            .model = "test-gemini",
+        } },
+        else => ProviderHolder.fromConfig(
+            allocator,
+            c.name,
+            "test-key",
+            c.base_url,
+            true,
+            null,
+            null,
+            false,
+            null,
+        ),
+    };
+}
+
 test "classifyProvider identifies known providers" {
     try std.testing.expect(classifyProvider("anthropic") == .anthropic_provider);
     try std.testing.expect(classifyProvider("openai") == .openai_provider);
@@ -1034,18 +1085,20 @@ test "detectProviderByApiKey short key" {
     try std.testing.expect(detectProviderByApiKey("ab") == .unknown);
 }
 
-test "ProviderHolder tagged union has all expected fields" {
-    try std.testing.expect(@hasField(ProviderHolder, "openrouter"));
-    try std.testing.expect(@hasField(ProviderHolder, "anthropic"));
-    try std.testing.expect(@hasField(ProviderHolder, "openai"));
-    try std.testing.expect(@hasField(ProviderHolder, "gemini"));
-    try std.testing.expect(@hasField(ProviderHolder, "vertex"));
-    try std.testing.expect(@hasField(ProviderHolder, "ollama"));
-    try std.testing.expect(@hasField(ProviderHolder, "compatible"));
-    try std.testing.expect(@hasField(ProviderHolder, "claude_cli"));
-    try std.testing.expect(@hasField(ProviderHolder, "codex_cli"));
-    try std.testing.expect(@hasField(ProviderHolder, "gemini_cli"));
-    try std.testing.expect(@hasField(ProviderHolder, "openai_codex"));
+test "ProviderHolder case table covers every union variant" {
+    const fields = @typeInfo(ProviderHolder).@"union".fields;
+    try std.testing.expectEqual(fields.len, provider_holder_cases.len);
+
+    inline for (fields) |field| {
+        var seen = false;
+        for (provider_holder_cases) |c| {
+            if (std.mem.eql(u8, field.name, @tagName(c.expected_tag))) {
+                try std.testing.expect(!seen);
+                seen = true;
+            }
+        }
+        try std.testing.expect(seen);
+    }
 }
 
 test "ProviderHolder.fromConfig routes to correct variant" {
@@ -1193,4 +1246,38 @@ test "fromConfigWithApiMode applies responses mode to compatible provider" {
     defer h.deinit();
     try std.testing.expect(h == .compatible);
     try std.testing.expectEqual(compatible.CompatibleApiMode.responses, h.compatible.api_mode);
+}
+
+test "ProviderHolder all variants deinit leaks zero bytes" {
+    const alloc = std.testing.allocator;
+
+    for (provider_holder_cases) |c| {
+        var holder = providerHolderForCase(alloc, c);
+        try std.testing.expectEqual(c.expected_tag, std.meta.activeTag(holder));
+
+        // Touch the vtable getter to ensure the interface is well-formed.
+        const provider = holder.provider();
+        _ = provider;
+        holder.deinit();
+    }
+}
+
+test "every ProviderHolder variant returns non-empty name matching key" {
+    const alloc = std.testing.allocator;
+
+    for (provider_holder_cases) |c| {
+        var holder = providerHolderForCase(alloc, c);
+
+        const provider = holder.provider();
+        const name = provider.getName();
+        try std.testing.expect(name.len > 0);
+
+        const lower_name = try std.ascii.allocLowerString(alloc, name);
+        defer alloc.free(lower_name);
+        const lower_substr = try std.ascii.allocLowerString(alloc, c.expected_name_substr);
+        defer alloc.free(lower_substr);
+        try std.testing.expect(std.mem.indexOf(u8, lower_name, lower_substr) != null);
+
+        holder.deinit();
+    }
 }

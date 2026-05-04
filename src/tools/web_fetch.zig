@@ -43,9 +43,9 @@ pub const WebFetchTool = struct {
             return ToolResult.fail("Missing required 'url' parameter");
 
         // Validate URL scheme - HTTPS only for security (AGENTS.md policy)
-        if (!std.mem.startsWith(u8, url, "https://")) {
+        net_security.validateOutboundUrl(url) catch {
             return ToolResult.fail("Only HTTPS URLs are allowed for security");
-        }
+        };
 
         const uri = std.Uri.parse(url) catch
             return ToolResult.fail("Invalid URL format");
@@ -64,7 +64,7 @@ pub const WebFetchTool = struct {
 
         // Reject non-allowlisted hosts when allowlist is configured
         if (self.allowed_domains.len > 0 and !is_allowlisted) {
-            return ToolResult.fail("Host is not in http_request.allowed_domains");
+            return ToolResult.fail("Host is not in web_fetch.allowed_domains");
         }
 
         // SSRF protection: skip for allowlisted hosts (fixes #393).
@@ -506,6 +506,16 @@ test "WebFetchTool non-HTTP scheme rejected" {
     try testing.expect(std.mem.indexOf(u8, result.error_msg.?, "HTTPS") != null);
 }
 
+test "WebFetchTool accepts uppercase https scheme before allowlist checks" {
+    const domains = [_][]const u8{"allowed.example"};
+    var wft = WebFetchTool{ .allowed_domains = &domains };
+    const parsed = try root.parseTestArgs("{\"url\":\"HTTPS://blocked.example/path\"}");
+    defer parsed.deinit();
+    const result = try wft.execute(testing.allocator, parsed.value.object);
+    try testing.expect(!result.success);
+    try testing.expectEqualStrings("Host is not in web_fetch.allowed_domains", result.error_msg.?);
+}
+
 test "WebFetchTool localhost blocked" {
     var wft = WebFetchTool{};
     const parsed = try root.parseTestArgs("{\"url\":\"https://localhost:8080/api\"}");
@@ -547,7 +557,7 @@ test "WebFetchTool blocked when host is not in allowlist" {
     defer parsed.deinit();
     const result = try wft.execute(testing.allocator, parsed.value.object);
     try testing.expect(!result.success);
-    try testing.expectEqualStrings("Host is not in http_request.allowed_domains", result.error_msg.?);
+    try testing.expectEqualStrings("Host is not in web_fetch.allowed_domains", result.error_msg.?);
 }
 
 test "WebFetchTool allowlisted local host is allowed (fixes #393)" {

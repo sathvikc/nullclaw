@@ -667,3 +667,15 @@ test "handleInboundMessage publishes nested notification to bus with injected ac
     try std.testing.expect(std.mem.indexOf(u8, msg.metadata_json.?, "\"account_id\":\"main\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, msg.metadata_json.?, "\"peer_kind\":\"group\"") != null);
 }
+
+test "ExternalChannel create + healthCheck + stop leaks zero bytes" {
+    // ExternalChannel holds no heap allocations at init-time.  No deinit needed.
+    // healthCheckLocked() returns false immediately when running=false and no child process.
+    var ch_struct = ExternalChannel.initFromConfig(std.testing.allocator, .{
+        .runtime_name = "test-external",
+    });
+
+    const ch = ch_struct.channel();
+    _ = ch.healthCheck();
+    ch.stop();
+}

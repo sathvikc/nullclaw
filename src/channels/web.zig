@@ -2544,6 +2544,17 @@ test "WebChannel relay user_message without access token is rejected" {
     try std.testing.expectEqual(@as(usize, 0), bus.inboundDepth());
 }
 
+test "WebChannel create + healthCheck + stop leaks zero bytes" {
+    // WebChannel (local transport) holds no heap allocations at init-time.  No deinit needed.
+    var ch_struct = WebChannel.initFromConfig(std.testing.allocator, .{
+        .transport = "local",
+    });
+
+    const ch = ch_struct.channel();
+    _ = ch.healthCheck();
+    ch.stop();
+}
+
 test {
     @import("std").testing.refAllDecls(@This());
 }

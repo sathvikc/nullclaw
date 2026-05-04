@@ -1353,6 +1353,7 @@ pub const SignalChannel = struct {
         self.sse_next_retry_at = 0;
         // Clean up SSE buffer
         self.sse_buffer.deinit(self.allocator);
+        self.sse_buffer = .empty;
         // Clean up typing indicator threads
         self.stopAllTyping();
     }
@@ -3412,6 +3413,17 @@ test "nextEventBoundary handles lf and crlf delimiters" {
     try std.testing.expectEqual(@as(usize, 13), crlf_boundary.next);
 }
 
+test "nextEventBoundary leaves incomplete trailing event buffered" {
+    const partial = "data: partial";
+    try std.testing.expect(SignalChannel.nextEventBoundary(partial, 0) == null);
+
+    const mixed = "data: complete\n\ndata: partial";
+    const boundary = SignalChannel.nextEventBoundary(mixed, 0).?;
+    try std.testing.expectEqual(@as(usize, 14), boundary.end);
+    try std.testing.expectEqual(@as(usize, 16), boundary.next);
+    try std.testing.expect(SignalChannel.nextEventBoundary(mixed, boundary.next) == null);
+}
+
 test "parseSSEEnvelope accepts multiline SSE data payload" {
     const users = [_][]const u8{"*"};
     const ch = SignalChannel.init(
@@ -3652,4 +3664,31 @@ test "parseSSEEnvelope ignores Note to Self sync from linked device" {
     ;
     const msg_opt = try ch.parseSSEEnvelope(std.testing.allocator, raw_json);
     try std.testing.expect(msg_opt == null);
+}
+
+test "SignalChannel create + healthCheck + stop leaks zero bytes" {
+    // SignalChannel holds no heap allocations at init-time.  No deinit needed.
+    var ch_struct = SignalChannel.initFromConfig(std.testing.allocator, .{
+        .http_url = "http://localhost:8080",
+        .account = "+15550001111",
+    });
+
+    const ch = ch_struct.channel();
+    _ = ch.healthCheck();
+    ch.stop();
+}
+
+test "SignalChannel start + stop under is_test leaks zero bytes" {
+    // vtableStart has `if (builtin.is_test) return;` — no network I/O, no thread.
+    // Double stop must be idempotent per Channel contract.
+    var ch_struct = SignalChannel.initFromConfig(std.testing.allocator, .{
+        .http_url = "http://localhost:8080",
+        .account = "+15550001111",
+    });
+
+    const ch = ch_struct.channel();
+    try ch.start();
+    ch.stop();
+    // Double stop — must not double-free or crash.
+    ch.stop();
 }

@@ -1204,3 +1204,12 @@ test "getJsonInt extracts integer" {
     try std.testing.expect(getJsonInt(parsed.value, "name") == null);
     try std.testing.expect(getJsonInt(parsed.value, "missing") == null);
 }
+
+test "OneBotChannel create + healthCheck + stop leaks zero bytes" {
+    // OneBotChannel holds no heap allocations at init-time.  No deinit needed.
+    var ch_struct = OneBotChannel.initFromConfig(std.testing.allocator, .{});
+
+    const ch = ch_struct.channel();
+    _ = ch.healthCheck();
+    ch.stop();
+}

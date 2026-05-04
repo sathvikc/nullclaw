@@ -61,9 +61,9 @@ pub const BrowserTool = struct {
         const url = root.getString(args, "url") orelse
             return ToolResult.fail("Missing 'url' parameter for open action");
 
-        if (!std.mem.startsWith(u8, url, "https://")) {
+        net_security.validateOutboundUrl(url) catch {
             return ToolResult.fail("Only https:// URLs are supported for security");
-        }
+        };
 
         // On Windows cmd.exe /c start interprets shell metacharacters in the URL.
         // On Unix, open/xdg-open receives the URL as a separate argv element (execvp),
@@ -116,11 +116,11 @@ pub const BrowserTool = struct {
         if (url.len > 0 and url[0] == '-') {
             return ToolResult.fail("Invalid URL for read action");
         }
+        net_security.validateOutboundUrl(url) catch {
+            return ToolResult.fail("Only https:// URLs are supported for security");
+        };
         const uri = std.Uri.parse(url) catch
             return ToolResult.fail("Invalid URL format");
-        if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) {
-            return ToolResult.fail("Only https:// URLs are supported for security");
-        }
 
         const host = net_security.extractHost(url) orelse
             return ToolResult.fail("Invalid URL: cannot extract host");
@@ -322,6 +322,32 @@ test "browser read rejects http" {
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "https") != null);
+}
+
+test "browser read accepts uppercase https scheme before SSRF checks" {
+    var bt = BrowserTool{};
+    const t = bt.tool();
+    const parsed = try root.parseTestArgs("{\"action\": \"read\", \"url\": \"HTTPS://127.0.0.1/\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "local") != null);
+}
+
+test "browser open accepts uppercase https scheme" {
+    // Regression: executeOpen previously used `std.mem.startsWith(u8, url, "https://")`
+    // which rejected `HTTPS://...` even though the scheme is valid per RFC 3986
+    // (case-insensitive). The fix routes through `validateOutboundUrl`. This test
+    // pairs with the same change in browser_open.zig / http_request.zig / web_fetch.zig
+    // and was missing from the original commit.
+    var bt = BrowserTool{};
+    const t = bt.tool();
+    const parsed = try root.parseTestArgs("{\"action\": \"open\", \"url\": \"HTTPS://example.com\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "example.com") != null);
 }
 
 test "browser read rejects option-like url" {

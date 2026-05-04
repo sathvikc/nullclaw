@@ -47,9 +47,9 @@ pub const HttpRequestTool = struct {
         };
 
         // Validate URL scheme - HTTPS only for security (AGENTS.md policy)
-        if (!std.mem.startsWith(u8, url, "https://")) {
+        net_security.validateOutboundUrl(url) catch {
             return ToolResult.fail("Only HTTPS URLs are allowed for security");
-        }
+        };
 
         // Build URI
         const uri = std.Uri.parse(url) catch
@@ -716,6 +716,17 @@ test "execute rejects non-http scheme" {
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "HTTPS") != null);
+}
+
+test "execute accepts uppercase https scheme before allowlist checks" {
+    const domains = [_][]const u8{"allowed.example"};
+    var ht = HttpRequestTool{ .allowed_domains = &domains };
+    const t = ht.tool();
+    const parsed = try root.parseTestArgs("{\"url\": \"HTTPS://blocked.example/path\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("Host is not in http_request.allowed_domains", result.error_msg.?);
 }
 
 test "execute rejects localhost SSRF" {

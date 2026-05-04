@@ -390,3 +390,19 @@ test "loadHistory enforces max entries limit" {
 test "MAX_HISTORY_LINES is 500" {
     try std.testing.expectEqual(@as(usize, 500), MAX_HISTORY_LINES);
 }
+
+test "CliChannel create + healthCheck + stop leaks zero bytes" {
+    const alloc = std.testing.allocator;
+
+    // CliChannel has no config — allocator only.
+    var ch_struct = CliChannel.init(alloc);
+
+    // Acquire vtable interface.
+    const ch = ch_struct.channel();
+
+    // healthCheck must be callable in any state.
+    _ = ch.healthCheck();
+
+    // stop without start must be safe (per Channel contract).
+    ch.stop();
+}

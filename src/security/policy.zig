@@ -248,6 +248,7 @@ pub const SecurityPolicy = struct {
         while (iter.next()) |raw_segment| {
             const segment = std.mem.trim(u8, raw_segment, " \t");
             if (segment.len == 0) continue;
+            if (!envAssignmentPrefixesAllowed(segment)) return false;
 
             const cmd_part = skipShellPrefixes(skipEnvAssignments(segment));
             var words = std.mem.tokenizeScalar(u8, cmd_part, ' ');
@@ -508,6 +509,37 @@ fn skipEnvAssignments(s: []const u8) []const u8 {
         }
         return trimmed;
     }
+}
+
+fn envAssignmentPrefixesAllowed(s: []const u8) bool {
+    var rest = s;
+    while (true) {
+        const trimmed = std.mem.trim(u8, rest, " \t");
+        if (trimmed.len == 0) return true;
+
+        const word_end = std.mem.indexOfAny(u8, trimmed, " \t") orelse trimmed.len;
+        const word = trimmed[0..word_end];
+        const eq = std.mem.indexOfScalar(u8, word, '=') orelse return true;
+        if (word.len == 0 or (!std.ascii.isAlphabetic(word[0]) and word[0] != '_')) return true;
+
+        const name = word[0..eq];
+        if (!isSafeTransparentEnvName(name)) return false;
+        rest = if (word_end < trimmed.len) trimmed[word_end..] else "";
+    }
+}
+
+fn isSafeTransparentEnvName(name: []const u8) bool {
+    if (std.mem.eql(u8, name, "LANG")) return true;
+    if (std.mem.eql(u8, name, "LC_ALL")) return true;
+    if (std.mem.startsWith(u8, name, "LC_")) return true;
+    if (std.mem.eql(u8, name, "TZ")) return true;
+    if (std.mem.eql(u8, name, "TERM")) return true;
+    if (std.mem.eql(u8, name, "NO_COLOR")) return true;
+    if (std.mem.eql(u8, name, "CLICOLOR")) return true;
+    if (std.mem.eql(u8, name, "CLICOLOR_FORCE")) return true;
+    if (std.mem.eql(u8, name, "FORCE_COLOR")) return true;
+    if (std.mem.eql(u8, name, "COLORTERM")) return true;
+    return false;
 }
 
 /// Shell builtin prefixes that are transparent to the actual command.
@@ -917,6 +949,10 @@ test "empty command blocked" {
     const p = SecurityPolicy{};
     try std.testing.expect(!p.isCommandAllowed(""));
     try std.testing.expect(!p.isCommandAllowed("   "));
+    // Mixed whitespace (tab + newline) — newline gets normalized into a
+    // segment separator so segments-iterator yields empty entries that the
+    // `if (segment.len == 0) continue;` skip drops, leaving has_cmd = false.
+    try std.testing.expect(!p.isCommandAllowed("\t\n"));
 }
 
 test "command with pipes validates all segments" {
@@ -973,11 +1009,32 @@ test "command injection dollar brace blocked" {
     try std.testing.expect(!p.isCommandAllowed("echo ${IFS}cat${IFS}/etc/passwd"));
 }
 
-test "command env var prefix with allowed cmd" {
+test "command safe env var prefix with allowed cmd" {
     const p = SecurityPolicy{};
-    try std.testing.expect(p.isCommandAllowed("FOO=bar ls"));
     try std.testing.expect(p.isCommandAllowed("LANG=C grep pattern file"));
+    try std.testing.expect(p.isCommandAllowed("LC_ALL=C ls"));
     try std.testing.expect(!p.isCommandAllowed("FOO=bar rm -rf /"));
+}
+
+test "command unsafelisted env var prefix is denied" {
+    // Anything outside the safelist (LANG/LC_*/TZ/TERM/NO_COLOR/CLICOLOR*/
+    // FORCE_COLOR/COLORTERM) is denied per `envAssignmentPrefixesAllowed`.
+    // Each case here pairs the env prefix with `ls` (low-risk, on default
+    // allowlist) so the env-prefix gate is the ONLY thing that can deny —
+    // a previous version of this test used `curl`, which is not in the
+    // default allowlist and is medium-risk, so it was over-determined and
+    // would have passed even if `envAssignmentPrefixesAllowed` were deleted.
+    const p = SecurityPolicy{};
+    try std.testing.expect(!p.isCommandAllowed("FOO=bar ls"));
+    try std.testing.expect(!p.isCommandAllowed("API_KEY=secret ls"));
+    try std.testing.expect(!p.isCommandAllowed("PATH=/tmp ls"));
+    // LD_PRELOAD is the canonical sandbox-escape vector this gate exists to
+    // close. Linux dynamic loader; the macOS equivalent is DYLD_INSERT_LIBRARIES.
+    try std.testing.expect(!p.isCommandAllowed("LD_PRELOAD=/tmp/hook.so ls"));
+    try std.testing.expect(!p.isCommandAllowed("DYLD_INSERT_LIBRARIES=/tmp/hook.dylib ls"));
+    // BASH_ENV is sourced even by non-interactive bash invocations, so it
+    // can run attacker-controlled startup scripts before the real command.
+    try std.testing.expect(!p.isCommandAllowed("BASH_ENV=/tmp/evil.sh ls"));
 }
 
 test "command and chain validates both" {
@@ -2191,4 +2248,47 @@ test "prefix before high-risk command still triggers HighRiskBlocked" {
     try std.testing.expectError(error.HighRiskBlocked, p.validateCommandExecution("time rm -rf /tmp", false));
     try std.testing.expectError(error.HighRiskBlocked, p.validateCommandExecution("nohup rm -rf /tmp", false));
     try std.testing.expectError(error.HighRiskBlocked, p.validateCommandExecution("nice rm -rf /tmp", false));
+}
+
+test "SecurityPolicy denies command not in allowlist" {
+    var p = SecurityPolicy{
+        .allowed_commands = &.{ "ls", "cat" },
+        .block_high_risk_commands = false,
+    };
+    try std.testing.expect(!p.isCommandAllowed("totally_random_cmd"));
+    try std.testing.expectError(error.CommandNotAllowed, p.validateCommandExecution("totally_random_cmd", false));
+}
+
+test "allowlist substring vs token boundary" {
+    // Regression #866: allowlisted command names must not match command prefixes.
+    var p = SecurityPolicy{
+        .allowed_commands = &.{"curl"},
+        .block_high_risk_commands = false,
+    };
+    try std.testing.expect(!p.isCommandAllowed("curlfoo --help"));
+    try std.testing.expect(!p.isCommandAllowed("curlx"));
+    try std.testing.expect(p.isCommandAllowed("curl https://example.com"));
+    try std.testing.expect(p.isCommandAllowed("curl -X POST https://example.com"));
+}
+
+test "safe env-assignment prefix is stripped before allowlist check" {
+    var p = SecurityPolicy{
+        .allowed_commands = &.{"curl"},
+        .block_high_risk_commands = false,
+        .block_medium_risk_commands = false,
+    };
+    try std.testing.expect(p.isCommandAllowed("LANG=C curl https://example.com"));
+    try std.testing.expect(!p.isCommandAllowed("API_KEY=secret curl https://example.com"));
+}
+
+test "env and shell prefixes still reach medium-risk gate" {
+    var p = SecurityPolicy{
+        .allowed_commands = &.{"curl"},
+        .block_high_risk_commands = true,
+        .block_medium_risk_commands = true,
+    };
+    try std.testing.expectError(
+        error.MediumRiskBlocked,
+        p.validateCommandExecution("LANG=C exec curl https://example.com", false),
+    );
 }

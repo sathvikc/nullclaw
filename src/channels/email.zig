@@ -818,3 +818,12 @@ test "markMessageSeen method exists" {
     const info = @typeInfo(@TypeOf(EmailChannel.markMessageSeen));
     try std.testing.expect(info == .@"fn");
 }
+
+test "EmailChannel create + healthCheck + stop leaks zero bytes" {
+    var ch_struct = EmailChannel.initFromConfig(std.testing.allocator, .{});
+    defer ch_struct.deinit();
+
+    const ch = ch_struct.channel();
+    _ = ch.healthCheck();
+    ch.stop();
+}

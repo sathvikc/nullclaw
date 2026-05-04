@@ -1518,3 +1518,32 @@ test "MatrixChannel parseSyncResponse with empty room_id accepts multiple rooms"
     try std.testing.expect(saw_a);
     try std.testing.expect(saw_b);
 }
+
+test "MatrixChannel create + healthCheck + stop leaks zero bytes" {
+    // MatrixChannel holds no heap allocations at init-time.  No deinit needed.
+    var ch_struct = MatrixChannel.initFromConfig(std.testing.allocator, .{
+        .homeserver = "https://matrix.example.com",
+        .access_token = "test-access-token",
+        .room_id = "!test-room:example.com",
+    });
+
+    const ch = ch_struct.channel();
+    _ = ch.healthCheck();
+    ch.stop();
+}
+
+test "MatrixChannel start + stop under is_test leaks zero bytes" {
+    // vtableStart sets self.running = true only — no I/O, no thread.
+    // Double stop must be idempotent per Channel contract.
+    var ch_struct = MatrixChannel.initFromConfig(std.testing.allocator, .{
+        .homeserver = "https://matrix.example.com",
+        .access_token = "test-access-token",
+        .room_id = "!test-room:example.com",
+    });
+
+    const ch = ch_struct.channel();
+    try ch.start();
+    ch.stop();
+    // Double stop — must not double-free or crash.
+    ch.stop();
+}

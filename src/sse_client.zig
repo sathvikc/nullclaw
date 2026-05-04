@@ -290,7 +290,17 @@ fn ownOrFreeList(list: *std.ArrayList(u8), allocator: std.mem.Allocator) ![]u8 {
 /// Returns a slice of events (caller must free each event.data and the slice itself)
 ///
 /// Safety: Truncates events larger than MAX_EVENT_SIZE to prevent memory exhaustion.
-/// Events are delimited by double newlines (\n\n).
+/// Events are dispatched on double newline delimiters (\n\n). Two non-spec
+/// extensions are deliberate, to support providers that do not strictly
+/// follow the W3C SSE spec on stream termination:
+/// 1. A single trailing newline (\n with no following blank line) flushes
+///    the pending event — many real-world providers (OpenAI/Anthropic
+///    streaming endpoints) end the final event this way after the
+///    `[DONE]` sentinel.
+/// 2. End-of-buffer with a non-empty pending event (no terminating
+///    newline) is also flushed.
+/// Strict W3C consumers can detect this by checking whether the buffer
+/// the parser was handed already had a terminating `\n\n`.
 /// Each data: line contributes to the event data, with newlines preserved.
 ///
 /// Per the W3C SSE specification:
@@ -553,4 +563,56 @@ test "parseField parses field:value correctly" {
     const r4 = parseField("data:");
     try std.testing.expectEqualStrings("data", r4.field);
     try std.testing.expectEqualStrings("", r4.value);
+}
+
+test "parseEvents flushes pending event on single trailing newline" {
+    // The Zig multiline literal below ends with one `\n` (no following blank
+    // line), so the buffer is `event: update\nid: evt-1\ndata: hello\n` —
+    // exactly the shape OpenAI/Anthropic emit for the final event of a
+    // stream. The parser must flush it; a strict W3C parser would discard.
+    // See the parseEvents docstring for the rationale.
+    const allocator = std.testing.allocator;
+    const trailing =
+        \\event: update
+        \\id: evt-1
+        \\data: hello
+        \\
+    ;
+    const events = try parseEvents(allocator, trailing);
+    defer freeEvents(allocator, events);
+
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqualStrings("hello", events[0].data);
+    try std.testing.expectEqualStrings("update", events[0].event_type);
+    try std.testing.expectEqualStrings("evt-1", events[0].id);
+}
+
+test "parseEvents flushes pending event at end of buffer with no trailing newline" {
+    // No terminating `\n` at all — exercises the EOF-flush path explicitly,
+    // which the prior test does NOT (single `\n` triggers the empty-line
+    // dispatch path, not the EOF dispatch path).
+    const allocator = std.testing.allocator;
+    const partial = "event: ping\ndata: bye";
+    const events = try parseEvents(allocator, partial);
+    defer freeEvents(allocator, events);
+
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqualStrings("bye", events[0].data);
+    try std.testing.expectEqualStrings("ping", events[0].event_type);
+}
+
+test "parseEvents emits [DONE] sentinel as plain data (no special handling here)" {
+    // [DONE] is an OpenAI-specific terminator. parseEvents does NOT recognize
+    // it; the recognition lives in providers/sse.zig and providers/openai_codex.zig
+    // which inspect `event.data` after parsing. This test pins the contract that
+    // this layer is content-agnostic — any future caller that adds [DONE]
+    // handling here would change the behavior other layers depend on.
+    const allocator = std.testing.allocator;
+    const stream = "data: [DONE]\n\n";
+    const events = try parseEvents(allocator, stream);
+    defer freeEvents(allocator, events);
+
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqualStrings("[DONE]", events[0].data);
+    try std.testing.expectEqualStrings("", events[0].event_type);
 }

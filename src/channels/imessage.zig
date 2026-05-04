@@ -917,3 +917,25 @@ test "imessage publishInboundMessage emits direct session key and dm metadata" {
     try std.testing.expect(!meta.value.object.get("is_group").?.bool);
     try std.testing.expect(meta.value.object.get("channel_id") == null);
 }
+
+test "IMessageChannel create + healthCheck + stop leaks zero bytes" {
+    // IMessageChannel holds no heap allocations at init-time.  No deinit needed.
+    var ch_struct = IMessageChannel.initFromConfig(std.testing.allocator, .{});
+
+    const ch = ch_struct.channel();
+    _ = ch.healthCheck();
+    ch.stop();
+}
+
+test "IMessageChannel start + stop under is_test leaks zero bytes" {
+    // vtableStart has `if (builtin.is_test) return;` — no poll thread is
+    // spawned.  Double stop must be idempotent per Channel contract
+    // (poll_thread stays null, so the join path is never reached).
+    var ch_struct = IMessageChannel.initFromConfig(std.testing.allocator, .{});
+
+    const ch = ch_struct.channel();
+    try ch.start();
+    ch.stop();
+    // Double stop — must not double-free or crash.
+    ch.stop();
+}

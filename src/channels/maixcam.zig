@@ -738,3 +738,12 @@ test "maixcam client count starts at zero" {
     var ch = MaixCamChannel.init(std.testing.allocator, .{});
     try std.testing.expectEqual(@as(usize, 0), ch.clientCount());
 }
+
+test "MaixCamChannel create + healthCheck + stop leaks zero bytes" {
+    var ch_struct = MaixCamChannel.initFromConfig(std.testing.allocator, .{});
+    defer ch_struct.deinit();
+
+    const ch = ch_struct.channel();
+    _ = ch.healthCheck();
+    ch.stop();
+}

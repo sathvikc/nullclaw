@@ -880,6 +880,47 @@ fn resolveInboundRouteSessionKey(
     return resolveInboundRouteSessionKeyWithMetadata(allocator, config, msg, parsed_meta.fields);
 }
 
+const InboundRoutingPlan = struct {
+    session_key: []const u8,
+    session_key_owned: bool,
+    outbound_channel: []const u8,
+    outbound_account_id: ?[]const u8,
+    outbound_chat_id: []const u8,
+    conversation_context: ?ConversationContext,
+
+    fn deinit(self: *InboundRoutingPlan, allocator: std.mem.Allocator) void {
+        if (self.session_key_owned) allocator.free(self.session_key);
+    }
+};
+
+fn buildInboundRoutingPlan(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    msg: *const bus_mod.InboundMessage,
+    meta: channel_adapters.InboundMetadata,
+) InboundRoutingPlan {
+    const routed_session_key = resolveInboundMainSessionKeyWithMetadata(
+        allocator,
+        config,
+        msg,
+        meta,
+    ) orelse resolveInboundRouteSessionKeyWithMetadata(
+        allocator,
+        config,
+        msg,
+        meta,
+    );
+
+    return .{
+        .session_key = routed_session_key orelse msg.session_key,
+        .session_key_owned = routed_session_key != null,
+        .outbound_channel = msg.channel,
+        .outbound_account_id = meta.account_id,
+        .outbound_chat_id = msg.chat_id,
+        .conversation_context = buildInboundConversationContext(msg, meta),
+    };
+}
+
 const SlackStatusTarget = struct {
     channel_id: []const u8,
     thread_ts: []const u8,
@@ -1231,41 +1272,29 @@ fn processInboundMessage(
     var parsed_meta = parseInboundMetadata(allocator, msg.metadata_json);
     defer parsed_meta.deinit();
 
-    const outbound_account_id = parsed_meta.fields.account_id;
-    const routed_session_key = resolveInboundMainSessionKeyWithMetadata(
-        allocator,
-        runtime.config,
-        msg,
-        parsed_meta.fields,
-    ) orelse resolveInboundRouteSessionKeyWithMetadata(
-        allocator,
-        runtime.config,
-        msg,
-        parsed_meta.fields,
-    );
-    defer if (routed_session_key) |key| allocator.free(key);
-    const session_key = routed_session_key orelse msg.session_key;
+    var routing_plan = buildInboundRoutingPlan(allocator, runtime.config, msg, parsed_meta.fields);
+    defer routing_plan.deinit(allocator);
 
-    const outbound_channel = resolveOutboundChannel(registry, msg.channel, outbound_account_id);
+    const outbound_channel = resolveOutboundChannel(registry, routing_plan.outbound_channel, routing_plan.outbound_account_id);
     if (outbound_channel) |channel| {
         markInboundMessageRead(channel, buildInboundMessageRef(msg, parsed_meta.fields));
     }
 
-    if (runtime.session_mgr.routeInbound(session_key, msg.content) == .skip) return;
+    if (runtime.session_mgr.routeInbound(routing_plan.session_key, msg.content) == .skip) return;
 
     const typing_recipient = sendInboundProcessingIndicator(
         allocator,
         registry,
-        msg.channel,
-        outbound_account_id,
-        msg.chat_id,
+        routing_plan.outbound_channel,
+        routing_plan.outbound_account_id,
+        routing_plan.outbound_chat_id,
         parsed_meta.fields,
     );
     defer clearInboundProcessingIndicator(
         allocator,
         registry,
-        msg.channel,
-        outbound_account_id,
+        routing_plan.outbound_channel,
+        routing_plan.outbound_account_id,
         typing_recipient,
     );
 
@@ -1281,9 +1310,9 @@ fn processInboundMessage(
     var streaming_ctx = StreamingOutboundCtx{
         .allocator = allocator,
         .event_bus = event_bus,
-        .channel = msg.channel,
-        .account_id = outbound_account_id,
-        .chat_id = msg.chat_id,
+        .channel = routing_plan.outbound_channel,
+        .account_id = routing_plan.outbound_account_id,
+        .chat_id = routing_plan.outbound_chat_id,
         .draft_id = outbound_draft_id,
     };
     var stream_sink: ?streaming.Sink = null;
@@ -1301,12 +1330,10 @@ fn processInboundMessage(
         defer channels_mod.max.setInteractiveOwnerContext(null);
     }
 
-    const conversation_context = buildInboundConversationContext(msg, parsed_meta.fields);
-
     const reply = runtime.session_mgr.processMessageStreaming(
-        session_key,
+        routing_plan.session_key,
         msg.content,
-        conversation_context,
+        routing_plan.conversation_context,
         stream_sink,
         null,
     ) catch |err| {
@@ -1320,10 +1347,10 @@ fn processInboundMessage(
             error.OutOfMemory => "Out of memory.",
             else => "An error occurred. Try again.",
         };
-        var err_out = if (outbound_account_id) |aid|
-            bus_mod.makeOutboundWithAccount(allocator, msg.channel, aid, msg.chat_id, err_msg) catch return
+        var err_out = if (routing_plan.outbound_account_id) |aid|
+            bus_mod.makeOutboundWithAccount(allocator, routing_plan.outbound_channel, aid, routing_plan.outbound_chat_id, err_msg) catch return
         else
-            bus_mod.makeOutbound(allocator, msg.channel, msg.chat_id, err_msg) catch return;
+            bus_mod.makeOutbound(allocator, routing_plan.outbound_channel, routing_plan.outbound_chat_id, err_msg) catch return;
         err_out.draft_id = outbound_draft_id;
         event_bus.publishOutbound(err_out) catch {
             err_out.deinit(allocator);
@@ -1338,9 +1365,9 @@ fn processInboundMessage(
                 log.warn("failed to build edit payload: {}", .{err});
                 const out = makeAssistantReplyOutbound(
                     allocator,
-                    msg.channel,
-                    outbound_account_id,
-                    msg.chat_id,
+                    routing_plan.outbound_channel,
+                    routing_plan.outbound_account_id,
+                    routing_plan.outbound_chat_id,
                     reply,
                     outbound_draft_id,
                 ) catch return;
@@ -1366,9 +1393,9 @@ fn processInboundMessage(
 
     const out = makeAssistantReplyOutbound(
         allocator,
-        msg.channel,
-        outbound_account_id,
-        msg.chat_id,
+        routing_plan.outbound_channel,
+        routing_plan.outbound_account_id,
+        routing_plan.outbound_chat_id,
         reply,
         outbound_draft_id,
     ) catch |err| {
@@ -2919,6 +2946,57 @@ test "makeAssistantReplyOutbound extracts structured choices from assistant repl
     try std.testing.expectEqualStrings("yes", msg.choices[0].id);
     try std.testing.expectEqualStrings("No", msg.choices[1].label);
     try std.testing.expectEqual(@as(u64, 17), msg.draft_id);
+}
+
+test "buildInboundRoutingPlan keeps inbound origin through outbound planning" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "custom-agent",
+            .match = .{
+                .channel = "custom",
+                .account_id = "custom-main",
+                .peer = .{ .kind = .direct, .id = "user-7" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+    };
+    const inbound = bus_mod.InboundMessage{
+        .channel = "custom",
+        .sender_id = "sender-1",
+        .chat_id = "delivery-chat",
+        .content = "hello",
+        .session_key = "custom:legacy",
+        .metadata_json = "{\"account_id\":\"custom-main\",\"peer_kind\":\"direct\",\"peer_id\":\"user-7\",\"sender_username\":\"alice\",\"sender_display_name\":\"Alice\"}",
+    };
+    var parsed_meta = parseInboundMetadata(allocator, inbound.metadata_json);
+    defer parsed_meta.deinit();
+
+    var plan = buildInboundRoutingPlan(allocator, &config, &inbound, parsed_meta.fields);
+    defer plan.deinit(allocator);
+
+    try std.testing.expect(plan.session_key_owned);
+    try std.testing.expectEqualStrings("agent:custom-agent:custom:direct:user-7", plan.session_key);
+    try std.testing.expectEqualStrings("custom", plan.outbound_channel);
+    try std.testing.expectEqualStrings("custom-main", plan.outbound_account_id.?);
+    try std.testing.expectEqualStrings("delivery-chat", plan.outbound_chat_id);
+
+    const context = plan.conversation_context orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("custom", context.channel.?);
+    try std.testing.expectEqualStrings("custom-main", context.account_id.?);
+    try std.testing.expectEqualStrings("sender-1", context.sender_id.?);
+    try std.testing.expectEqualStrings("alice", context.sender_username.?);
+    try std.testing.expectEqualStrings("Alice", context.sender_display_name.?);
+    try std.testing.expectEqualStrings("delivery-chat", context.delivery_chat_id.?);
+    try std.testing.expectEqualStrings("user-7", context.peer_id.?);
+    try std.testing.expect(context.is_group != null);
+    try std.testing.expect(!context.is_group.?);
+    try std.testing.expect(context.group_id == null);
 }
 
 test "nextOutboundDraftId stays unique across concurrent callers" {
