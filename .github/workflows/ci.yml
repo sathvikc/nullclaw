@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 jobs:
-  ci:
+  test:
     uses: nullclaw/nullbuilder/.github/workflows/zig-ci.yml@v1
     permissions:
       contents: read
