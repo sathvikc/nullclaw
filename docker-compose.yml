@@ -27,7 +27,7 @@ services:
     profiles: ["gateway"]
     command: ["gateway", "--port", "${NULLCLAW_PORT:-3210}", "--host", "::"]
     ports:
-      - "127.0.0.1:${NULLCLAW_PORT:-3210}:${NULLCLAW_PORT:-3210}"
+      - "0.0.0.0:${NULLCLAW_PORT:-3210}:${NULLCLAW_PORT:-3210}"
     env_file:
       - path: .env
         required: false
