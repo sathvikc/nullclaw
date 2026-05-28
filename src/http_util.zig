@@ -283,6 +283,44 @@ pub fn prepareCurlHeaderArg(allocator: Allocator, headers: []const []const u8) !
     return prepared;
 }
 
+fn credentialedCurlUsesHttpFallback(url: []const u8, headers: []const []const u8, resolve_entry: ?[]const u8) bool {
+    return hasCredentialedCurlArgs(url, headers) and resolve_entry == null;
+}
+
+fn prepareCurlHeadersForArgv(allocator: Allocator, url: []const u8, headers: []const []const u8) !CurlHeaderArg {
+    if (hasCredentialedCurlArgs(url, headers)) {
+        if (hasSensitiveUrlToken(url)) return error.CredentialedCurlArgRejected;
+        return try prepareCurlHeaderArg(allocator, headers);
+    }
+
+    try validateNoCredentialedCurlArgs(url, headers);
+    return .{};
+}
+
+fn appendPreparedCurlHeaders(
+    argv_buf: []([]const u8),
+    argc: *usize,
+    headers: []const []const u8,
+    prepared_arg: ?[]const u8,
+) !void {
+    if (prepared_arg) |headers_arg| {
+        if (argc.* + 2 > argv_buf.len) return error.CurlArgsOverflow;
+        argv_buf[argc.*] = "-H";
+        argc.* += 1;
+        argv_buf[argc.*] = headers_arg;
+        argc.* += 1;
+        return;
+    }
+
+    for (headers) |hdr| {
+        if (argc.* + 2 > argv_buf.len) break;
+        argv_buf[argc.*] = "-H";
+        argc.* += 1;
+        argv_buf[argc.*] = hdr;
+        argc.* += 1;
+    }
+}
+
 fn parseHeader(header: []const u8) ?std.http.Header {
     const colon = std.mem.indexOfScalar(u8, header, ':') orelse return null;
     const name = std.mem.trim(u8, header[0..colon], " \t\r\n");
@@ -654,14 +692,15 @@ fn curlRequestWithProxy(
     max_time: ?[]const u8,
     resolve_entry: ?[]const u8,
 ) ![]u8 {
-    if (hasCredentialedCurlArgs(url, headers)) {
+    if (credentialedCurlUsesHttpFallback(url, headers, resolve_entry)) {
         const method_enum = std.meta.stringToEnum(std.http.Method, method) orelse return error.UnsupportedHttpMethod;
         const content_type = contentTypeHeaderValue(content_type_header) orelse return error.InvalidHeader;
         const resp = try httpRequestWithStatus(allocator, method_enum, url, body, headers, content_type, proxy);
         return resp.body;
     }
+    var prepared_headers = try prepareCurlHeadersForArgv(allocator, url, headers);
+    defer prepared_headers.deinit(allocator);
 
-    try validateNoCredentialedCurlArgs(url, headers);
     var argv_buf: [40][]const u8 = undefined;
     var argc: usize = 0;
 
@@ -694,13 +733,7 @@ fn curlRequestWithProxy(
         argc += 1;
     }
 
-    for (headers) |hdr| {
-        if (argc + 2 > argv_buf.len) break;
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = hdr;
-        argc += 1;
-    }
+    try appendPreparedCurlHeaders(argv_buf[0..], &argc, headers, prepared_headers.arg);
 
     // Pass payload via stdin to avoid OS argv length limits for large JSON
     // bodies (e.g. multimodal base64 images).
@@ -831,11 +864,12 @@ pub fn curlPostWithStatusAndTimeoutAndResolve(
     max_time: ?[]const u8,
     resolve_entry: ?[]const u8,
 ) !HttpResponse {
-    if (hasCredentialedCurlArgs(url, headers)) {
+    if (credentialedCurlUsesHttpFallback(url, headers, resolve_entry)) {
         return httpRequestWithStatus(allocator, .POST, url, body, headers, "application/json", null);
     }
+    var prepared_headers = try prepareCurlHeadersForArgv(allocator, url, headers);
+    defer prepared_headers.deinit(allocator);
 
-    try validateNoCredentialedCurlArgs(url, headers);
     var argv_buf: [48][]const u8 = undefined;
     var argc: usize = 0;
 
@@ -862,13 +896,7 @@ pub fn curlPostWithStatusAndTimeoutAndResolve(
     argv_buf[argc] = "Content-Type: application/json";
     argc += 1;
 
-    for (headers) |hdr| {
-        if (argc + 2 > argv_buf.len) break;
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = hdr;
-        argc += 1;
-    }
+    try appendPreparedCurlHeaders(argv_buf[0..], &argc, headers, prepared_headers.arg);
 
     argv_buf[argc] = "--data-binary";
     argc += 1;
@@ -976,11 +1004,12 @@ pub fn curlPostWithStatusHeadersAndTimeoutAndResolve(
     max_time: ?[]const u8,
     resolve_entry: ?[]const u8,
 ) !HttpResponseWithHeaders {
-    if (hasCredentialedCurlArgs(url, headers)) {
+    if (credentialedCurlUsesHttpFallback(url, headers, resolve_entry)) {
         return httpRequestWithStatusAndHeaders(allocator, .POST, url, body, headers, "application/json", null);
     }
+    var prepared_headers = try prepareCurlHeadersForArgv(allocator, url, headers);
+    defer prepared_headers.deinit(allocator);
 
-    try validateNoCredentialedCurlArgs(url, headers);
     var argv_buf: [56][]const u8 = undefined;
     var argc: usize = 0;
 
@@ -1007,13 +1036,7 @@ pub fn curlPostWithStatusHeadersAndTimeoutAndResolve(
     argv_buf[argc] = "Content-Type: application/json";
     argc += 1;
 
-    for (headers) |hdr| {
-        if (argc + 2 > argv_buf.len) break;
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = hdr;
-        argc += 1;
-    }
+    try appendPreparedCurlHeaders(argv_buf[0..], &argc, headers, prepared_headers.arg);
 
     // Dump response headers to stdout so we can capture session IDs.
     argv_buf[argc] = "-D";
@@ -1141,11 +1164,12 @@ pub fn curlGetWithStatusAndTimeoutAndResolve(
     max_time: ?[]const u8,
     resolve_entry: ?[]const u8,
 ) !HttpResponse {
-    if (hasCredentialedCurlArgs(url, headers)) {
+    if (credentialedCurlUsesHttpFallback(url, headers, resolve_entry)) {
         return httpRequestWithStatus(allocator, .GET, url, null, headers, null, null);
     }
+    var prepared_headers = try prepareCurlHeadersForArgv(allocator, url, headers);
+    defer prepared_headers.deinit(allocator);
 
-    try validateNoCredentialedCurlArgs(url, headers);
     var argv_buf: [48][]const u8 = undefined;
     var argc: usize = 0;
 
@@ -1163,13 +1187,7 @@ pub fn curlGetWithStatusAndTimeoutAndResolve(
 
     appendCurlResolveArgs(argv_buf[0..], &argc, resolve_entry);
 
-    for (headers) |hdr| {
-        if (argc + 2 > argv_buf.len) break;
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = hdr;
-        argc += 1;
-    }
+    try appendPreparedCurlHeaders(argv_buf[0..], &argc, headers, prepared_headers.arg);
 
     argv_buf[argc] = "-w";
     argc += 1;
@@ -1263,11 +1281,12 @@ fn curlGetWithProxyAndResolve(
     resolve_entry: ?[]const u8,
     max_bytes: usize,
 ) ![]u8 {
-    if (hasCredentialedCurlArgs(url, headers)) {
+    if (credentialedCurlUsesHttpFallback(url, headers, resolve_entry)) {
         return httpRequest(allocator, .GET, url, null, headers, null, proxy);
     }
+    var prepared_headers = try prepareCurlHeadersForArgv(allocator, url, headers);
+    defer prepared_headers.deinit(allocator);
 
-    try validateNoCredentialedCurlArgs(url, headers);
     var argv_buf: [48][]const u8 = undefined;
     var argc: usize = 0;
 
@@ -1294,13 +1313,7 @@ fn curlGetWithProxyAndResolve(
         argc += 1;
     }
 
-    for (headers) |hdr| {
-        if (argc + 2 > argv_buf.len) break;
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = hdr;
-        argc += 1;
-    }
+    try appendPreparedCurlHeaders(argv_buf[0..], &argc, headers, prepared_headers.arg);
 
     argv_buf[argc] = url;
     argc += 1;
@@ -1819,6 +1832,97 @@ fn expectLegacyCredentialedCurlFallback(helper: LegacyCredentialedCurlHelper, ex
     try std.testing.expect(ctx.saw_authorization.load(.acquire));
 }
 
+fn expectCredentialedCurlResolveEntry(helper: LegacyCredentialedCurlHelper, expected_method: []const u8) !void {
+    if (comptime @import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+
+    var ctx = CredentialedCurlFallbackServerCtx{
+        .server = &server,
+        .expected_method = expected_method,
+    };
+    var thread = try std.Thread.spawn(.{}, serveCredentialedCurlFallbackTest, .{&ctx});
+
+    const host = "credentialed-curl.test";
+    const port = server.listen_address.in.getPort();
+    const url = try std.fmt.allocPrint(allocator, "http://{s}:{d}/legacy", .{ host, port });
+    defer allocator.free(url);
+    const resolve_entry = try std.fmt.allocPrint(allocator, "{s}:{d}:127.0.0.1", .{ host, port });
+    defer allocator.free(resolve_entry);
+    const headers = [_][]const u8{"Authorization: Bearer test-token"};
+    var request_err: ?anyerror = null;
+
+    switch (helper) {
+        .get_body => {
+            const body = curlGetWithResolve(allocator, url, &headers, "5", resolve_entry) catch |err| blk: {
+                request_err = err;
+                break :blk null;
+            };
+            if (body) |b| {
+                defer allocator.free(b);
+                try std.testing.expectEqualStrings("{\"ok\":true}", b);
+            }
+        },
+        .get_status => {
+            const resp = curlGetWithStatusAndTimeoutAndResolve(allocator, url, &headers, "5", resolve_entry) catch |err| blk: {
+                request_err = err;
+                break :blk null;
+            };
+            if (resp) |r| {
+                defer allocator.free(r.body);
+                try std.testing.expectEqual(@as(u16, 200), r.status_code);
+                try std.testing.expectEqualStrings("{\"ok\":true}", r.body);
+            }
+        },
+        .post_body => {
+            const body = curlPostWithProxyAndResolve(allocator, url, "{\"ping\":true}", &headers, null, "5", resolve_entry) catch |err| blk: {
+                request_err = err;
+                break :blk null;
+            };
+            if (body) |b| {
+                defer allocator.free(b);
+                try std.testing.expectEqualStrings("{\"ok\":true}", b);
+            }
+        },
+        .post_status => {
+            const resp = curlPostWithStatusAndTimeoutAndResolve(allocator, url, "{\"ping\":true}", &headers, "5", resolve_entry) catch |err| blk: {
+                request_err = err;
+                break :blk null;
+            };
+            if (resp) |r| {
+                defer allocator.free(r.body);
+                try std.testing.expectEqual(@as(u16, 200), r.status_code);
+                try std.testing.expectEqualStrings("{\"ok\":true}", r.body);
+            }
+        },
+        .post_status_headers => {
+            const resp = curlPostWithStatusHeadersAndTimeoutAndResolve(allocator, url, "{\"ping\":true}", &headers, "5", resolve_entry) catch |err| blk: {
+                request_err = err;
+                break :blk null;
+            };
+            if (resp) |r| {
+                defer allocator.free(r.headers);
+                defer allocator.free(r.body);
+                try std.testing.expectEqual(@as(u16, 200), r.status_code);
+                try std.testing.expectEqualStrings("{\"ok\":true}", r.body);
+            }
+        },
+        .put_body => unreachable,
+    }
+
+    if (!ctx.saw_request.load(.acquire)) {
+        unblockCredentialedCurlFallbackServer(&server);
+    }
+    thread.join();
+
+    if (request_err) |err| return err;
+    try std.testing.expect(ctx.saw_expected_method.load(.acquire));
+    try std.testing.expect(ctx.saw_authorization.load(.acquire));
+}
+
 test "credentialed legacy curl body helpers do not reject authorization headers" {
     // Regression: legacy channel code still passes Authorization to curl* helper
     // APIs. These helpers must route through std.http fallback instead of
@@ -1834,6 +1938,29 @@ test "credentialed legacy curl status helpers do not reject authorization header
     try expectLegacyCredentialedCurlFallback(.get_status, "GET");
     try expectLegacyCredentialedCurlFallback(.post_status, "POST");
     try expectLegacyCredentialedCurlFallback(.post_status_headers, "POST");
+}
+
+test "credentialed curl helpers preserve resolve pinning" {
+    // Regression: credentialed fallback must not bypass curl --resolve pinning,
+    // otherwise provider SSRF/DNS-rebinding protection is weakened.
+    try expectCredentialedCurlResolveEntry(.get_body, "GET");
+    try expectCredentialedCurlResolveEntry(.post_body, "POST");
+    try expectCredentialedCurlResolveEntry(.get_status, "GET");
+    try expectCredentialedCurlResolveEntry(.post_status, "POST");
+    try expectCredentialedCurlResolveEntry(.post_status_headers, "POST");
+}
+
+test "credentialed curl resolve path rejects sensitive URL tokens" {
+    try std.testing.expectError(
+        error.CredentialedCurlArgRejected,
+        curlGetWithResolve(
+            std.testing.allocator,
+            "https://example.com/v1?access_token=test-token",
+            &.{},
+            "5",
+            "example.com:443:203.0.113.10",
+        ),
+    );
 }
 
 test "prepareCurlHeaderArg writes headers outside argv" {
